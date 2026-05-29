@@ -137,6 +137,7 @@ async def _handle_stream(
         in_tokens = 0
         out_tokens = 0
         buffer = ""
+        full_body = [] if config.LOG_OUTPUT else None
         status_code = 200
         error = False
 
@@ -149,6 +150,8 @@ async def _handle_stream(
                     async for chunk in resp.aiter_bytes():
                         yield chunk
                         text = chunk.decode("utf-8", errors="replace")
+                        if full_body is not None:
+                            full_body.append(text)
                         buffer += text
                         while "\n" in buffer:
                             line, buffer = buffer.split("\n", 1)
@@ -177,6 +180,8 @@ async def _handle_stream(
                 _record_metrics(model, in_tokens, out_tokens, duration)
             if in_tokens > 0 or out_tokens > 0:
                 _log_summary(model, in_tokens, out_tokens, duration)
+            if full_body is not None:
+                logger.info(f"Stream response ({status_code}):\n{\"".join(full_body)}")
 
     return StreamingResponse(
         generate(),
