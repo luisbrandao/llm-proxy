@@ -138,7 +138,8 @@ async def _handle_stream(
         out_tokens = 0
         buffer = ""
         delta_contents = [] if config.LOG_OUTPUT else None
-        last_usage = None
+        reasoning_contents = [] if config.LOG_OUTPUT else None
+        final_chunk = None
         resp_model = model
         status_code = 200
         error = False
@@ -168,13 +169,17 @@ async def _handle_stream(
                                 if usage:
                                     in_tokens = usage.get("prompt_tokens", in_tokens)
                                     out_tokens = usage.get("completion_tokens", out_tokens)
-                                    last_usage = usage
+                                    final_chunk = data
                                 if delta_contents is not None:
                                     choices = data.get("choices", [])
                                     if choices:
-                                        content = choices[0].get("delta", {}).get("content", "")
+                                        delta = choices[0].get("delta", {})
+                                        content = delta.get("content", "")
+                                        reasoning = delta.get("reasoning_content")
                                         if content:
                                             delta_contents.append(content)
+                                        if reasoning:
+                                            reasoning_contents.append(reasoning)
                             except json.JSONDecodeError:
                                 pass
         except Exception as e:
@@ -190,19 +195,21 @@ async def _handle_stream(
                 _log_summary(model, in_tokens, out_tokens, duration)
             if delta_contents is not None:
                 full_text = "".join(delta_contents)
-                meta = ""
-                if last_usage:
-                    meta += f"\n--- model: {resp_model}"
-                    meta += f"\n--- prompt_tokens: {last_usage.get('prompt_tokens', 0)}"
-                    meta += f"\n--- completion_tokens: {last_usage.get('completion_tokens', 0)}"
-                    meta += f"\n--- total_tokens: {last_usage.get('total_tokens', 0)}"
-                    pt_details = last_usage.get("prompt_tokens_details", {})
-                    if pt_details:
-                        meta += f"\n--- cached_tokens: {pt_details.get('cached_tokens', 0)}"
-                    ct_details = last_usage.get("completion_tokens_details", {})
-                    if ct_details:
-                        meta += f"\n--- reasoning_tokens: {ct_details.get('reasoning_tokens', 0)}"
-                logger.info(f"Stream response ({status_code}):{meta}\n{full_text}")
+                reasoning_text = "".join(reasoning_contents) if reasoning_contents else ""
+                log_data = {}
+                if final_chunk:
+                    log_data = final_chunk
+                else:
+                    log_data = {
+                        "model": resp_model,
+                        "usage": {"prompt_tokens": in_tokens, "completion_tokens": out_tokens},
+                    }
+                log_data["_assembled_content"] = full_text
+                if reasoning_text:
+                    log_data["_reasoning_content"] = reasoning_text
+                logger.info(
+                    f"Stream response ({status_code}):\n{json.dumps(log_data, indent=2, ensure_ascii=False)}"
+                )
 
     return StreamingResponse(
         generate(),
