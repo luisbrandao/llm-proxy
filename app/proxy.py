@@ -65,14 +65,15 @@ async def _handle_non_stream(
 ) -> Response:
     url = _build_url(path)
     headers = _build_headers(request)
+    method = request.method.upper()
 
     if config.LOG_INPUT:
-        _log_curl(request.method, url, headers, body_str)
+        _log_curl(method, url, headers, body_str)
 
     start = time.time()
 
     async with httpx.AsyncClient(timeout=600.0) as client:
-        resp = await client.post(url, headers=headers, content=body)
+        resp = await client.request(method, url, headers=headers, content=body)
 
         duration = time.time() - start
         resp_body = resp.text
@@ -95,7 +96,8 @@ async def _handle_non_stream(
         else:
             _record_metrics(model, in_tokens, out_tokens, duration)
 
-        _log_summary(model, in_tokens, out_tokens, duration)
+        if in_tokens > 0 or out_tokens > 0:
+            _log_summary(model, in_tokens, out_tokens, duration)
 
         resp_headers = dict(resp.headers)
         resp_headers.pop("content-length", None)
@@ -114,9 +116,10 @@ async def _handle_stream(
 ) -> StreamingResponse:
     url = _build_url(path)
     headers = _build_headers(request)
+    method = request.method.upper()
 
     if config.LOG_INPUT:
-        _log_curl(request.method, url, headers, body_str)
+        _log_curl(method, url, headers, body_str)
 
     async def generate():
         start = time.time()
@@ -128,7 +131,7 @@ async def _handle_stream(
 
         try:
             async with httpx.AsyncClient(timeout=600.0) as client:
-                async with client.stream("POST", url, headers=headers, content=body) as resp:
+                async with client.stream(method, url, headers=headers, content=body) as resp:
                     status_code = resp.status_code
                     if resp.is_error:
                         error = True
@@ -161,7 +164,8 @@ async def _handle_stream(
                 ERRORS_TOTAL.labels(model=model, status_code=str(status_code)).inc()
             else:
                 _record_metrics(model, in_tokens, out_tokens, duration)
-            _log_summary(model, in_tokens, out_tokens, duration)
+            if in_tokens > 0 or out_tokens > 0:
+                _log_summary(model, in_tokens, out_tokens, duration)
 
     return StreamingResponse(
         generate(),

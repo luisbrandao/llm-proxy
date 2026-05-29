@@ -1,12 +1,13 @@
 services:
-  deepseek-proxy:
+  deepseek-exporter:
     build: .
-    ports:
-      - "${PORT:-8000}:${PORT:-8000}"
+    container_name: deepseek-exporter
     environment:
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_API_KEY=
       - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
-      - LOG_INPUT=${LOG_INPUT:-false}
-      - LOG_OUTPUT=${LOG_OUTPUT:-false}
-      - PORT=${PORT:-8000}
+      - LOG_INPUT=true
+      - LOG_OUTPUT=true
+      - PORT=8000
+    ports:
+      - "8001:8000"    
     restart: unless-stopped
