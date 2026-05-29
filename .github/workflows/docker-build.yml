@@ -3,6 +3,8 @@ name: Docker Build
 on:
   push:
     branches: [master]
+    paths-ignore:
+      - '**.md'
 
 env:
   REGISTRY: ghcr.io

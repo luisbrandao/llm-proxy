@@ -109,7 +109,7 @@ This line is always emitted, regardless of debug flags.
 | `DEEPSEEK_BASE_URL` | no | `https://api.deepseek.com` | Override the upstream API URL (useful for testing or alternative endpoints) |
 | `PORT` | no | `8000` | Port the proxy binds to |
 | `LOG_INPUT` | no | `false` | When `true`, log the full proxied request (method, URL, headers, body) in curl-style format. Authorization token is masked. |
-| `LOG_OUTPUT` | no | `false` | When `true`, log the full upstream response body for non-streaming requests. For streaming, logs the final status. |
+| `LOG_OUTPUT` | no | `false` | When `true`, log the full upstream response (pretty-printed JSON). For streaming, emits a single assembled JSON with `_assembled_content` and `_reasoning_content` fields. |
 
 ### Debug example
 
@@ -122,10 +122,28 @@ LOG_INPUT=true LOG_OUTPUT=true docker compose up
 POST https://api.deepseek.com/v1/chat/completions
   -H 'content-type: application/json'
   -H 'authorization: Bearer ***'
-  -d '{"model":"deepseek-chat","messages":[...],...}'
+  -d '{
+  "model": "deepseek-chat",
+  "messages": [...],
+  "stream": false
+}'
 ...
 2026-05-29 14:20:01 - INFO - Response (200):
-{"id":"...", "choices":[{"message":{"content":"Hello!"}}], "usage":{...}}
+{
+  "id": "...",
+  "choices": [
+    {
+      "message": {
+        "content": "Hello!"
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 10,
+    "completion_tokens": 1,
+    "total_tokens": 11
+  }
+}
 ```
 
 ## Supported Features
