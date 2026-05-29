@@ -137,7 +137,7 @@ async def _handle_stream(
         in_tokens = 0
         out_tokens = 0
         buffer = ""
-        full_body = [] if config.LOG_OUTPUT else None
+        delta_contents = [] if config.LOG_OUTPUT else None
         status_code = 200
         error = False
 
@@ -150,8 +150,6 @@ async def _handle_stream(
                     async for chunk in resp.aiter_bytes():
                         yield chunk
                         text = chunk.decode("utf-8", errors="replace")
-                        if full_body is not None:
-                            full_body.append(text)
                         buffer += text
                         while "\n" in buffer:
                             line, buffer = buffer.split("\n", 1)
@@ -167,6 +165,12 @@ async def _handle_stream(
                                 if usage:
                                     in_tokens = usage.get("prompt_tokens", in_tokens)
                                     out_tokens = usage.get("completion_tokens", out_tokens)
+                                if delta_contents is not None:
+                                    choices = data.get("choices", [])
+                                    if choices:
+                                        content = choices[0].get("delta", {}).get("content", "")
+                                        if content:
+                                            delta_contents.append(content)
                             except json.JSONDecodeError:
                                 pass
         except Exception as e:
@@ -180,9 +184,9 @@ async def _handle_stream(
                 _record_metrics(model, in_tokens, out_tokens, duration)
             if in_tokens > 0 or out_tokens > 0:
                 _log_summary(model, in_tokens, out_tokens, duration)
-            if full_body is not None:
-                body_text = "".join(full_body)
-                logger.info(f"Stream response ({status_code}):\n{body_text}")
+            if delta_contents is not None:
+                full_text = "".join(delta_contents)
+                logger.info(f"Stream response ({status_code}):\n{full_text}")
 
     return StreamingResponse(
         generate(),
