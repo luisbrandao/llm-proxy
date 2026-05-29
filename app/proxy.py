@@ -40,7 +40,12 @@ def _log_curl(method: str, url: str, headers: dict, body: str) -> None:
         else:
             cmd += f"\n  -H '{k}: {v}'"
     if body:
-        cmd += f"\n  -d '{body}'"
+        try:
+            parsed = json.loads(body)
+            pretty = json.dumps(parsed, indent=2, ensure_ascii=False)
+            cmd += f"\n  -d '{pretty}'"
+        except (json.JSONDecodeError, ValueError):
+            cmd += f"\n  -d '{body}'"
     logger.info(f"Request:\n{cmd}")
 
 
@@ -89,7 +94,13 @@ async def _handle_non_stream(
             pass
 
         if config.LOG_OUTPUT:
-            logger.info(f"Response ({resp.status_code}):\n{resp_body}")
+            pretty_body = resp_body
+            try:
+                parsed = json.loads(resp_body)
+                pretty_body = json.dumps(parsed, indent=2, ensure_ascii=False)
+            except (json.JSONDecodeError, ValueError):
+                pass
+            logger.info(f"Response ({resp.status_code}):\n{pretty_body}")
 
         if resp.is_error:
             ERRORS_TOTAL.labels(model=model, status_code=str(resp.status_code)).inc()
