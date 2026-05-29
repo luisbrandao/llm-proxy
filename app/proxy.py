@@ -138,6 +138,8 @@ async def _handle_stream(
         out_tokens = 0
         buffer = ""
         delta_contents = [] if config.LOG_OUTPUT else None
+        last_usage = None
+        resp_model = model
         status_code = 200
         error = False
 
@@ -161,10 +163,12 @@ async def _handle_stream(
                                 continue
                             try:
                                 data = json.loads(payload)
+                                resp_model = data.get("model", resp_model)
                                 usage = data.get("usage")
                                 if usage:
                                     in_tokens = usage.get("prompt_tokens", in_tokens)
                                     out_tokens = usage.get("completion_tokens", out_tokens)
+                                    last_usage = usage
                                 if delta_contents is not None:
                                     choices = data.get("choices", [])
                                     if choices:
@@ -186,7 +190,19 @@ async def _handle_stream(
                 _log_summary(model, in_tokens, out_tokens, duration)
             if delta_contents is not None:
                 full_text = "".join(delta_contents)
-                logger.info(f"Stream response ({status_code}):\n{full_text}")
+                meta = ""
+                if last_usage:
+                    meta += f"\n--- model: {resp_model}"
+                    meta += f"\n--- prompt_tokens: {last_usage.get('prompt_tokens', 0)}"
+                    meta += f"\n--- completion_tokens: {last_usage.get('completion_tokens', 0)}"
+                    meta += f"\n--- total_tokens: {last_usage.get('total_tokens', 0)}"
+                    pt_details = last_usage.get("prompt_tokens_details", {})
+                    if pt_details:
+                        meta += f"\n--- cached_tokens: {pt_details.get('cached_tokens', 0)}"
+                    ct_details = last_usage.get("completion_tokens_details", {})
+                    if ct_details:
+                        meta += f"\n--- reasoning_tokens: {ct_details.get('reasoning_tokens', 0)}"
+                logger.info(f"Stream response ({status_code}):{meta}\n{full_text}")
 
     return StreamingResponse(
         generate(),
