@@ -1,0 +1,12 @@
+services:
+  deepseek-proxy:
+    build: .
+    ports:
+      - "${PORT:-8000}:${PORT:-8000}"
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      - LOG_INPUT=${LOG_INPUT:-false}
+      - LOG_OUTPUT=${LOG_OUTPUT:-false}
+      - PORT=${PORT:-8000}
+    restart: unless-stopped
