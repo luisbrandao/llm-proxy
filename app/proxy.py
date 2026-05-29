@@ -181,7 +181,8 @@ async def _handle_stream(
             if in_tokens > 0 or out_tokens > 0:
                 _log_summary(model, in_tokens, out_tokens, duration)
             if full_body is not None:
-                logger.info(f"Stream response ({status_code}):\n{\"".join(full_body)}")
+                body_text = "".join(full_body)
+                logger.info(f"Stream response ({status_code}):\n{body_text}")
 
     return StreamingResponse(
         generate(),
