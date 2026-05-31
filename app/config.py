@@ -6,3 +6,8 @@ DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.co
 LOG_INPUT = os.environ.get("LOG_INPUT", "false").lower() == "true"
 LOG_OUTPUT = os.environ.get("LOG_OUTPUT", "false").lower() == "true"
 PORT = int(os.environ.get("PORT", "8000"))
+
+MODEL_MAP = {
+    "deepseek-chat": "deepseek-v4-pro",
+    "deepseek-reasoner": "deepseek-v4-flash",
+}

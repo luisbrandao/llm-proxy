@@ -8,7 +8,7 @@ import httpx
 from fastapi import Request
 from fastapi.responses import Response, StreamingResponse
 
-from app import config
+from app import config as conf
 from app.metrics import (
     ERRORS_TOTAL,
     REQUEST_DURATION,
@@ -21,14 +21,14 @@ logger = logging.getLogger("deepseek-proxy")
 
 
 def _build_url(path: str) -> str:
-    return f"{config.DEEPSEEK_BASE_URL}/{path.lstrip('/')}"
+    return f"{conf.DEEPSEEK_BASE_URL}/{path.lstrip('/')}"
 
 
 def _build_headers(request: Request) -> dict:
     headers = dict(request.headers)
     headers.pop("host", None)
     headers.pop("content-length", None)
-    headers["authorization"] = f"Bearer {config.DEEPSEEK_API_KEY}"
+    headers["authorization"] = f"Bearer {conf.DEEPSEEK_API_KEY}"
     return headers
 
 
@@ -72,7 +72,7 @@ async def _handle_non_stream(
     headers = _build_headers(request)
     method = request.method.upper()
 
-    if config.LOG_INPUT:
+    if conf.LOG_INPUT:
         _log_curl(method, url, headers, body_str)
 
     start = time.time()
@@ -93,7 +93,7 @@ async def _handle_non_stream(
         except (json.JSONDecodeError, AttributeError):
             pass
 
-        if config.LOG_OUTPUT:
+        if conf.LOG_OUTPUT:
             pretty_body = resp_body
             try:
                 parsed = json.loads(resp_body)
@@ -102,10 +102,11 @@ async def _handle_non_stream(
                 pass
             logger.info(f"Response ({resp.status_code}):\n{pretty_body}")
 
-        if resp.is_error:
-            ERRORS_TOTAL.labels(model=model, status_code=str(resp.status_code)).inc()
-        else:
-            _record_metrics(model, in_tokens, out_tokens, duration)
+        if model != "unknown":
+            if resp.is_error:
+                ERRORS_TOTAL.labels(model=model, status_code=str(resp.status_code)).inc()
+            else:
+                _record_metrics(model, in_tokens, out_tokens, duration)
 
         if in_tokens > 0 or out_tokens > 0:
             _log_summary(model, in_tokens, out_tokens, duration)
@@ -129,7 +130,7 @@ async def _handle_stream(
     headers = _build_headers(request)
     method = request.method.upper()
 
-    if config.LOG_INPUT:
+    if conf.LOG_INPUT:
         _log_curl(method, url, headers, body_str)
 
     async def generate():
@@ -137,8 +138,8 @@ async def _handle_stream(
         in_tokens = 0
         out_tokens = 0
         buffer = ""
-        delta_contents = [] if config.LOG_OUTPUT else None
-        reasoning_contents = [] if config.LOG_OUTPUT else None
+        delta_contents = [] if conf.LOG_OUTPUT else None
+        reasoning_contents = [] if conf.LOG_OUTPUT else None
         final_chunk = None
         resp_model = model
         status_code = 200
@@ -187,10 +188,11 @@ async def _handle_stream(
             logger.error(f"Stream error: {e}")
         finally:
             duration = time.time() - start
-            if error:
-                ERRORS_TOTAL.labels(model=model, status_code=str(status_code)).inc()
-            else:
-                _record_metrics(model, in_tokens, out_tokens, duration)
+            if model != "unknown":
+                if error:
+                    ERRORS_TOTAL.labels(model=model, status_code=str(status_code)).inc()
+                else:
+                    _record_metrics(model, in_tokens, out_tokens, duration)
             if in_tokens > 0 or out_tokens > 0:
                 _log_summary(model, in_tokens, out_tokens, duration)
             if delta_contents is not None:
@@ -231,6 +233,7 @@ async def proxy_request(request: Request, path: str) -> Union[Response, Streamin
     try:
         payload = json.loads(body_str)
         model = payload.get("model", "unknown")
+        model = conf.MODEL_MAP.get(model, model)
         is_stream = payload.get("stream", False)
     except (json.JSONDecodeError, AttributeError):
         pass
