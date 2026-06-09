@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
@@ -7,13 +8,33 @@ from app.metrics import metrics_response
 from app.proxy import proxy_request
 from app.registry import list_models
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-app = FastAPI(title="LLM Proxy")
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=DATE_FORMAT)
+
+
+def _unify_logging() -> None:
+    """Align uvicorn's loggers with the rest of the app's format.
+
+    uvicorn installs its own handlers (the `INFO:     ...` style) on the
+    uvicorn/uvicorn.access/uvicorn.error loggers with propagate=False, so they
+    ignore basicConfig. Re-point them at our formatter so every line matches.
+    """
+    fmt = logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT)
+    for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        for handler in logging.getLogger(name).handlers:
+            handler.setFormatter(fmt)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Runs after uvicorn has configured its logging, so our reformat sticks.
+    _unify_logging()
+    yield
+
+
+app = FastAPI(title="LLM Proxy", lifespan=lifespan)
 
 
 @app.get("/health")

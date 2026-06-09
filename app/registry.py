@@ -16,6 +16,19 @@ PROBE_TIMEOUT = httpx.Timeout(5.0, connect=3.0)
 # provider name -> (expires_at_epoch, [model_id, ...])
 _cache = {}
 
+# provider name -> asyncio.Lock, created lazily so each binds to the running
+# loop. Coalesces concurrent cold-cache misses into a single upstream probe
+# (single-flight) instead of letting every in-flight request fetch in parallel.
+_locks = {}
+
+
+def _lock_for(provider_name: str) -> asyncio.Lock:
+    lock = _locks.get(provider_name)
+    if lock is None:
+        lock = asyncio.Lock()
+        _locks[provider_name] = lock
+    return lock
+
 # provider name -> epoch until which the backend is considered down. Set when a
 # request fails against it so the router can skip it during failover, and
 # cleared on the next success.
@@ -57,26 +70,36 @@ async def _cached_live(provider: conf.Provider):
     entry = _cache.get(provider.name)
     if entry and entry[0] > time.time():
         return entry[1]
-    try:
-        ids = await _fetch_live(provider)
-    except Exception as e:
-        # Backend is unreachable: drop its models from the listing. Backends
-        # are expected to come and go, so this is not an error condition.
-        logger.warning(f"Failed to fetch models from {provider.name}: {e}")
-        ids = []
-    # Stamp expiry AFTER the probe (which may have been slow), so a failed
-    # probe is still cached for the full ttl and we don't re-hit a dead backend
-    # on every request. Once the box is back, the next miss re-discovers it.
-    _cache[provider.name] = (time.time() + provider.cache_ttl, ids)
-    return ids
+
+    # Single-flight: only the first concurrent miss probes; the rest wait here
+    # and pick up the fresh cache below, instead of stampeding the backend.
+    async with _lock_for(provider.name):
+        entry = _cache.get(provider.name)
+        if entry and entry[0] > time.time():
+            return entry[1]
+        try:
+            ids = await _fetch_live(provider)
+        except Exception as e:
+            # Backend is unreachable: drop its models from the listing. Backends
+            # are expected to come and go, so this is not an error condition.
+            logger.warning(f"Failed to fetch models from {provider.name}: {e}")
+            ids = []
+        # Stamp expiry AFTER the probe (which may have been slow), so a failed
+        # probe is still cached for the full ttl and we don't re-hit a dead
+        # backend on every request. Once the box is back, the next miss
+        # re-discovers it.
+        _cache[provider.name] = (time.time() + provider.cache_ttl, ids)
+        return ids
 
 
 async def list_models() -> dict:
     """Aggregate models, presenting clean server-less names clients can use directly.
 
-    Listed (deduped, in this order): aliases, explicit logical models, bare model
-    ids (a model served by several backends appears once), and finally the
-    explicit `provider:model` ids for manual targeting. Offline backends drop out.
+    Listed (deduped, in this order): aliases, explicit logical models, and bare
+    model ids (a model served by several backends appears once). Backend-prefixed
+    `provider:model` ids are not listed — they still work for pinning a specific
+    backend, but advertising them would just duplicate the clean names. Offline
+    backends drop out.
     """
     sep = conf.PROVIDER_SEP
     data = []
@@ -115,19 +138,14 @@ async def list_models() -> dict:
 
     # Group each model id by the backends that serve it.
     by_model = {}
-    explicit = []
     for provider in conf.PROVIDERS:
         ids = live_ids.get(provider.name, []) if provider.lists_all else provider.enabled_models
         for mid in ids:
             by_model.setdefault(mid, []).append(provider.name)
-            explicit.append((provider.name, mid))
 
-    # Bare id once (auto-balanced when served by several backends).
+    # Each model id once, by its clean server-less name. When several backends
+    # serve it, they share the entry (and the proxy load-balances behind it).
     for mid, owners in by_model.items():
         add(mid, ",".join(owners) if len(owners) > 1 else owners[0])
-
-    # Explicit `provider:model` for pinning a specific backend.
-    for pname, mid in explicit:
-        add(f"{pname}{sep}{mid}", pname)
 
     return {"object": "list", "data": data}
