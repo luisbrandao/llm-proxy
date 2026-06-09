@@ -41,11 +41,25 @@ class Provider:
     # their requests are rejected with 401. Authentication is a valid proxy key
     # in the `Authorization: Bearer` header (see AUTH_KEYS).
     require_permission: bool = False
+    # Path segment to strip from the incoming request before appending to
+    # base_url. Lets backends whose OpenAI-compatible root isn't `/v1` work —
+    # e.g. Google Gemini lives at `/v1beta/openai/...`, so strip `v1` and set
+    # base_url to `.../v1beta/openai`.
+    strip_path_prefix: str = ""
 
     @property
     def lists_all(self) -> bool:
         """Empty enabled_models means: expose every model the provider has."""
         return not self.enabled_models
+
+
+def strip_prefix(provider, path: str) -> str:
+    """Drop a backend's `strip_path_prefix` from an incoming path (if present)."""
+    p = path.lstrip("/")
+    prefix = (provider.strip_path_prefix or "").strip("/")
+    if prefix and (p == prefix or p.startswith(prefix + "/")):
+        p = p[len(prefix):].lstrip("/")
+    return p
 
 
 @dataclass
@@ -93,6 +107,7 @@ def _load():
                 slots=(int(slots) if slots is not None else None),
                 priority=int(item.get("priority", idx)),
                 require_permission=bool(item.get("require_permission", False)),
+                strip_path_prefix=str(item.get("strip_path_prefix", "")),
             )
         )
 

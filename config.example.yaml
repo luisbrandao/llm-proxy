@@ -73,6 +73,18 @@ providers:
     slots: 10
     cache_ttl: 3600
 
+  # Google Gemini via its OpenAI-compatible endpoint (NOT the native
+  # generateContent API). Standard Bearer auth + `messages` body; the only quirk
+  # is the path root is /v1beta/openai, handled by strip_path_prefix.
+  - name: google
+    api_key: "${GEMINI_API_KEY}"
+    require_permission: true
+    base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
+    strip_path_prefix: "v1"     # /v1/chat/completions -> /v1beta/openai/chat/completions
+    enabled_models: []          # [] = live-discover; or list e.g. [gemini-flash-latest]
+    slots: 10
+    cache_ttl: 3600
+
 # Logical models: one client-facing name backed by several prioritized targets.
 # Use this when the same logical model exists on backends under *different* real
 # ids (e.g. flash on OpenRouter vs DeepSeek). Backends that expose the *same* id

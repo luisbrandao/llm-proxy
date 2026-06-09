@@ -55,7 +55,7 @@ async def provider_model_ids(provider: conf.Provider):
 
 
 async def _fetch_live(provider: conf.Provider):
-    url = f"{provider.base_url}/v1/models"
+    url = f"{provider.base_url}/{conf.strip_prefix(provider, 'v1/models')}"
     headers = {}
     if provider.api_key:
         headers["authorization"] = f"Bearer {provider.api_key}"

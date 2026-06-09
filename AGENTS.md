@@ -96,3 +96,6 @@ if you extend behavior substantially.
 - `queue_timeout: 0` means wait forever (the current default).
 - Live discovery is cached per backend for `cache_ttl`; a down backend caches an empty list
   for the full ttl (no hammering) and silently rejoins on recovery.
+- `/v1/models` hides ids that are targets of a logical model (clients use the stable logical
+  name). A logical model is always listed regardless of backend liveness, so the catalog
+  stays stable as backends come and go.

@@ -145,6 +145,7 @@ routing:
 | `slots` | Max concurrent in-flight requests (shared across the backend's models). Omit = unlimited |
 | `priority` | Preference when a model has several backends; lower wins. Default = config order |
 | `require_permission` | `true` → gated behind a proxy auth key (default `false`) |
+| `strip_path_prefix` | Path segment removed before appending to `base_url`. For OpenAI-compatible backends whose root isn't `/v1` — e.g. Google Gemini (`v1` → its `/v1beta/openai/...`) |
 | `model_map` | Optional incoming→upstream model name rewrites |
 | `provider_routing` | OpenRouter only — per-model upstream pinning (list = strict order, dict = verbatim `provider` field) |
 | `cache_ttl` | Seconds the live `/models` result is cached for this backend |
@@ -209,10 +210,13 @@ model name (e.g. `deepseek-v4-flash`). Pass `Authorization: Bearer <key>` for ga
 Lists, deduplicated: aliases, logical models, and each bare model id once. A model served
 by several backends appears a **single** time (the proxy load-balances behind it).
 Backend-prefixed `provider:model` ids are **not** listed — they still work for pinning a
-specific backend, but advertising them would just duplicate the clean names. Live-discovered
-backends are queried (`GET {base_url}/v1/models`), cached for `cache_ttl`, coalesced via
-single-flight so a burst of cold requests triggers one probe per backend; offline backends
-drop out. Gated backends are hidden from callers without a valid key.
+specific backend, but advertising them would just duplicate the clean names. Likewise, any
+id that is a **target of a logical model is hidden** — clients use the stable logical name
+instead, so per-backend variants (e.g. quantizations) don't flap in and out of the list as
+backends come and go. Live-discovered backends are queried (`GET {base_url}/v1/models`),
+cached for `cache_ttl`, coalesced via single-flight so a burst of cold requests triggers one
+probe per backend; offline backends drop out. Gated backends are hidden from callers
+without a valid key.
 
 ## Prometheus Metrics
 

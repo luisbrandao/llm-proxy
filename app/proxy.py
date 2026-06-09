@@ -26,7 +26,7 @@ logger = logging.getLogger("llm-proxy")
 
 
 def _build_url(provider: Provider, path: str) -> str:
-    return f"{provider.base_url}/{path.lstrip('/')}"
+    return f"{provider.base_url}/{conf.strip_prefix(provider, path)}"
 
 
 def _build_headers(provider: Provider, request: Request) -> dict:
