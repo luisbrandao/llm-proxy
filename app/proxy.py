@@ -351,6 +351,24 @@ async def _handle_stream(
     )
 
 
+def _routing_for(provider: Provider, model: str):
+    """Resolve the upstream routing object for a model, or None.
+
+    Looks up `provider.provider_routing` by resolved model id, falling back to
+    a "*" default. A list value pins strictly (order + allow_fallbacks=false);
+    a dict is passed through verbatim (full OpenRouter `provider` control).
+    """
+    routing = provider.provider_routing
+    if not routing:
+        return None
+    spec = routing.get(model, routing.get("*"))
+    if isinstance(spec, list):
+        return {"order": spec, "allow_fallbacks": False}
+    if isinstance(spec, dict):
+        return spec
+    return None
+
+
 async def proxy_request(request: Request, path: str) -> Union[Response, StreamingResponse]:
     body = await request.body()
     body_str = body.decode("utf-8", errors="replace")
@@ -367,6 +385,12 @@ async def proxy_request(request: Request, path: str) -> Union[Response, Streamin
             provider, model = resolve_provider(raw_model)
             if provider is not None:
                 payload["model"] = model
+                # Inject upstream routing (e.g. OpenRouter `provider`) unless the
+                # client already specified its own — client wins.
+                if "provider" not in payload:
+                    routing = _routing_for(provider, model)
+                    if routing is not None:
+                        payload["provider"] = routing
                 body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 body_str = body.decode("utf-8")
     except (json.JSONDecodeError, AttributeError):

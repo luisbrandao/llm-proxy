@@ -26,6 +26,10 @@ class Provider:
     api_key: str = ""
     enabled_models: List[str] = field(default_factory=list)
     model_map: Dict[str, str] = field(default_factory=dict)
+    # Optional per-model upstream routing (OpenRouter `provider` field). Keyed
+    # by resolved model id; value is a list of upstream slugs (strict pin) or a
+    # dict passed through verbatim. A "*" key applies to unlisted models.
+    provider_routing: Dict[str, object] = field(default_factory=dict)
     cache_ttl: int = 60
 
     @property
@@ -50,6 +54,7 @@ def _load():
                 api_key=_interpolate(item.get("api_key", "")),
                 enabled_models=item.get("enabled_models") or [],
                 model_map=item.get("model_map") or {},
+                provider_routing=item.get("provider_routing") or {},
                 cache_ttl=int(item.get("cache_ttl", 60)),
             )
         )

@@ -43,4 +43,13 @@ providers:
     enabled_models:
       - anthropic/claude-3.5-sonnet
       - openai/gpt-4o
+    # Optional: pin which upstream OpenRouter routes a model to, otherwise it
+    # picks the cheapest/available one (which may not be who you want). Keyed by
+    # resolved model id. A list pins strictly (order + allow_fallbacks=false); a
+    # dict is forwarded verbatim as OpenRouter's `provider` field. Clients that
+    # send their own `provider` field override this.
+    provider_routing:
+      anthropic/claude-3.5-sonnet: [anthropic]
+      # full control form:
+      # openai/gpt-4o: { order: [openai], allow_fallbacks: true }
     cache_ttl: 3600
