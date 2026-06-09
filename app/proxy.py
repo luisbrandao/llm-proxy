@@ -1,6 +1,8 @@
+import gzip
 import json
 import logging
 import time
+import zlib
 from datetime import timedelta
 from typing import Union
 
@@ -29,7 +31,46 @@ def _build_headers(request: Request) -> dict:
     headers.pop("host", None)
     headers.pop("content-length", None)
     headers["authorization"] = f"Bearer {conf.DEEPSEEK_API_KEY}"
+    # Only advertise encodings we can decode with the stdlib. Otherwise
+    # DeepSeek may reply with brotli, which we'd be unable to uncompress.
+    headers["accept-encoding"] = "gzip, deflate"
     return headers
+
+
+def _decompress(raw: bytes, encoding: str) -> bytes:
+    """Decompress an upstream response body based on its Content-Encoding.
+
+    Handles gzip, deflate, brotli and zstd. Unknown or empty encodings are
+    returned unchanged. If decompression fails the raw bytes are returned so
+    the proxy never crashes on an unexpected body.
+    """
+    encoding = (encoding or "").strip().lower()
+    if not encoding or encoding == "identity":
+        return raw
+
+    try:
+        if encoding == "gzip":
+            return gzip.decompress(raw)
+        if encoding == "deflate":
+            try:
+                return zlib.decompress(raw)
+            except zlib.error:
+                # Raw deflate stream without zlib header/trailer.
+                return zlib.decompress(raw, -zlib.MAX_WBITS)
+        if encoding == "br":
+            import brotli  # type: ignore
+
+            return brotli.decompress(raw)
+        if encoding == "zstd":
+            import zstandard  # type: ignore
+
+            return zstandard.ZstdDecompressor().decompress(raw)
+    except Exception as e:  # noqa: BLE001 - never let decompression crash the proxy
+        logger.warning(f"Failed to decompress '{encoding}' response: {e}")
+        return raw
+
+    logger.warning(f"Unknown Content-Encoding '{encoding}', passing body through")
+    return raw
 
 
 def _log_curl(method: str, url: str, headers: dict, body: str) -> None:
@@ -78,10 +119,16 @@ async def _handle_non_stream(
     start = time.time()
 
     async with httpx.AsyncClient(timeout=600.0) as client:
-        resp = await client.request(method, url, headers=headers, content=body)
+        async with client.stream(method, url, headers=headers, content=body) as resp:
+            # Read the raw, undecoded bytes so we control decompression
+            # ourselves (httpx cannot decode brotli/zstd without extra libs and
+            # would otherwise pass compressed bytes straight through).
+            raw = b"".join([chunk async for chunk in resp.aiter_raw()])
 
         duration = time.time() - start
-        resp_body = resp.text
+
+        resp_bytes = _decompress(raw, resp.headers.get("content-encoding", ""))
+        resp_body = resp_bytes.decode("utf-8", errors="replace")
 
         in_tokens = 0
         out_tokens = 0
