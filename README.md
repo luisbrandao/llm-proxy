@@ -146,6 +146,7 @@ routing:
 | `priority` | Preference when a model has several backends; lower wins. Default = config order |
 | `require_permission` | `true` → gated behind a proxy auth key (default `false`) |
 | `strip_path_prefix` | Path segment removed before appending to `base_url`. For OpenAI-compatible backends whose root isn't `/v1` — e.g. Google Gemini (`v1` → its `/v1beta/openai/...`) |
+| `strip_fields` | Top-level request-body keys to drop before forwarding. For strict backends that 400 on unknown fields (e.g. Google rejects the `num_ctx` some clients inject) |
 | `model_map` | Optional incoming→upstream model name rewrites |
 | `provider_routing` | OpenRouter only — per-model upstream pinning (list = strict order, dict = verbatim `provider` field) |
 | `cache_ttl` | Seconds the live `/models` result is cached for this backend |

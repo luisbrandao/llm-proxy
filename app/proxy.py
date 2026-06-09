@@ -364,6 +364,9 @@ def _build_body(payload: dict, provider: Provider, model: str):
         opts = dict(p.get("stream_options") or {})
         opts.setdefault("include_usage", True)
         p["stream_options"] = opts
+    # Drop fields a strict backend would reject (e.g. Google 400s on `num_ctx`).
+    for f in provider.strip_fields:
+        p.pop(f, None)
     body = json.dumps(p, ensure_ascii=False).encode("utf-8")
     return body, body.decode("utf-8")
 

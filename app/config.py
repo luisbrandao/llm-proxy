@@ -46,6 +46,10 @@ class Provider:
     # e.g. Google Gemini lives at `/v1beta/openai/...`, so strip `v1` and set
     # base_url to `.../v1beta/openai`.
     strip_path_prefix: str = ""
+    # Top-level request-body fields to drop before forwarding. For strict
+    # backends (Google rejects any unknown field with a 400) — e.g. clients that
+    # inject Ollama-isms like `num_ctx`. Default: keep everything.
+    strip_fields: List[str] = field(default_factory=list)
 
     @property
     def lists_all(self) -> bool:
@@ -108,6 +112,7 @@ def _load():
                 priority=int(item.get("priority", idx)),
                 require_permission=bool(item.get("require_permission", False)),
                 strip_path_prefix=str(item.get("strip_path_prefix", "")),
+                strip_fields=item.get("strip_fields") or [],
             )
         )
 

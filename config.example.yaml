@@ -81,6 +81,7 @@ providers:
     require_permission: true
     base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
     strip_path_prefix: "v1"     # /v1/chat/completions -> /v1beta/openai/chat/completions
+    strip_fields: [num_ctx]     # Google 400s on unknown fields some clients inject
     enabled_models: []          # [] = live-discover; or list e.g. [gemini-flash-latest]
     slots: 10
     cache_ttl: 3600
