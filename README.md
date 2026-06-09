@@ -220,17 +220,35 @@ Scrape `http://<host>:8000/metrics`:
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `deepseek_proxy_requests_total` | Counter | `provider`, `model` | Completed requests |
-| `deepseek_proxy_tokens_input_total` | Counter | `provider`, `model` | Cumulative input tokens |
-| `deepseek_proxy_tokens_output_total` | Counter | `provider`, `model` | Cumulative output tokens |
-| `deepseek_proxy_request_duration_seconds` | Histogram | `provider`, `model` | Request latency (0.1–600s) |
-| `deepseek_proxy_errors_total` | Counter | `provider`, `model`, `status_code` | Failed requests |
-| `deepseek_proxy_slots_in_use` | Gauge | `provider` | In-flight requests holding a slot |
-| `deepseek_proxy_queue_waiting` | Gauge | — | Requests currently waiting for a slot |
-| `deepseek_proxy_failovers_total` | Counter | `provider` | Failovers away from a backend |
+| `llm_proxy_requests_total` | Counter | `provider`, `model` | Completed requests |
+| `llm_proxy_tokens_input_total` | Counter | `provider`, `model` | Cumulative input tokens |
+| `llm_proxy_tokens_output_total` | Counter | `provider`, `model` | Cumulative output tokens |
+| `llm_proxy_request_duration_seconds` | Histogram | `provider`, `model` | Request latency (0.1–600s) |
+| `llm_proxy_errors_total` | Counter | `provider`, `model`, `status_code` | Failed requests |
+| `llm_proxy_slots_in_use` | Gauge | `provider` | In-flight requests holding a slot |
+| `llm_proxy_queue_waiting` | Gauge | — | Requests currently waiting for a slot |
+| `llm_proxy_failovers_total` | Counter | `provider` | Failovers away from a backend |
 
-> The `deepseek_proxy_` prefix is kept for dashboard back-compat; the `provider` label
-> distinguishes upstreams.
+> **Metric prefix:** as of the multi-backend rework these use `llm_proxy_` (was
+> `deepseek_proxy_`). Update existing Grafana/alert queries accordingly.
+
+### Persistence across restarts (optional)
+
+In-memory counters reset to zero on restart, which Prometheus sees as a counter reset and
+loses the delta around the reboot. Enable **`METRICS_PERSIST=true`** to snapshot the
+cumulative counters to `METRICS_PERSIST_PATH` (lazily, every `METRICS_FLUSH_INTERVAL`
+seconds and on graceful shutdown) and re-seed them on boot, keeping totals continuous.
+
+Only counters are persisted; live gauges (`slots_in_use`, `queue_waiting`) and the latency
+histogram intentionally reset. **The path must be on a volume that outlives the
+container** (the bundled `docker-compose.yml` mounts `./data`), otherwise the file is
+recreated empty each restart and persistence is a no-op.
+
+| Env var | Default | Description |
+|---|---|---|
+| `METRICS_PERSIST` | `false` | Enable counter persistence |
+| `METRICS_PERSIST_PATH` | `metrics_state.json` | Where the snapshot is written (use a mounted volume) |
+| `METRICS_FLUSH_INTERVAL` | `30` | Seconds between lazy snapshots |
 
 ## Token Logging
 
@@ -246,8 +264,10 @@ upstream response pretty-printed (streaming reassembled into one JSON with
 to match this `timestamp - level - message` style.
 
 > **Streaming token counts:** upstreams only emit a `usage` block in a streamed response
-> when the client sends `stream_options: {"include_usage": true}`. Without it, streamed
-> token metrics/logs are `0` (content still streams fine). Non-streaming always reports usage.
+> when the request sets `stream_options: {"include_usage": true}`. The proxy **injects
+> this automatically** on streamed requests (unless the client explicitly set it), so
+> token metrics/logs are reliable for streams too. As a result the client receives a final
+> usage chunk (standard OpenAI streaming behavior). Non-streaming always reports usage.
 
 ## CI / CD
 

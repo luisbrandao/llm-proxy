@@ -21,8 +21,9 @@ decompresses the response. Single process, async, one uvicorn worker.
 | `app/registry.py` | `/v1/models` listing, live model discovery (cached, single-flight), and backend health (`mark_down`/`is_down`/`clear_down`). |
 | `app/auth.py` | Bearer-key gate: `is_authorized(request)`, `restricted(provider)`. |
 | `app/proxy.py` | Request lifecycle: parse → resolve → gate → `_dispatch` (acquire slot, build body, forward, failover) → `_handle_non_stream` / `_handle_stream`. Also decompression + upstream error mapping. |
-| `app/metrics.py` | Prometheus counters/gauges. |
-| `app/main.py` | FastAPI app, routes, logging unification. |
+| `app/metrics.py` | Prometheus counters/gauges (`llm_proxy_` prefix) + `PERSISTABLE_COUNTERS`. |
+| `app/persistence.py` | Optional: snapshot/restore cumulative counters to disk (`load`/`dump`/`flush_loop`). |
+| `app/main.py` | FastAPI app, routes, logging unification, lifespan (metrics load/flush/dump). |
 
 ## Request lifecycle (`proxy.proxy_request`)
 
@@ -56,6 +57,10 @@ decompresses the response. Single process, async, one uvicorn worker.
   `Accept-Encoding` is capped to `gzip, deflate` in `_build_headers`. Keep these aligned.
 - **Auth gate consistency.** Any new model-listing or routing path must apply the same
   `require_permission` filtering as `registry.list_models` and `proxy_request`.
+- **Metric names use the `llm_proxy_` prefix** (renamed from `deepseek_proxy_`). Only
+  cumulative counters are persisted (`metrics.PERSISTABLE_COUNTERS`); never persist gauges
+  or the histogram. Persistence must never crash startup or a request — failures are logged
+  and swallowed.
 
 ## Conventions
 

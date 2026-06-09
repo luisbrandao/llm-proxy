@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 .env
 config.yaml
+
+# Persisted metric state (lives on a mounted volume in production)
+data/
+metrics_state.json

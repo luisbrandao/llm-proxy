@@ -1,10 +1,11 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
-from app import auth
+from app import auth, persistence
 from app.metrics import metrics_response
 from app.proxy import proxy_request
 from app.registry import list_models
@@ -32,7 +33,14 @@ def _unify_logging() -> None:
 async def lifespan(app: FastAPI):
     # Runs after uvicorn has configured its logging, so our reformat sticks.
     _unify_logging()
-    yield
+    # Restore persisted counters, then snapshot them periodically and on shutdown.
+    persistence.load()
+    flush_task = asyncio.create_task(persistence.flush_loop())
+    try:
+        yield
+    finally:
+        flush_task.cancel()
+        persistence.dump()
 
 
 app = FastAPI(title="LLM Proxy", lifespan=lifespan)

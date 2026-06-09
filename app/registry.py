@@ -6,7 +6,7 @@ import httpx
 
 from app import config as conf
 
-logger = logging.getLogger("deepseek-proxy")
+logger = logging.getLogger("llm-proxy")
 
 # Probe timeout for live model discovery. Kept short so a powered-off or
 # otherwise unreachable backend fails fast instead of blocking the listing for

@@ -4,7 +4,7 @@ from typing import List
 from app import config as conf
 from app import registry
 
-logger = logging.getLogger("deepseek-proxy")
+logger = logging.getLogger("llm-proxy")
 
 
 def _explicit(raw: str):

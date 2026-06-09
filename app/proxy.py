@@ -22,7 +22,7 @@ from app.metrics import (
     TOKENS_OUTPUT_TOTAL,
 )
 
-logger = logging.getLogger("deepseek-proxy")
+logger = logging.getLogger("llm-proxy")
 
 
 def _build_url(provider: Provider, path: str) -> str:
@@ -347,14 +347,23 @@ def _routing_for(provider: Provider, model: str):
 
 
 def _build_body(payload: dict, provider: Provider, model: str):
-    """Rewrite the request body for a chosen target: set the real model id and
-    inject upstream routing (OpenRouter `provider`) unless the client set it."""
+    """Rewrite the request body for a chosen target: set the real model id,
+    inject upstream routing (OpenRouter `provider`), and ask for usage on streams.
+
+    Each defers to the client: an explicit `provider` or `stream_options` wins.
+    """
     p = dict(payload)
     p["model"] = model
     if "provider" not in p:
         routing = _routing_for(provider, model)
         if routing is not None:
             p["provider"] = routing
+    # For streaming, ask the upstream to emit a final `usage` chunk so our token
+    # metrics are reliable without depending on the client to request it.
+    if p.get("stream"):
+        opts = dict(p.get("stream_options") or {})
+        opts.setdefault("include_usage", True)
+        p["stream_options"] = opts
     body = json.dumps(p, ensure_ascii=False).encode("utf-8")
     return body, body.decode("utf-8")
 
