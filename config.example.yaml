@@ -1,9 +1,10 @@
 # LLM Proxy configuration.
-# Copy to config.yaml and fill in. API keys support ${ENV_VAR} interpolation
-# so secrets can stay in the environment instead of this file.
+# Copy to config.yaml and fill in. Provider API keys go inline below; they may
+# optionally be pulled from the environment via ${ENV_VAR} interpolation instead.
 #
-# Runtime flags (LOG_INPUT, LOG_OUTPUT, PORT) are NOT here — set them as
-# environment variables in docker-compose.yml.
+# Runtime flags (LOG_INPUT, LOG_OUTPUT, PORT) and the proxy auth keys
+# (PROXY_API_KEYS) are NOT here — set them as environment variables in
+# docker-compose.yml / .env.
 
 # Global aliases: simple name -> "provider:model" target.
 # Clients can request `model: "chat"` and it resolves to deepseek:deepseek-chat.
@@ -14,12 +15,20 @@ aliases:
   llama: ollamaCitrine:llama3
   sonnet: openRouter:anthropic/claude-3.5-sonnet
 
+# Proxy auth keys gate any backend marked `require_permission: true`. Set them
+# via the PROXY_API_KEYS env var (comma-separated for several). Clients pass one
+# as `Authorization: Bearer <key>`. A caller with a valid key sees and uses
+# everything; a caller without one only sees/uses the open backends. With no
+# keys configured the gate is inert (everything open).
+
 # Each backend has `slots` (max concurrent in-flight requests, shared across all
-# its models; omit = unlimited) and `priority` (lower = preferred when a model is
-# served by several backends; defaults to config order).
+# its models; omit = unlimited), `priority` (lower = preferred when a model is
+# served by several backends; defaults to config order), and an optional
+# `require_permission` flag (default false) that puts it behind the auth gate.
 providers:
   - name: deepseek
-    api_key: "${DEEPSEEK_API_KEY}"
+    api_key: "sk-your-deepseek-key"   # or "${DEEPSEEK_API_KEY}" to read from env
+    require_permission: true   # paid backend -> only authenticated callers
     base_url: "https://api.deepseek.com"
     enabled_models: [deepseek-v4-pro, deepseek-v4-flash]
     slots: 10
@@ -28,9 +37,9 @@ providers:
       deepseek-chat: deepseek-v4-pro
       deepseek-reasoner: deepseek-v4-flash
 
-  - name: ollamaCitrine
+  - name: ollama
     api_key: ""
-    base_url: "http://citrine.brandao:11434"   # Ollama serves plain HTTP
+    base_url: "http://localhost:11434"   # Ollama serves plain HTTP
     enabled_models: []        # empty = expose all models (live-discovered)
     slots: 1                  # single GPU box
     priority: 1               # faster -> preferred for models it shares with gw
@@ -38,14 +47,15 @@ providers:
 
   - name: ollamaGW
     api_key: ""
-    base_url: "http://gw.brandao:11434"        # Ollama serves plain HTTP
+    base_url: "http://other_machine:11434"        # Ollama serves plain HTTP
     enabled_models: []        # empty = expose all models (live-discovered)
     slots: 1
     priority: 2               # slower -> only used when citrine is busy
     cache_ttl: 10
 
   - name: openRouter
-    api_key: "${OPENROUTER_API_KEY}"
+    api_key: "sk-your-openrouter-key"   # or "${OPENROUTER_API_KEY}" to read from env
+    require_permission: true   # paid backend -> only authenticated callers
     base_url: "https://openrouter.ai/api"
     # OpenRouter has too many models — pick the ones to expose upstream.
     enabled_models:

@@ -37,6 +37,10 @@ class Provider:
     # Preference when a logical model can run on several backends. Lower wins.
     # Defaults to the provider's position in the config list.
     priority: int = 100
+    # If true, this backend's models are hidden from unauthenticated clients and
+    # their requests are rejected with 401. Authentication is a valid proxy key
+    # in the `Authorization: Bearer` header (see AUTH_KEYS).
+    require_permission: bool = False
 
     @property
     def lists_all(self) -> bool:
@@ -88,6 +92,7 @@ def _load():
                 cache_ttl=int(item.get("cache_ttl", 60)),
                 slots=(int(slots) if slots is not None else None),
                 priority=int(item.get("priority", idx)),
+                require_permission=bool(item.get("require_permission", False)),
             )
         )
 
@@ -114,10 +119,23 @@ def _load():
         down_backoff=float(r.get("down_backoff", 15)),
     )
 
-    return providers, aliases, logical, routing
+    # Accepted proxy keys gate the `require_permission` backends. Sourced from
+    # the PROXY_API_KEYS env var (comma-separated) and/or `auth.keys` in config
+    # (which supports ${ENV_VAR} interpolation). Empty => gate disabled.
+    auth_keys = set()
+    for k in (raw.get("auth") or {}).get("keys") or []:
+        v = _interpolate(str(k)).strip()
+        if v:
+            auth_keys.add(v)
+    for k in os.environ.get("PROXY_API_KEYS", "").split(","):
+        k = k.strip()
+        if k:
+            auth_keys.add(k)
+
+    return providers, aliases, logical, routing, auth_keys
 
 
-PROVIDERS, ALIASES, LOGICAL_MODELS, ROUTING = _load()
+PROVIDERS, ALIASES, LOGICAL_MODELS, ROUTING, AUTH_KEYS = _load()
 PROVIDERS_BY_NAME = {p.name: p for p in PROVIDERS}
 
 

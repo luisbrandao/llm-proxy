@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
+from app import auth
 from app.metrics import metrics_response
 from app.proxy import proxy_request
 from app.registry import list_models
@@ -50,8 +51,8 @@ async def metrics():
 
 @app.get("/models")
 @app.get("/v1/models")
-async def models():
-    return await list_models()
+async def models(request: Request):
+    return await list_models(authorized=auth.is_authorized(request))
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])

@@ -11,7 +11,7 @@ from fastapi import Request
 from fastapi.responses import Response, StreamingResponse
 
 from app import config as conf
-from app import registry, router, slots
+from app import auth, registry, router, slots
 from app.config import Provider
 from app.metrics import (
     ERRORS_TOTAL,
@@ -417,9 +417,22 @@ async def _dispatch(
     return _backend_error(last_provider, "unknown", last_exc)
 
 
+def _unauthorized(model: str) -> Response:
+    payload = {
+        "error": {
+            "message": f"Model '{model}' requires authentication" if model else "Authentication required",
+            "type": "unauthorized",
+            "code": 401,
+        }
+    }
+    return Response(content=json.dumps(payload), status_code=401, media_type="application/json")
+
+
 async def proxy_request(request: Request, path: str) -> Union[Response, StreamingResponse]:
     body = await request.body()
     body_str = body.decode("utf-8", errors="replace")
+
+    authorized = auth.is_authorized(request)
 
     payload = None
     raw_model = None
@@ -437,6 +450,8 @@ async def proxy_request(request: Request, path: str) -> Union[Response, Streamin
         if not conf.PROVIDERS:
             return Response(content="No providers configured", status_code=503)
         provider = conf.PROVIDERS[0]
+        if not authorized and provider.require_permission:
+            return _unauthorized("")
         try:
             if is_stream:
                 return await _handle_stream(request, provider, path, body, body_str, "unknown")
@@ -447,6 +462,13 @@ async def proxy_request(request: Request, path: str) -> Union[Response, Streamin
     targets = await router.resolve(raw_model)
     if not targets:
         return Response(content="No providers configured", status_code=503)
+
+    # Gate: unauthenticated callers can only reach open backends. If the model
+    # lives solely behind permission-required backends, reject with 401.
+    if not authorized:
+        targets = [t for t in targets if not auth.restricted(t.provider)]
+        if not targets:
+            return _unauthorized(raw_model)
 
     # Prefer backends not currently marked down, but keep them as a last resort.
     healthy = [t for t in targets if not registry.is_down(t.provider)]

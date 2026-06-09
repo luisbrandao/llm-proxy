@@ -92,7 +92,7 @@ async def _cached_live(provider: conf.Provider):
         return ids
 
 
-async def list_models() -> dict:
+async def list_models(authorized: bool = True) -> dict:
     """Aggregate models, presenting clean server-less names clients can use directly.
 
     Listed (deduped, in this order): aliases, explicit logical models, and bare
@@ -100,10 +100,18 @@ async def list_models() -> dict:
     `provider:model` ids are not listed — they still work for pinning a specific
     backend, but advertising them would just duplicate the clean names. Offline
     backends drop out.
+
+    When `authorized` is False, backends with `require_permission` are excluded:
+    their models are hidden, and shared models are listed with only the open
+    backends as owners.
     """
     sep = conf.PROVIDER_SEP
     data = []
     seen = set()
+
+    def visible(provider_name: str) -> bool:
+        p = conf.PROVIDERS_BY_NAME.get(provider_name)
+        return authorized or not (p and p.require_permission)
 
     def add(mid: str, owner: str):
         if mid in seen:
@@ -114,16 +122,20 @@ async def list_models() -> dict:
     # Aliases first (e.g. `chat` -> deepseek:deepseek-chat).
     for alias, target in conf.ALIASES.items():
         owner = target.split(sep, 1)[0] if sep in target else "alias"
+        if sep in target and not visible(owner):
+            continue
         add(alias, owner)
 
-    # Explicit logical models (may span backends with differing real ids).
+    # Explicit logical models (may span backends with differing real ids). Listed
+    # if at least one of its targets is visible to the caller.
     for name, lm in conf.LOGICAL_MODELS.items():
-        owners = ",".join(t.provider for t in lm.targets)
-        add(name, owners or "logical")
+        owners = [t.provider for t in lm.targets if visible(t.provider)]
+        if not owners:
+            continue
+        add(name, ",".join(owners) or "logical")
 
-    # Probe every live-discovery backend concurrently, so one slow or offline
-    # box waits in parallel with the others instead of serializing behind them.
-    live_providers = [p for p in conf.PROVIDERS if p.lists_all]
+    # Probe only the backends visible to this caller, concurrently.
+    live_providers = [p for p in conf.PROVIDERS if p.lists_all and visible(p.name)]
     live_results = await asyncio.gather(
         *(_cached_live(p) for p in live_providers),
         return_exceptions=True,
@@ -136,9 +148,11 @@ async def list_models() -> dict:
         else:
             live_ids[provider.name] = result
 
-    # Group each model id by the backends that serve it.
+    # Group each model id by the visible backends that serve it.
     by_model = {}
     for provider in conf.PROVIDERS:
+        if not visible(provider.name):
+            continue
         ids = live_ids.get(provider.name, []) if provider.lists_all else provider.enabled_models
         for mid in ids:
             by_model.setdefault(mid, []).append(provider.name)
