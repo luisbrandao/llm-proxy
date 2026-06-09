@@ -4,13 +4,14 @@ import logging
 import time
 import zlib
 from datetime import timedelta
-from typing import Union
+from typing import Optional, Tuple, Union
 
 import httpx
 from fastapi import Request
 from fastapi.responses import Response, StreamingResponse
 
 from app import config as conf
+from app.config import Provider
 from app.metrics import (
     ERRORS_TOTAL,
     REQUEST_DURATION,
@@ -22,17 +23,49 @@ from app.metrics import (
 logger = logging.getLogger("deepseek-proxy")
 
 
-def _build_url(path: str) -> str:
-    return f"{conf.DEEPSEEK_BASE_URL}/{path.lstrip('/')}"
+def resolve_provider(model: str) -> Tuple[Optional[Provider], str]:
+    """Map an incoming model name to (provider, real_model).
+
+    Routing order:
+      0. Expand a global alias (simple name -> "provider:model").
+      1. Explicit `provider:model` prefix.
+      2. First provider whose enabled_models lists the bare name.
+      3. Fallback: first configured provider.
+    The provider's model_map is applied to the resolved name.
+    """
+    model = conf.ALIASES.get(model, model)
+    sep = conf.PROVIDER_SEP
+    if sep in model:
+        prefix, _, rest = model.partition(sep)
+        provider = conf.PROVIDERS_BY_NAME.get(prefix)
+        if provider:
+            return provider, provider.model_map.get(rest, rest)
+
+    for provider in conf.PROVIDERS:
+        if model in provider.enabled_models:
+            return provider, provider.model_map.get(model, model)
+
+    if conf.PROVIDERS:
+        provider = conf.PROVIDERS[0]
+        return provider, provider.model_map.get(model, model)
+
+    return None, model
 
 
-def _build_headers(request: Request) -> dict:
+def _build_url(provider: Provider, path: str) -> str:
+    return f"{provider.base_url}/{path.lstrip('/')}"
+
+
+def _build_headers(provider: Provider, request: Request) -> dict:
     headers = dict(request.headers)
     headers.pop("host", None)
     headers.pop("content-length", None)
-    headers["authorization"] = f"Bearer {conf.DEEPSEEK_API_KEY}"
-    # Only advertise encodings we can decode with the stdlib. Otherwise
-    # DeepSeek may reply with brotli, which we'd be unable to uncompress.
+    if provider.api_key:
+        headers["authorization"] = f"Bearer {provider.api_key}"
+    else:
+        headers.pop("authorization", None)
+    # Only advertise encodings we can decode with the stdlib. Otherwise a
+    # backend may reply with brotli, which we'd be unable to uncompress.
     headers["accept-encoding"] = "gzip, deflate"
     return headers
 
@@ -90,28 +123,29 @@ def _log_curl(method: str, url: str, headers: dict, body: str) -> None:
     logger.info(f"Request:\n{cmd}")
 
 
-def _log_summary(model: str, in_tokens: int, out_tokens: int, duration: float) -> None:
+def _log_summary(provider: str, model: str, in_tokens: int, out_tokens: int, duration: float) -> None:
     speed = out_tokens / duration if duration > 0 else 0
     time_str = str(timedelta(seconds=int(duration)))
     logger.info(
-        f"Tokens - Model: {model}, In: {in_tokens}, Out: {out_tokens}, "
+        f"Tokens - Provider: {provider}, Model: {model}, In: {in_tokens}, Out: {out_tokens}, "
         f"Time: {time_str}, Speed: {speed:.2f} t/s"
     )
 
 
-def _record_metrics(model: str, in_tokens: int, out_tokens: int, duration: float) -> None:
-    REQUESTS_TOTAL.labels(model=model).inc()
-    TOKENS_INPUT_TOTAL.labels(model=model).inc(in_tokens)
-    TOKENS_OUTPUT_TOTAL.labels(model=model).inc(out_tokens)
-    REQUEST_DURATION.labels(model=model).observe(duration)
+def _record_metrics(provider: str, model: str, in_tokens: int, out_tokens: int, duration: float) -> None:
+    REQUESTS_TOTAL.labels(provider=provider, model=model).inc()
+    TOKENS_INPUT_TOTAL.labels(provider=provider, model=model).inc(in_tokens)
+    TOKENS_OUTPUT_TOTAL.labels(provider=provider, model=model).inc(out_tokens)
+    REQUEST_DURATION.labels(provider=provider, model=model).observe(duration)
 
 
 async def _handle_non_stream(
-    request: Request, path: str, body: bytes, body_str: str, model: str
+    request: Request, provider: Provider, path: str, body: bytes, body_str: str, model: str
 ) -> Response:
-    url = _build_url(path)
-    headers = _build_headers(request)
+    url = _build_url(provider, path)
+    headers = _build_headers(provider, request)
     method = request.method.upper()
+    pname = provider.name
 
     if conf.LOG_INPUT:
         _log_curl(method, url, headers, body_str)
@@ -151,12 +185,12 @@ async def _handle_non_stream(
 
         if model != "unknown":
             if resp.is_error:
-                ERRORS_TOTAL.labels(model=model, status_code=str(resp.status_code)).inc()
+                ERRORS_TOTAL.labels(provider=pname, model=model, status_code=str(resp.status_code)).inc()
             else:
-                _record_metrics(model, in_tokens, out_tokens, duration)
+                _record_metrics(pname, model, in_tokens, out_tokens, duration)
 
         if in_tokens > 0 or out_tokens > 0:
-            _log_summary(model, in_tokens, out_tokens, duration)
+            _log_summary(pname, model, in_tokens, out_tokens, duration)
 
         resp_headers = dict(resp.headers)
         resp_headers.pop("content-length", None)
@@ -171,11 +205,12 @@ async def _handle_non_stream(
 
 
 async def _handle_stream(
-    request: Request, path: str, body: bytes, body_str: str, model: str
+    request: Request, provider: Provider, path: str, body: bytes, body_str: str, model: str
 ) -> StreamingResponse:
-    url = _build_url(path)
-    headers = _build_headers(request)
+    url = _build_url(provider, path)
+    headers = _build_headers(provider, request)
     method = request.method.upper()
+    pname = provider.name
 
     if conf.LOG_INPUT:
         _log_curl(method, url, headers, body_str)
@@ -237,11 +272,11 @@ async def _handle_stream(
             duration = time.time() - start
             if model != "unknown":
                 if error:
-                    ERRORS_TOTAL.labels(model=model, status_code=str(status_code)).inc()
+                    ERRORS_TOTAL.labels(provider=pname, model=model, status_code=str(status_code)).inc()
                 else:
-                    _record_metrics(model, in_tokens, out_tokens, duration)
+                    _record_metrics(pname, model, in_tokens, out_tokens, duration)
             if in_tokens > 0 or out_tokens > 0:
-                _log_summary(model, in_tokens, out_tokens, duration)
+                _log_summary(pname, model, in_tokens, out_tokens, duration)
             if delta_contents is not None:
                 full_text = "".join(delta_contents)
                 reasoning_text = "".join(reasoning_contents) if reasoning_contents else ""
@@ -275,17 +310,29 @@ async def proxy_request(request: Request, path: str) -> Union[Response, Streamin
     body = await request.body()
     body_str = body.decode("utf-8", errors="replace")
 
+    provider: Optional[Provider] = None
     model = "unknown"
     is_stream = False
+
     try:
         payload = json.loads(body_str)
-        model = payload.get("model", "unknown")
-        model = conf.MODEL_MAP.get(model, model)
+        raw_model = payload.get("model")
         is_stream = payload.get("stream", False)
+        if raw_model:
+            provider, model = resolve_provider(raw_model)
+            if provider is not None:
+                payload["model"] = model
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                body_str = body.decode("utf-8")
     except (json.JSONDecodeError, AttributeError):
         pass
 
+    if provider is None:
+        # No JSON body / no model field (e.g. non-chat calls): forward to first provider.
+        if not conf.PROVIDERS:
+            return Response(content="No providers configured", status_code=503)
+        provider = conf.PROVIDERS[0]
+
     if is_stream:
-        return await _handle_stream(request, path, body, body_str, model)
-    else:
-        return await _handle_non_stream(request, path, body, body_str, model)
+        return await _handle_stream(request, provider, path, body, body_str, model)
+    return await _handle_non_stream(request, provider, path, body, body_str, model)

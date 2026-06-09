@@ -1,0 +1,46 @@
+# LLM Proxy configuration.
+# Copy to config.yaml and fill in. API keys support ${ENV_VAR} interpolation
+# so secrets can stay in the environment instead of this file.
+#
+# Runtime flags (LOG_INPUT, LOG_OUTPUT, PORT) are NOT here — set them as
+# environment variables in docker-compose.yml.
+
+# Global aliases: simple name -> "provider:model" target.
+# Clients can request `model: "chat"` and it resolves to deepseek:deepseek-chat.
+# Aliases are also listed in /models so they're discoverable.
+aliases:
+  chat: deepseek:deepseek-chat
+  reasoner: deepseek:deepseek-reasoner
+  llama: ollamaCitrine:llama3
+  sonnet: openRouter:anthropic/claude-3.5-sonnet
+
+providers:
+  - name: deepseek
+    api_key: "${DEEPSEEK_API_KEY}"
+    base_url: "https://api.deepseek.com"
+    enabled_models: [deepseek-v4-pro, deepseek-v4-flash]
+    cache_ttl: 3600
+    model_map:
+      deepseek-chat: deepseek-v4-pro
+      deepseek-reasoner: deepseek-v4-flash
+
+  - name: ollamaCitrine
+    api_key: ""
+    base_url: "http://citrine.brandao:11434"   # Ollama serves plain HTTP
+    enabled_models: []        # empty = expose all models (live-discovered)
+    cache_ttl: 10
+
+  - name: ollamaGW
+    api_key: ""
+    base_url: "http://gw.brandao:11434"        # Ollama serves plain HTTP
+    enabled_models: []        # empty = expose all models (live-discovered)
+    cache_ttl: 10
+
+  - name: openRouter
+    api_key: "${OPENROUTER_API_KEY}"
+    base_url: "https://openrouter.ai/api"
+    # OpenRouter has too many models — pick the ones to expose upstream.
+    enabled_models:
+      - anthropic/claude-3.5-sonnet
+      - openai/gpt-4o
+    cache_ttl: 3600

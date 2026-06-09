@@ -1,13 +1,16 @@
 services:
-  deepseek-exporter:
+  llm-proxy:
     build: .
-    container_name: deepseek-exporter
+    container_name: llm-proxy
+    env_file:
+      - .env
     environment:
-      - DEEPSEEK_API_KEY=
-      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      - CONFIG_PATH=/app/config.yaml
       - LOG_INPUT=true
       - LOG_OUTPUT=true
       - PORT=8000
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
     ports:
-      - "8001:8000"    
+      - "8001:8000"
     restart: unless-stopped

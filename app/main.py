@@ -5,6 +5,7 @@ from fastapi.responses import Response
 
 from app.metrics import metrics_response
 from app.proxy import proxy_request
+from app.registry import list_models
 
 logging.basicConfig(
     level=logging.INFO,
@@ -12,7 +13,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-app = FastAPI(title="DeepSeek Proxy")
+app = FastAPI(title="LLM Proxy")
 
 
 @app.get("/health")
@@ -24,6 +25,12 @@ async def health():
 async def metrics():
     data, status, headers = metrics_response()
     return Response(content=data, status_code=status, headers=headers)
+
+
+@app.get("/models")
+@app.get("/v1/models")
+async def models():
+    return await list_models()
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
