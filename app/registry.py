@@ -134,6 +134,12 @@ async def list_models(authorized: bool = True) -> dict:
             continue
         add(name, ",".join(owners) or "logical")
 
+    # Model ids that are reachable through a logical model. We hide their raw
+    # bare ids below: clients should use the stable logical name, and the raw
+    # ids (e.g. per-quant variants) would otherwise flap in/out of the list as
+    # backends come and go.
+    logical_targets = {t.model for lm in conf.LOGICAL_MODELS.values() for t in lm.targets}
+
     # Probe only the backends visible to this caller, concurrently.
     live_providers = [p for p in conf.PROVIDERS if p.lists_all and visible(p.name)]
     live_results = await asyncio.gather(
@@ -148,13 +154,16 @@ async def list_models(authorized: bool = True) -> dict:
         else:
             live_ids[provider.name] = result
 
-    # Group each model id by the visible backends that serve it.
+    # Group each model id by the visible backends that serve it, skipping ids
+    # that a logical model already fronts.
     by_model = {}
     for provider in conf.PROVIDERS:
         if not visible(provider.name):
             continue
         ids = live_ids.get(provider.name, []) if provider.lists_all else provider.enabled_models
         for mid in ids:
+            if mid in logical_targets:
+                continue
             by_model.setdefault(mid, []).append(provider.name)
 
     # Each model id once, by its clean server-less name. When several backends
