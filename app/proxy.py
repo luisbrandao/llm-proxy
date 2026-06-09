@@ -139,6 +139,36 @@ def _record_metrics(provider: str, model: str, in_tokens: int, out_tokens: int, 
     REQUEST_DURATION.labels(provider=provider, model=model).observe(duration)
 
 
+def _backend_error(provider: Provider, model: str, exc: Exception) -> Response:
+    """Build a clean OpenAI-style error when an upstream backend is unreachable.
+
+    Backends come and go, so a connection failure is an expected condition, not
+    a crash: we translate it into a 502/504 the client can understand instead of
+    letting it surface as an unhandled 500.
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        status, kind = 504, "upstream_timeout"
+    else:
+        status, kind = 502, "upstream_unavailable"
+
+    logger.warning(f"Backend '{provider.name}' unreachable: {type(exc).__name__}: {exc}")
+    if model != "unknown":
+        ERRORS_TOTAL.labels(provider=provider.name, model=model, status_code=str(status)).inc()
+
+    payload = {
+        "error": {
+            "message": f"Upstream backend '{provider.name}' is unavailable: {exc}",
+            "type": kind,
+            "code": status,
+        }
+    }
+    return Response(
+        content=json.dumps(payload),
+        status_code=status,
+        media_type="application/json",
+    )
+
+
 async def _handle_non_stream(
     request: Request, provider: Provider, path: str, body: bytes, body_str: str, model: str
 ) -> Response:
@@ -152,61 +182,67 @@ async def _handle_non_stream(
 
     start = time.time()
 
-    async with httpx.AsyncClient(timeout=600.0) as client:
-        async with client.stream(method, url, headers=headers, content=body) as resp:
-            # Read the raw, undecoded bytes so we control decompression
-            # ourselves (httpx cannot decode brotli/zstd without extra libs and
-            # would otherwise pass compressed bytes straight through).
-            raw = b"".join([chunk async for chunk in resp.aiter_raw()])
+    try:
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            async with client.stream(method, url, headers=headers, content=body) as resp:
+                # Read the raw, undecoded bytes so we control decompression
+                # ourselves (httpx cannot decode brotli/zstd without extra libs
+                # and would otherwise pass compressed bytes straight through).
+                raw = b"".join([chunk async for chunk in resp.aiter_raw()])
+                status_code = resp.status_code
+                is_error = resp.is_error
+                resp_headers = dict(resp.headers)
+                content_encoding = resp.headers.get("content-encoding", "")
+    except httpx.RequestError as e:
+        return _backend_error(provider, model, e)
 
-        duration = time.time() - start
+    duration = time.time() - start
 
-        resp_bytes = _decompress(raw, resp.headers.get("content-encoding", ""))
-        resp_body = resp_bytes.decode("utf-8", errors="replace")
+    resp_bytes = _decompress(raw, content_encoding)
+    resp_body = resp_bytes.decode("utf-8", errors="replace")
 
-        in_tokens = 0
-        out_tokens = 0
+    in_tokens = 0
+    out_tokens = 0
+    try:
+        data = json.loads(resp_body)
+        usage = data.get("usage", {})
+        in_tokens = usage.get("prompt_tokens", 0)
+        out_tokens = usage.get("completion_tokens", 0)
+    except (json.JSONDecodeError, AttributeError):
+        pass
+
+    if conf.LOG_OUTPUT:
+        pretty_body = resp_body
         try:
-            data = json.loads(resp_body)
-            usage = data.get("usage", {})
-            in_tokens = usage.get("prompt_tokens", 0)
-            out_tokens = usage.get("completion_tokens", 0)
-        except (json.JSONDecodeError, AttributeError):
+            parsed = json.loads(resp_body)
+            pretty_body = json.dumps(parsed, indent=2, ensure_ascii=False)
+        except (json.JSONDecodeError, ValueError):
             pass
+        logger.info(f"Response ({status_code}):\n{pretty_body}")
 
-        if conf.LOG_OUTPUT:
-            pretty_body = resp_body
-            try:
-                parsed = json.loads(resp_body)
-                pretty_body = json.dumps(parsed, indent=2, ensure_ascii=False)
-            except (json.JSONDecodeError, ValueError):
-                pass
-            logger.info(f"Response ({resp.status_code}):\n{pretty_body}")
+    if model != "unknown":
+        if is_error:
+            ERRORS_TOTAL.labels(provider=pname, model=model, status_code=str(status_code)).inc()
+        else:
+            _record_metrics(pname, model, in_tokens, out_tokens, duration)
 
-        if model != "unknown":
-            if resp.is_error:
-                ERRORS_TOTAL.labels(provider=pname, model=model, status_code=str(resp.status_code)).inc()
-            else:
-                _record_metrics(pname, model, in_tokens, out_tokens, duration)
+    if in_tokens > 0 or out_tokens > 0:
+        _log_summary(pname, model, in_tokens, out_tokens, duration)
 
-        if in_tokens > 0 or out_tokens > 0:
-            _log_summary(pname, model, in_tokens, out_tokens, duration)
+    resp_headers.pop("content-length", None)
+    resp_headers.pop("transfer-encoding", None)
+    resp_headers.pop("content-encoding", None)
 
-        resp_headers = dict(resp.headers)
-        resp_headers.pop("content-length", None)
-        resp_headers.pop("transfer-encoding", None)
-        resp_headers.pop("content-encoding", None)
-
-        return Response(
-            content=resp_body,
-            status_code=resp.status_code,
-            headers=resp_headers,
-        )
+    return Response(
+        content=resp_body,
+        status_code=status_code,
+        headers=resp_headers,
+    )
 
 
 async def _handle_stream(
     request: Request, provider: Provider, path: str, body: bytes, body_str: str, model: str
-) -> StreamingResponse:
+) -> Union[Response, StreamingResponse]:
     url = _build_url(provider, path)
     headers = _build_headers(provider, request)
     method = request.method.upper()
@@ -214,6 +250,18 @@ async def _handle_stream(
 
     if conf.LOG_INPUT:
         _log_curl(method, url, headers, body_str)
+
+    # Pre-flight the connection: a StreamingResponse commits its status code
+    # before the body generator runs, so we must learn whether the backend is
+    # reachable *now* — otherwise an offline backend would yield a 200 with an
+    # empty body instead of a clean error.
+    client = httpx.AsyncClient(timeout=600.0)
+    stream_cm = client.stream(method, url, headers=headers, content=body)
+    try:
+        resp = await stream_cm.__aenter__()
+    except httpx.RequestError as e:
+        await client.aclose()
+        return _backend_error(provider, model, e)
 
     async def generate():
         start = time.time()
@@ -224,51 +272,48 @@ async def _handle_stream(
         reasoning_contents = [] if conf.LOG_OUTPUT else None
         final_chunk = None
         resp_model = model
-        status_code = 200
-        error = False
+        status_code = resp.status_code
+        error = resp.is_error
 
         try:
-            async with httpx.AsyncClient(timeout=600.0) as client:
-                async with client.stream(method, url, headers=headers, content=body) as resp:
-                    status_code = resp.status_code
-                    if resp.is_error:
-                        error = True
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
-                        text = chunk.decode("utf-8", errors="replace")
-                        buffer += text
-                        while "\n" in buffer:
-                            line, buffer = buffer.split("\n", 1)
-                            line = line.strip()
-                            if not line.startswith("data:"):
-                                continue
-                            payload = line[5:].strip()
-                            if payload == "[DONE]":
-                                continue
-                            try:
-                                data = json.loads(payload)
-                                resp_model = data.get("model", resp_model)
-                                usage = data.get("usage")
-                                if usage:
-                                    in_tokens = usage.get("prompt_tokens", in_tokens)
-                                    out_tokens = usage.get("completion_tokens", out_tokens)
-                                    final_chunk = data
-                                if delta_contents is not None:
-                                    choices = data.get("choices", [])
-                                    if choices:
-                                        delta = choices[0].get("delta", {})
-                                        content = delta.get("content", "")
-                                        reasoning = delta.get("reasoning_content")
-                                        if content:
-                                            delta_contents.append(content)
-                                        if reasoning:
-                                            reasoning_contents.append(reasoning)
-                            except json.JSONDecodeError:
-                                pass
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+                text = chunk.decode("utf-8", errors="replace")
+                buffer += text
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        continue
+                    try:
+                        data = json.loads(payload)
+                        resp_model = data.get("model", resp_model)
+                        usage = data.get("usage")
+                        if usage:
+                            in_tokens = usage.get("prompt_tokens", in_tokens)
+                            out_tokens = usage.get("completion_tokens", out_tokens)
+                            final_chunk = data
+                        if delta_contents is not None:
+                            choices = data.get("choices", [])
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                content = delta.get("content", "")
+                                reasoning = delta.get("reasoning_content")
+                                if content:
+                                    delta_contents.append(content)
+                                if reasoning:
+                                    reasoning_contents.append(reasoning)
+                    except json.JSONDecodeError:
+                        pass
         except Exception as e:
             error = True
             logger.error(f"Stream error: {e}")
         finally:
+            await stream_cm.__aexit__(None, None, None)
+            await client.aclose()
             duration = time.time() - start
             if model != "unknown":
                 if error:
