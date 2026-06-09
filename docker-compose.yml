@@ -6,10 +6,10 @@ services:
       - CONFIG_PATH=/app/config.yaml
       - LOG_INPUT=true
       - LOG_OUTPUT=true
-      - PORT=9999
+      - PORT=8000
       - PROXY_API_KEYS=sk-1234
     volumes:
       - ./config.yaml:/app/config.yaml:ro
     ports:
-      - "9999:9999"
+      - "8000:8000"
     restart: unless-stopped

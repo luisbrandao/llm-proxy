@@ -1,111 +1,199 @@
 # LLM Proxy
 
-OpenAI-compatible reverse proxy for **multiple LLM providers**, with built-in **Prometheus metrics**, **token counting**, and **structured logging**.
+OpenAI-compatible reverse proxy for **multiple LLM backends**, with **priority-based
+load balancing**, per-backend **concurrency limits (slots)**, automatic **failover**,
+a bearer-key **permission gate**, **Prometheus metrics**, **token counting**, and
+**structured logging**.
 
-Drop it between your LLM clients (Open WebUI, OpenCode, LangChain, any OpenAI SDK, etc.) and any number of upstream providers (DeepSeek, Ollama hosts, OpenRouter, …). One endpoint, one set of metrics, every provider.
+Drop it between your LLM clients (Open WebUI, OpenCode, LangChain, any OpenAI SDK, …)
+and any number of upstream backends (DeepSeek, Ollama hosts, OpenRouter, …). Clients
+request a **clean model name** — the proxy decides *which* backend actually serves it.
+
+## Highlights
+
+- **Transparent routing** — clients use a plain model name (`deepseek-v4-flash`,
+  `local.qwen-medium:low`); no need to know which server runs it.
+- **Priority + slots** — prefer your fast/cheap backend, cap concurrency per backend,
+  and **queue** requests when every candidate is busy.
+- **Failover** — if a backend errors, the request retries the next one; offline
+  backends drop out of the model list and are skipped.
+- **Permission gate** — mark paid backends `require_permission: true`; only callers
+  with a valid `Authorization: Bearer` key see or use them.
+- **OpenRouter provider routing** — pin which upstream OpenRouter uses (e.g. force
+  DeepSeek-official instead of whatever's cheapest).
+- **Response decompression** — transparently decodes gzip/deflate/brotli upstream
+  bodies that a client couldn't otherwise read.
 
 ## Architecture
 
 ```
 Your App (OpenAI client)
-       │
-       │  POST /v1/chat/completions   { "model": "deepseek:deepseek-chat" }
+       │  POST /v1/chat/completions   { "model": "deepseek-v4-flash" }
        ▼
-┌─────────────────┐
-│    llm-proxy     │  ← routes by provider prefix, adds auth, logs tokens, exports metrics
-│    :8000         │
-└───┬────┬────┬───┘
-    │    │    │
-    ▼    ▼    ▼
- DeepSeek  Ollama  OpenRouter   (any provider in config.yaml)
+┌──────────────────────────────────────────────┐
+│                  llm-proxy                     │
+│  resolve model → ordered targets               │
+│  auth gate → slot acquire (priority+queue)     │
+│  forward → failover on error → decompress      │
+│  log tokens · export metrics                   │
+└───┬─────────────┬──────────────┬───────────────┘
+    ▼             ▼              ▼
+ OpenRouter    DeepSeek     Ollama hosts        (any backend in config.yaml)
+ (10 slots)    (10 slots)   (1 slot each, citrine preferred over gw)
 ```
 
 ## How routing works
 
-Clients address a model as **`provider:model`**. The part before the first `:` selects the provider from `config.yaml`; the rest is the real model name sent upstream.
+A client sends a **model name**. The proxy resolves it to an ordered list of
+**targets** (a real model on a real backend), then admits the request to the
+highest-priority target that has a free slot.
 
-```
-deepseek:deepseek-chat        → deepseek provider, model deepseek-chat (then model_map → deepseek-v4-pro)
-ollamaGW:llama3               → ollamaGW host
-ollamaCitrine:llama3          → ollamaCitrine host   (same model name, different host — unambiguous)
-openRouter:openai/gpt-4o      → openRouter
-```
+**Resolution order:**
+1. **Alias** — a global short name → `provider:model` (e.g. `chat` → `deepseek:deepseek-chat`).
+2. **Explicit `provider:model`** — forces one backend (manual override / pinning).
+3. **Logical model** — an explicit `models:` entry mapping one client-facing name to
+   several prioritized targets (used when the real ids differ across backends).
+4. **Auto-group** — the same model id served by multiple backends is load-balanced
+   automatically, ordered by each backend's `priority` (no config needed).
+5. **Fallback** — first backend whose `enabled_models` lists it, else the first backend.
 
-Resolution order:
-0. Expand a **global alias** (simple name → `provider:model`).
-1. Explicit `provider:` prefix.
-2. Bare name listed in some provider's `enabled_models`.
-3. Fallback to the first provider in the config.
+### Slots, priority & queueing
 
-Each provider can also declare a `model_map` to rewrite incoming names (e.g. `deepseek-chat` → `deepseek-v4-pro`).
+Each backend declares `slots` (max concurrent in-flight requests, shared across all its
+models) and `priority` (lower = preferred). When a request arrives the proxy takes a
+slot from the **highest-priority candidate that has one free**. If all candidates are
+full it **waits** (indefinitely by default, or up to `routing.queue_timeout`) for the
+first slot to free.
 
-### Global aliases
+> Example: `local.qwen-medium:low` runs on `ollamaCitrine` (fast, 1 slot, priority 1)
+> and `ollamaGW` (slow, 1 slot, priority 2). Request 1 → citrine, request 2 → gw,
+> request 3 → waits for whichever frees first.
 
-For short, provider-agnostic names, define top-level `aliases` mapping a simple name to a `provider:model` target:
+### Failover
 
-```yaml
-aliases:
-  chat: deepseek:deepseek-chat
-  reasoner: deepseek:deepseek-reasoner
-  llama: ollamaCitrine:llama3
-  sonnet: openRouter:anthropic/claude-3.5-sonnet
-```
-
-Now a client can just request `model: "chat"`. Aliases resolve **before** provider routing, so they still pass through the target provider's `model_map` (`chat` → `deepseek:deepseek-chat` → `deepseek-v4-pro`). Aliases are also listed in `/models` under their simple name, so they're discoverable by tools like OpenCode.
+If a chosen backend errors (connection refused, timeout, …) the proxy releases the slot,
+marks the backend down for `routing.down_backoff` seconds, and retries the next-priority
+target. Only if **all** candidates fail does the client get an error. Streaming requests
+can fail over up to the first byte (after that the HTTP status is already committed).
 
 ## Configuration
 
-All config lives in `config.yaml` (see `config.example.yaml`). API keys support `${ENV_VAR}` interpolation so secrets stay in `.env`.
+All routing config lives in `config.yaml` (see `config.example.yaml`). Provider API keys
+go inline, or optionally via `${ENV_VAR}` interpolation. Proxy auth keys and runtime
+flags come from the environment.
 
 ```yaml
-aliases:                       # optional short names -> provider:model
+aliases:                          # optional short names -> provider:model
   chat: deepseek:deepseek-chat
-  sonnet: openRouter:anthropic/claude-3.5-sonnet
 
 providers:
   - name: deepseek
-    api_key: "${DEEPSEEK_API_KEY}"
+    api_key: "sk-..."             # or "${DEEPSEEK_API_KEY}"
+    require_permission: true      # paid -> only authenticated callers
     base_url: "https://api.deepseek.com"
     enabled_models: [deepseek-v4-pro, deepseek-v4-flash]
+    slots: 10
     cache_ttl: 3600
     model_map:
       deepseek-chat: deepseek-v4-pro
-      deepseek-reasoner: deepseek-v4-flash
+
+  - name: ollamaCitrine
+    api_key: ""                   # empty -> no auth header (Ollama)
+    base_url: "http://citrine.brandao:11434"
+    enabled_models: []            # empty -> expose ALL models (live-discovered)
+    slots: 1                      # single GPU box
+    priority: 1                   # faster -> preferred over gw
 
   - name: ollamaGW
-    api_key: ""
-    base_url: "https://gw.brandao:11434"
-    enabled_models: []      # empty = expose ALL models (live-discovered)
-    cache_ttl: 10
+    base_url: "http://gw.brandao:11434"
+    enabled_models: []
+    slots: 1
+    priority: 2
+
+  - name: openRouter
+    api_key: "sk-or-..."
+    require_permission: true
+    base_url: "https://openrouter.ai/api"
+    enabled_models: [deepseek/deepseek-v4-flash, z-ai/glm-5.1]
+    slots: 10
+    provider_routing:             # pin OpenRouter's upstream choice
+      deepseek/deepseek-v4-flash: [deepseek]
+
+# One client-facing name backed by several prioritized targets (differing real ids).
+models:
+  deepseek-v4-flash:
+    targets:
+      - {provider: openRouter, model: deepseek/deepseek-v4-flash, priority: 1}
+      - {provider: deepseek,   model: deepseek-v4-flash,         priority: 2}
+
+# Global routing behavior.
+routing:
+  queue_timeout: 0    # seconds to wait for a free slot; 0 = wait forever
+  failover: true      # retry the next target on backend error
+  auto_group: true    # identical model ids across backends load-balance
+  down_backoff: 15    # seconds a failed backend is skipped before retry
 ```
+
+### Provider fields
 
 | Field | Description |
 |---|---|
-| `name` | Provider key used as the `provider:` routing prefix |
+| `name` | Backend key, also the `provider:` routing prefix |
 | `base_url` | Upstream base URL |
-| `api_key` | Sent as `Authorization: Bearer`. Empty → no auth header (e.g. Ollama) |
-| `enabled_models` | **Empty** = expose all models (live-queried). **Non-empty** = expose only these (no live call) |
-| `cache_ttl` | Seconds the live `/models` result is cached for this provider |
+| `api_key` | Sent as `Authorization: Bearer` upstream. Empty → no auth header (e.g. Ollama) |
+| `enabled_models` | **Empty** = expose all (live-queried). **Non-empty** = exactly these (no live call) |
+| `slots` | Max concurrent in-flight requests (shared across the backend's models). Omit = unlimited |
+| `priority` | Preference when a model has several backends; lower wins. Default = config order |
+| `require_permission` | `true` → gated behind a proxy auth key (default `false`) |
 | `model_map` | Optional incoming→upstream model name rewrites |
+| `provider_routing` | OpenRouter only — per-model upstream pinning (list = strict order, dict = verbatim `provider` field) |
+| `cache_ttl` | Seconds the live `/models` result is cached for this backend |
 
-Runtime flags are **environment variables** (set in `docker-compose.yml`), not part of `config.yaml`:
+### `models:` and `routing:`
+
+- **`models:`** — declare logical models whose targets have *different real ids* per
+  backend (the flash example). Backends sharing the *same* id auto-group without an entry.
+- **`routing:`** — `queue_timeout`, `failover`, `auto_group`, `down_backoff` (see above).
+
+### Environment variables
+
+Set in `docker-compose.yml` / `.env` — **not** in `config.yaml`:
 
 | Env var | Default | Description |
 |---|---|---|
+| `PROXY_API_KEYS` | _(empty)_ | Comma-separated proxy auth keys for gated backends. Empty = gate disabled |
 | `LOG_INPUT` | `false` | Log the full proxied request (curl-style, auth masked) |
 | `LOG_OUTPUT` | `false` | Log the upstream response (pretty JSON; streaming reassembled) |
 | `PORT` | `8000` | Port the proxy binds to inside the container |
 | `CONFIG_PATH` | `config.yaml` | Path to the YAML config |
 
+> **Single worker required.** Slot/queue accounting is in-process, so run **one**
+> uvicorn worker (the default). Multiple workers would split the accounting and break
+> the concurrency caps.
+
+## Authentication & permissions
+
+Backends marked `require_permission: true` are gated. A request is **authorized** when it
+carries `Authorization: Bearer <key>` with a key listed in `PROXY_API_KEYS`.
+
+- **With a valid key** → sees and uses every backend.
+- **Without a key** → gated backends are hidden from `/v1/models`, and requests to them
+  (including explicit `provider:model` pins) return **401**. Open backends work for everyone.
+- **No keys configured** → the gate is inert; everything is open.
+
+> Use case: share your Ollama hosts with a friend (no key, open) while keeping your paid
+> DeepSeek/OpenRouter backends private (key required).
+
 ## Quick Start
 
 ```bash
-cp .env.example .env              # set DEEPSEEK_API_KEY / OPENROUTER_API_KEY
-cp config.example.yaml config.yaml # edit providers
+cp .env.example .env                 # set PROXY_API_KEYS
+cp config.example.yaml config.yaml   # edit backends, slots, priorities, keys
 docker compose up -d
 ```
 
-Point any OpenAI client at `http://<host>:8001/v1/chat/completions` and use `provider:model` model names.
+Point any OpenAI client at `http://<host>:8000/v1/chat/completions` and request a clean
+model name (e.g. `deepseek-v4-flash`). Pass `Authorization: Bearer <key>` for gated backends.
 
 ## Endpoints
 
@@ -113,42 +201,58 @@ Point any OpenAI client at `http://<host>:8001/v1/chat/completions` and use `pro
 |---|---|---|
 | `/health` | `GET` | `{"status": "ok"}` health check |
 | `/metrics` | `GET` | Prometheus-format metrics |
-| `/models`, `/v1/models` | `GET` | Aggregated model list across all providers, each id prefixed with `provider:` |
-| `/*` | any | Catch-all proxy — routed to the provider resolved from the request body's `model` |
+| `/models`, `/v1/models` | `GET` | Aggregated model list (clean names; honors the auth gate) |
+| `/*` | any | Catch-all proxy — routed from the request body's `model` |
 
 ### `/models` aggregation
 
-The proxy fans out to every provider and merges the results into one OpenAI-shaped list. Global aliases are listed first under their simple name. Providers with `enabled_models: []` are live-queried (`GET {base_url}/v1/models`) and cached for `cache_ttl` seconds; providers with an explicit list contribute exactly those models with no live call. Every provider-sourced id is prefixed (`deepseek:deepseek-v4-pro`, `ollamaGW:llama3`, …) so clients pick one unambiguously.
+Lists, deduplicated: aliases, logical models, and each bare model id once. A model served
+by several backends appears a **single** time (the proxy load-balances behind it).
+Backend-prefixed `provider:model` ids are **not** listed — they still work for pinning a
+specific backend, but advertising them would just duplicate the clean names. Live-discovered
+backends are queried (`GET {base_url}/v1/models`), cached for `cache_ttl`, coalesced via
+single-flight so a burst of cold requests triggers one probe per backend; offline backends
+drop out. Gated backends are hidden from callers without a valid key.
 
 ## Prometheus Metrics
 
-Scrape `http://<host>:8001/metrics`:
+Scrape `http://<host>:8000/metrics`:
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `deepseek_proxy_requests_total` | Counter | `provider`, `model` | Total completed requests |
+| `deepseek_proxy_requests_total` | Counter | `provider`, `model` | Completed requests |
 | `deepseek_proxy_tokens_input_total` | Counter | `provider`, `model` | Cumulative input tokens |
 | `deepseek_proxy_tokens_output_total` | Counter | `provider`, `model` | Cumulative output tokens |
-| `deepseek_proxy_request_duration_seconds` | Histogram | `provider`, `model` | Request latency (buckets: 0.1–600s) |
+| `deepseek_proxy_request_duration_seconds` | Histogram | `provider`, `model` | Request latency (0.1–600s) |
 | `deepseek_proxy_errors_total` | Counter | `provider`, `model`, `status_code` | Failed requests |
+| `deepseek_proxy_slots_in_use` | Gauge | `provider` | In-flight requests holding a slot |
+| `deepseek_proxy_queue_waiting` | Gauge | — | Requests currently waiting for a slot |
+| `deepseek_proxy_failovers_total` | Counter | `provider` | Failovers away from a backend |
 
-> Metric names keep the `deepseek_proxy_` prefix for backward compatibility with existing dashboards; the new `provider` label distinguishes upstreams.
+> The `deepseek_proxy_` prefix is kept for dashboard back-compat; the `provider` label
+> distinguishes upstreams.
 
 ## Token Logging
 
-Every completed request emits a single log line:
+Every completed request emits one line:
 
 ```
-2026-05-29 14:19:03 - INFO - Tokens - Provider: deepseek, Model: deepseek-v4-pro, In: 29323, Out: 142, Time: 0:00:10, Speed: 13.76 t/s
+2026-06-09 14:19:03 - INFO - Tokens - Provider: deepseek, Model: deepseek-v4-pro, In: 29323, Out: 142, Time: 0:00:10, Speed: 13.76 t/s
 ```
 
-`LOG_INPUT` logs the full proxied request curl-style (auth masked); `LOG_OUTPUT` logs the upstream response pretty-printed (streaming responses are reassembled into one JSON with `_assembled_content` / `_reasoning_content`).
+`LOG_INPUT` logs the full proxied request curl-style (auth masked); `LOG_OUTPUT` logs the
+upstream response pretty-printed (streaming reassembled into one JSON with
+`_assembled_content` / `_reasoning_content`). uvicorn's access/error logs are reformatted
+to match this `timestamp - level - message` style.
 
-> **Streaming token counts:** like the OpenAI API, upstreams (DeepSeek, Ollama, …) only emit a `usage` block in a streaming response when the client sends `stream_options: {"include_usage": true}`. Without it, token metrics/logs for streamed requests will be `0` (the content still streams fine). Non-streaming requests always report usage.
+> **Streaming token counts:** upstreams only emit a `usage` block in a streamed response
+> when the client sends `stream_options: {"include_usage": true}`. Without it, streamed
+> token metrics/logs are `0` (content still streams fine). Non-streaming always reports usage.
 
 ## CI / CD
 
-Pushes to `master` (ignoring `.md`-only changes) build the Docker image and push to GitHub Container Registry, tagged `latest` and `master-{run_number}`. Uses the built-in `GITHUB_TOKEN`.
+Pushes to `master` (ignoring `.md`-only changes) build the Docker image and push to GitHub
+Container Registry, tagged `latest` and `master-{run_number}`, using `GITHUB_TOKEN`.
 
 ## Tech Stack
 
