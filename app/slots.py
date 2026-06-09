@@ -1,0 +1,107 @@
+"""Per-provider concurrency control with priority-ordered admission.
+
+Each provider has a slot budget (its `slots` config; None = unlimited). A request
+carries an ordered list of candidate targets (highest priority first). Admission
+scans the candidates and takes a slot from the first provider that has one free.
+If none are free the request waits on a shared Condition until some other request
+releases a slot, then re-scans — so priority is honored on every wake and waiters
+queue fairly (Condition wakes them roughly FIFO).
+
+State is process-local, which is correct here because the app runs as a single
+uvicorn worker. Running multiple workers would split the accounting and must use
+a shared store instead.
+"""
+import asyncio
+from contextlib import asynccontextmanager
+
+from app import config as conf
+from app.metrics import QUEUE_WAITING, SLOTS_IN_USE
+
+# Created lazily on first use so it binds to the running event loop (uvicorn's),
+# not whatever loop happened to exist at import time.
+_cond = None
+_in_use = {}  # provider name -> current in-flight count
+
+
+def _condition() -> asyncio.Condition:
+    global _cond
+    if _cond is None:
+        _cond = asyncio.Condition()
+    return _cond
+
+
+class SlotTimeout(Exception):
+    """Raised when no slot becomes free within the configured queue timeout."""
+
+
+def _capacity(provider_name: str):
+    p = conf.PROVIDERS_BY_NAME.get(provider_name)
+    return p.slots if p else None  # None => unlimited
+
+
+def _free(provider_name: str) -> bool:
+    cap = _capacity(provider_name)
+    if cap is None:
+        return True
+    return _in_use.get(provider_name, 0) < cap
+
+
+def _take(provider_name: str) -> None:
+    _in_use[provider_name] = _in_use.get(provider_name, 0) + 1
+    SLOTS_IN_USE.labels(provider=provider_name).set(_in_use[provider_name])
+
+
+async def acquire(targets, timeout: float = 0.0):
+    """Reserve a slot on the best available target. Waits if all are full.
+
+    `targets` is ordered by priority. `timeout` of 0 (or None) waits forever;
+    otherwise SlotTimeout is raised once the deadline passes.
+    """
+    cond = _condition()
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout if timeout and timeout > 0 else None
+
+    async with cond:
+        waiting = False
+        try:
+            while True:
+                for t in targets:
+                    if _free(t.provider):
+                        _take(t.provider)
+                        return t
+                # Nothing free: queue until a slot is released.
+                if not waiting:
+                    waiting = True
+                    QUEUE_WAITING.inc()
+                if deadline is None:
+                    await cond.wait()
+                else:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise SlotTimeout()
+                    try:
+                        await asyncio.wait_for(cond.wait(), remaining)
+                    except asyncio.TimeoutError:
+                        raise SlotTimeout()
+        finally:
+            if waiting:
+                QUEUE_WAITING.dec()
+
+
+async def release(provider_name: str) -> None:
+    cond = _condition()
+    async with cond:
+        current = _in_use.get(provider_name, 0)
+        if current > 0:
+            _in_use[provider_name] = current - 1
+            SLOTS_IN_USE.labels(provider=provider_name).set(current - 1)
+        cond.notify()
+
+
+@asynccontextmanager
+async def slot(targets, timeout: float = 0.0):
+    target = await acquire(targets, timeout)
+    try:
+        yield target
+    finally:
+        await release(target.provider)

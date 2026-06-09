@@ -1,7 +1,7 @@
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import yaml
 
@@ -31,11 +31,40 @@ class Provider:
     # dict passed through verbatim. A "*" key applies to unlisted models.
     provider_routing: Dict[str, object] = field(default_factory=dict)
     cache_ttl: int = 60
+    # Max concurrent in-flight requests this backend will handle. None means
+    # unlimited (no slot gating). Shared across every model the backend serves.
+    slots: Optional[int] = None
+    # Preference when a logical model can run on several backends. Lower wins.
+    # Defaults to the provider's position in the config list.
+    priority: int = 100
 
     @property
     def lists_all(self) -> bool:
         """Empty enabled_models means: expose every model the provider has."""
         return not self.enabled_models
+
+
+@dataclass
+class Target:
+    """A concrete place a request can run: a real model on a real provider."""
+    provider: str
+    model: str
+    priority: int = 100
+
+
+@dataclass
+class LogicalModel:
+    """A client-facing model name backed by one or more prioritized targets."""
+    name: str
+    targets: List[Target] = field(default_factory=list)
+
+
+@dataclass
+class Routing:
+    queue_timeout: float = 0.0   # seconds to wait for a slot; 0 = wait forever
+    failover: bool = True        # on backend error, try the next-priority target
+    auto_group: bool = True      # group identical model ids across providers
+    down_backoff: float = 15.0   # seconds a failed backend is skipped for
 
 
 def _load():
@@ -46,7 +75,8 @@ def _load():
     aliases = {str(k): str(v) for k, v in (raw.get("aliases") or {}).items()}
 
     providers = []
-    for item in raw.get("providers", []) or []:
+    for idx, item in enumerate(raw.get("providers", []) or []):
+        slots = item.get("slots")
         providers.append(
             Provider(
                 name=item["name"],
@@ -56,12 +86,38 @@ def _load():
                 model_map=item.get("model_map") or {},
                 provider_routing=item.get("provider_routing") or {},
                 cache_ttl=int(item.get("cache_ttl", 60)),
+                slots=(int(slots) if slots is not None else None),
+                priority=int(item.get("priority", idx)),
             )
         )
-    return providers, aliases
+
+    # Explicit logical models: client-facing name -> prioritized targets.
+    logical = {}
+    for name, spec in (raw.get("models") or {}).items():
+        targets = []
+        for t in (spec.get("targets") or []):
+            targets.append(
+                Target(
+                    provider=t["provider"],
+                    model=t.get("model", name),
+                    priority=int(t.get("priority", 100)),
+                )
+            )
+        targets.sort(key=lambda x: x.priority)
+        logical[str(name)] = LogicalModel(name=str(name), targets=targets)
+
+    r = raw.get("routing") or {}
+    routing = Routing(
+        queue_timeout=float(r.get("queue_timeout", 0) or 0),
+        failover=bool(r.get("failover", True)),
+        auto_group=bool(r.get("auto_group", True)),
+        down_backoff=float(r.get("down_backoff", 15)),
+    )
+
+    return providers, aliases, logical, routing
 
 
-PROVIDERS, ALIASES = _load()
+PROVIDERS, ALIASES, LOGICAL_MODELS, ROUTING = _load()
 PROVIDERS_BY_NAME = {p.name: p for p in PROVIDERS}
 
 

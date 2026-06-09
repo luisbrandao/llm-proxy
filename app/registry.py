@@ -16,6 +16,30 @@ PROBE_TIMEOUT = httpx.Timeout(5.0, connect=3.0)
 # provider name -> (expires_at_epoch, [model_id, ...])
 _cache = {}
 
+# provider name -> epoch until which the backend is considered down. Set when a
+# request fails against it so the router can skip it during failover, and
+# cleared on the next success.
+_down_until = {}
+
+
+def mark_down(provider_name: str, seconds: float) -> None:
+    _down_until[provider_name] = time.time() + seconds
+
+
+def clear_down(provider_name: str) -> None:
+    _down_until.pop(provider_name, None)
+
+
+def is_down(provider_name: str) -> bool:
+    return _down_until.get(provider_name, 0) > time.time()
+
+
+async def provider_model_ids(provider: conf.Provider):
+    """Effective model ids a provider serves: configured list or live-discovered."""
+    if provider.lists_all:
+        return await _cached_live(provider)
+    return list(provider.enabled_models)
+
 
 async def _fetch_live(provider: conf.Provider):
     url = f"{provider.base_url}/v1/models"
@@ -48,15 +72,31 @@ async def _cached_live(provider: conf.Provider):
 
 
 async def list_models() -> dict:
-    """Aggregate models from every provider, prefixed with `provider:`.
+    """Aggregate models, presenting clean server-less names clients can use directly.
 
-    Global aliases are listed first under their simple name so clients can
-    pick them directly (e.g. `chat` -> deepseek:deepseek-chat).
+    Listed (deduped, in this order): aliases, explicit logical models, bare model
+    ids (a model served by several backends appears once), and finally the
+    explicit `provider:model` ids for manual targeting. Offline backends drop out.
     """
+    sep = conf.PROVIDER_SEP
     data = []
+    seen = set()
+
+    def add(mid: str, owner: str):
+        if mid in seen:
+            return
+        seen.add(mid)
+        data.append({"id": mid, "object": "model", "owned_by": owner})
+
+    # Aliases first (e.g. `chat` -> deepseek:deepseek-chat).
     for alias, target in conf.ALIASES.items():
-        owner = target.split(conf.PROVIDER_SEP, 1)[0] if conf.PROVIDER_SEP in target else "alias"
-        data.append({"id": alias, "object": "model", "owned_by": owner})
+        owner = target.split(sep, 1)[0] if sep in target else "alias"
+        add(alias, owner)
+
+    # Explicit logical models (may span backends with differing real ids).
+    for name, lm in conf.LOGICAL_MODELS.items():
+        owners = ",".join(t.provider for t in lm.targets)
+        add(name, owners or "logical")
 
     # Probe every live-discovery backend concurrently, so one slow or offline
     # box waits in parallel with the others instead of serializing behind them.
@@ -73,17 +113,21 @@ async def list_models() -> dict:
         else:
             live_ids[provider.name] = result
 
+    # Group each model id by the backends that serve it.
+    by_model = {}
+    explicit = []
     for provider in conf.PROVIDERS:
-        if provider.lists_all:
-            ids = live_ids.get(provider.name, [])
-        else:
-            ids = provider.enabled_models
+        ids = live_ids.get(provider.name, []) if provider.lists_all else provider.enabled_models
         for mid in ids:
-            data.append(
-                {
-                    "id": f"{provider.name}{conf.PROVIDER_SEP}{mid}",
-                    "object": "model",
-                    "owned_by": provider.name,
-                }
-            )
+            by_model.setdefault(mid, []).append(provider.name)
+            explicit.append((provider.name, mid))
+
+    # Bare id once (auto-balanced when served by several backends).
+    for mid, owners in by_model.items():
+        add(mid, ",".join(owners) if len(owners) > 1 else owners[0])
+
+    # Explicit `provider:model` for pinning a specific backend.
+    for pname, mid in explicit:
+        add(f"{pname}{sep}{mid}", pname)
+
     return {"object": "list", "data": data}

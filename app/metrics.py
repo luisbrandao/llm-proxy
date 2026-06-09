@@ -1,4 +1,4 @@
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 
 REQUESTS_TOTAL = Counter(
@@ -30,6 +30,23 @@ ERRORS_TOTAL = Counter(
     "deepseek_proxy_errors_total",
     "Total errors",
     ["provider", "model", "status_code"],
+)
+
+SLOTS_IN_USE = Gauge(
+    "deepseek_proxy_slots_in_use",
+    "In-flight requests currently occupying a slot, per provider",
+    ["provider"],
+)
+
+QUEUE_WAITING = Gauge(
+    "deepseek_proxy_queue_waiting",
+    "Requests currently waiting for a free slot",
+)
+
+FAILOVERS_TOTAL = Counter(
+    "deepseek_proxy_failovers_total",
+    "Times a request failed over from one backend to the next",
+    ["provider"],
 )
 
 

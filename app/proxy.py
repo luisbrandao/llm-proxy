@@ -4,16 +4,18 @@ import logging
 import time
 import zlib
 from datetime import timedelta
-from typing import Optional, Tuple, Union
+from typing import Optional, Union
 
 import httpx
 from fastapi import Request
 from fastapi.responses import Response, StreamingResponse
 
 from app import config as conf
+from app import registry, router, slots
 from app.config import Provider
 from app.metrics import (
     ERRORS_TOTAL,
+    FAILOVERS_TOTAL,
     REQUEST_DURATION,
     REQUESTS_TOTAL,
     TOKENS_INPUT_TOTAL,
@@ -21,35 +23,6 @@ from app.metrics import (
 )
 
 logger = logging.getLogger("deepseek-proxy")
-
-
-def resolve_provider(model: str) -> Tuple[Optional[Provider], str]:
-    """Map an incoming model name to (provider, real_model).
-
-    Routing order:
-      0. Expand a global alias (simple name -> "provider:model").
-      1. Explicit `provider:model` prefix.
-      2. First provider whose enabled_models lists the bare name.
-      3. Fallback: first configured provider.
-    The provider's model_map is applied to the resolved name.
-    """
-    model = conf.ALIASES.get(model, model)
-    sep = conf.PROVIDER_SEP
-    if sep in model:
-        prefix, _, rest = model.partition(sep)
-        provider = conf.PROVIDERS_BY_NAME.get(prefix)
-        if provider:
-            return provider, provider.model_map.get(rest, rest)
-
-    for provider in conf.PROVIDERS:
-        if model in provider.enabled_models:
-            return provider, provider.model_map.get(model, model)
-
-    if conf.PROVIDERS:
-        provider = conf.PROVIDERS[0]
-        return provider, provider.model_map.get(model, model)
-
-    return None, model
 
 
 def _build_url(provider: Provider, path: str) -> str:
@@ -182,19 +155,18 @@ async def _handle_non_stream(
 
     start = time.time()
 
-    try:
-        async with httpx.AsyncClient(timeout=600.0) as client:
-            async with client.stream(method, url, headers=headers, content=body) as resp:
-                # Read the raw, undecoded bytes so we control decompression
-                # ourselves (httpx cannot decode brotli/zstd without extra libs
-                # and would otherwise pass compressed bytes straight through).
-                raw = b"".join([chunk async for chunk in resp.aiter_raw()])
-                status_code = resp.status_code
-                is_error = resp.is_error
-                resp_headers = dict(resp.headers)
-                content_encoding = resp.headers.get("content-encoding", "")
-    except httpx.RequestError as e:
-        return _backend_error(provider, model, e)
+    # Connection failures propagate as httpx.RequestError so the dispatcher can
+    # fail over to the next backend; the response is fully buffered here.
+    async with httpx.AsyncClient(timeout=600.0) as client:
+        async with client.stream(method, url, headers=headers, content=body) as resp:
+            # Read the raw, undecoded bytes so we control decompression
+            # ourselves (httpx cannot decode brotli/zstd without extra libs
+            # and would otherwise pass compressed bytes straight through).
+            raw = b"".join([chunk async for chunk in resp.aiter_raw()])
+            status_code = resp.status_code
+            is_error = resp.is_error
+            resp_headers = dict(resp.headers)
+            content_encoding = resp.headers.get("content-encoding", "")
 
     duration = time.time() - start
 
@@ -241,8 +213,9 @@ async def _handle_non_stream(
 
 
 async def _handle_stream(
-    request: Request, provider: Provider, path: str, body: bytes, body_str: str, model: str
-) -> Union[Response, StreamingResponse]:
+    request: Request, provider: Provider, path: str, body: bytes, body_str: str, model: str,
+    on_complete=None,
+) -> StreamingResponse:
     url = _build_url(provider, path)
     headers = _build_headers(provider, request)
     method = request.method.upper()
@@ -254,14 +227,16 @@ async def _handle_stream(
     # Pre-flight the connection: a StreamingResponse commits its status code
     # before the body generator runs, so we must learn whether the backend is
     # reachable *now* — otherwise an offline backend would yield a 200 with an
-    # empty body instead of a clean error.
+    # empty body instead of a clean error. A failure here propagates as
+    # httpx.RequestError so the dispatcher can fail over before any bytes are
+    # committed to the client (failover is impossible mid-stream).
     client = httpx.AsyncClient(timeout=600.0)
     stream_cm = client.stream(method, url, headers=headers, content=body)
     try:
         resp = await stream_cm.__aenter__()
-    except httpx.RequestError as e:
+    except httpx.RequestError:
         await client.aclose()
-        return _backend_error(provider, model, e)
+        raise
 
     async def generate():
         start = time.time()
@@ -314,6 +289,8 @@ async def _handle_stream(
         finally:
             await stream_cm.__aexit__(None, None, None)
             await client.aclose()
+            if on_complete is not None:
+                await on_complete()
             duration = time.time() - start
             if model != "unknown":
                 if error:
@@ -369,39 +346,110 @@ def _routing_for(provider: Provider, model: str):
     return None
 
 
+def _build_body(payload: dict, provider: Provider, model: str):
+    """Rewrite the request body for a chosen target: set the real model id and
+    inject upstream routing (OpenRouter `provider`) unless the client set it."""
+    p = dict(payload)
+    p["model"] = model
+    if "provider" not in p:
+        routing = _routing_for(provider, model)
+        if routing is not None:
+            p["provider"] = routing
+    body = json.dumps(p, ensure_ascii=False).encode("utf-8")
+    return body, body.decode("utf-8")
+
+
+async def _dispatch(
+    request: Request, path: str, payload: dict, is_stream: bool, targets: list
+) -> Union[Response, StreamingResponse]:
+    """Acquire a slot on the best available target and forward, failing over to
+    the next-priority target if a backend errors out (when failover is enabled)."""
+    remaining = list(targets)
+    last_provider = None
+    last_exc = None
+
+    while remaining:
+        try:
+            target = await slots.acquire(remaining, conf.ROUTING.queue_timeout)
+        except slots.SlotTimeout:
+            return Response(
+                content=json.dumps({"error": {"message": "No backend slot available (queue timeout)", "type": "slot_timeout", "code": 503}}),
+                status_code=503,
+                media_type="application/json",
+            )
+
+        provider = conf.PROVIDERS_BY_NAME[target.provider]
+        last_provider = provider
+        body, body_str = _build_body(payload, provider, target.model)
+
+        try:
+            if is_stream:
+                async def _release(p=target.provider):
+                    await slots.release(p)
+
+                resp = await _handle_stream(
+                    request, provider, path, body, body_str, target.model, on_complete=_release
+                )
+                # Slot is released by the generator's finally once streaming ends.
+                registry.clear_down(target.provider)
+                return resp
+
+            resp = await _handle_non_stream(request, provider, path, body, body_str, target.model)
+            await slots.release(target.provider)
+            registry.clear_down(target.provider)
+            return resp
+        except httpx.RequestError as e:
+            await slots.release(target.provider)
+            last_exc = e
+            if not conf.ROUTING.failover:
+                return _backend_error(provider, target.model, e)
+            registry.mark_down(target.provider, conf.ROUTING.down_backoff)
+            FAILOVERS_TOTAL.labels(provider=target.provider).inc()
+            remaining = [t for t in remaining if t.provider != target.provider]
+            logger.warning(
+                f"Failover: '{target.provider}' failed ({type(e).__name__}); "
+                f"{len(remaining)} target(s) left for model '{target.model}'"
+            )
+
+    # Every candidate failed.
+    if last_exc is None:
+        last_exc = httpx.ConnectError("no backends available")
+    return _backend_error(last_provider, "unknown", last_exc)
+
+
 async def proxy_request(request: Request, path: str) -> Union[Response, StreamingResponse]:
     body = await request.body()
     body_str = body.decode("utf-8", errors="replace")
 
-    provider: Optional[Provider] = None
-    model = "unknown"
+    payload = None
+    raw_model = None
     is_stream = False
-
     try:
         payload = json.loads(body_str)
         raw_model = payload.get("model")
         is_stream = payload.get("stream", False)
-        if raw_model:
-            provider, model = resolve_provider(raw_model)
-            if provider is not None:
-                payload["model"] = model
-                # Inject upstream routing (e.g. OpenRouter `provider`) unless the
-                # client already specified its own — client wins.
-                if "provider" not in payload:
-                    routing = _routing_for(provider, model)
-                    if routing is not None:
-                        payload["provider"] = routing
-                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                body_str = body.decode("utf-8")
     except (json.JSONDecodeError, AttributeError):
-        pass
+        payload = None
 
-    if provider is None:
-        # No JSON body / no model field (e.g. non-chat calls): forward to first provider.
+    # No JSON model (e.g. non-chat passthrough): forward to the first provider
+    # untouched, without slot gating.
+    if not raw_model:
         if not conf.PROVIDERS:
             return Response(content="No providers configured", status_code=503)
         provider = conf.PROVIDERS[0]
+        try:
+            if is_stream:
+                return await _handle_stream(request, provider, path, body, body_str, "unknown")
+            return await _handle_non_stream(request, provider, path, body, body_str, "unknown")
+        except httpx.RequestError as e:
+            return _backend_error(provider, "unknown", e)
 
-    if is_stream:
-        return await _handle_stream(request, provider, path, body, body_str, model)
-    return await _handle_non_stream(request, provider, path, body, body_str, model)
+    targets = await router.resolve(raw_model)
+    if not targets:
+        return Response(content="No providers configured", status_code=503)
+
+    # Prefer backends not currently marked down, but keep them as a last resort.
+    healthy = [t for t in targets if not registry.is_down(t.provider)]
+    candidates = healthy or targets
+
+    return await _dispatch(request, path, payload, is_stream, candidates)

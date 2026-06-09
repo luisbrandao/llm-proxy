@@ -14,11 +14,15 @@ aliases:
   llama: ollamaCitrine:llama3
   sonnet: openRouter:anthropic/claude-3.5-sonnet
 
+# Each backend has `slots` (max concurrent in-flight requests, shared across all
+# its models; omit = unlimited) and `priority` (lower = preferred when a model is
+# served by several backends; defaults to config order).
 providers:
   - name: deepseek
     api_key: "${DEEPSEEK_API_KEY}"
     base_url: "https://api.deepseek.com"
     enabled_models: [deepseek-v4-pro, deepseek-v4-flash]
+    slots: 10
     cache_ttl: 3600
     model_map:
       deepseek-chat: deepseek-v4-pro
@@ -28,12 +32,16 @@ providers:
     api_key: ""
     base_url: "http://citrine.brandao:11434"   # Ollama serves plain HTTP
     enabled_models: []        # empty = expose all models (live-discovered)
+    slots: 1                  # single GPU box
+    priority: 1               # faster -> preferred for models it shares with gw
     cache_ttl: 10
 
   - name: ollamaGW
     api_key: ""
     base_url: "http://gw.brandao:11434"        # Ollama serves plain HTTP
     enabled_models: []        # empty = expose all models (live-discovered)
+    slots: 1
+    priority: 2               # slower -> only used when citrine is busy
     cache_ttl: 10
 
   - name: openRouter
@@ -52,4 +60,23 @@ providers:
       anthropic/claude-3.5-sonnet: [anthropic]
       # full control form:
       # openai/gpt-4o: { order: [openai], allow_fallbacks: true }
+    slots: 10
     cache_ttl: 3600
+
+# Logical models: one client-facing name backed by several prioritized targets.
+# Use this when the same logical model exists on backends under *different* real
+# ids (e.g. flash on OpenRouter vs DeepSeek). Backends that expose the *same* id
+# (e.g. an Ollama model on two boxes) auto-group with no entry here, ordered by
+# provider priority. Explicit `provider:model` always still pins one backend.
+models:
+  deepseek-v4-flash:
+    targets:
+      - {provider: openRouter, model: deepseek/deepseek-v4-flash, priority: 1}
+      - {provider: deepseek,   model: deepseek-v4-flash,         priority: 2}
+
+# Global routing behavior.
+routing:
+  queue_timeout: 0     # seconds to wait for a free slot; 0 = wait indefinitely
+  failover: true       # on backend error, retry the next-priority target
+  auto_group: true     # identical model ids across backends load-balance
+  down_backoff: 15     # seconds a failed backend is skipped before retrying
