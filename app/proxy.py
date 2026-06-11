@@ -37,6 +37,12 @@ def _build_headers(provider: Provider, request: Request) -> dict:
         headers["authorization"] = f"Bearer {provider.api_key}"
     else:
         headers.pop("authorization", None)
+    # Forward the caller's User-Agent verbatim. When the caller sent none, httpx
+    # would otherwise inject its own `python-httpx/x.y` default, which surfaces at
+    # the backend (e.g. OpenRouter) as a bogus/"missing" client. Ensuring the key
+    # is always present stops that substitution; absent a caller UA we advertise
+    # the proxy itself rather than httpx.
+    headers.setdefault("user-agent", "llm-proxy")
     # Only advertise encodings we can decode with the stdlib. Otherwise a
     # backend may reply with brotli, which we'd be unable to uncompress.
     headers["accept-encoding"] = "gzip, deflate"
