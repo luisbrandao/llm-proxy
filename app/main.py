@@ -3,9 +3,10 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 from app import auth, persistence
+from app import config as conf
 from app.metrics import metrics_response
 from app.proxy import proxy_request
 from app.registry import list_models
@@ -55,6 +56,37 @@ async def health():
 async def metrics():
     data, status, headers = metrics_response()
     return Response(content=data, status_code=status, headers=headers)
+
+
+@app.get("/logging")
+async def get_logging():
+    return {"log_input": conf.LOG_INPUT, "log_output": conf.LOG_OUTPUT}
+
+
+@app.post("/logging")
+async def set_logging(request: Request):
+    """Toggle request/response logging at runtime, no restart needed.
+
+    Body: {"log_input": bool, "log_output": bool} — both keys optional.
+    Gated by the same bearer keys as restricted backends (inert when unset).
+    """
+    if not auth.is_authorized(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=403)
+    body = await request.json()
+    for key, attr in (("log_input", "LOG_INPUT"), ("log_output", "LOG_OUTPUT")):
+        if key in body:
+            value = body[key]
+            if not isinstance(value, bool):
+                return JSONResponse(
+                    {"error": f"{key} must be a boolean"}, status_code=422
+                )
+            setattr(conf, attr, value)
+    logging.getLogger(__name__).info(
+        "Logging flags updated: LOG_INPUT=%s LOG_OUTPUT=%s",
+        conf.LOG_INPUT,
+        conf.LOG_OUTPUT,
+    )
+    return {"log_input": conf.LOG_INPUT, "log_output": conf.LOG_OUTPUT}
 
 
 @app.get("/models")

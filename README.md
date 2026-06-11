@@ -164,8 +164,8 @@ Set in `docker-compose.yml` / `.env` — **not** in `config.yaml`:
 | Env var | Default | Description |
 |---|---|---|
 | `PROXY_API_KEYS` | _(empty)_ | Comma-separated proxy auth keys for gated backends. Empty = gate disabled |
-| `LOG_INPUT` | `false` | Log the full proxied request (curl-style, auth masked) |
-| `LOG_OUTPUT` | `false` | Log the upstream response (pretty JSON; streaming reassembled) |
+| `LOG_INPUT` | `false` | Log the full proxied request (curl-style, auth masked). Toggleable at runtime via `/logging` |
+| `LOG_OUTPUT` | `false` | Log the upstream response (pretty JSON; streaming reassembled). Toggleable at runtime via `/logging` |
 | `PORT` | `8000` | Port the proxy binds to inside the container |
 | `CONFIG_PATH` | `config.yaml` | Path to the YAML config |
 
@@ -204,6 +204,8 @@ model name (e.g. `deepseek-v4-flash`). Pass `Authorization: Bearer <key>` for ga
 | `/health` | `GET` | `{"status": "ok"}` health check |
 | `/metrics` | `GET` | Prometheus-format metrics |
 | `/models`, `/v1/models` | `GET` | Aggregated model list (clean names; honors the auth gate) |
+| `/logging` | `GET` | Current `log_input` / `log_output` state |
+| `/logging` | `POST` | Toggle request/response logging at runtime (honors the auth gate) |
 | `/*` | any | Catch-all proxy — routed from the request body's `model` |
 
 ### `/models` aggregation
@@ -267,6 +269,18 @@ Every completed request emits one line:
 upstream response pretty-printed (streaming reassembled into one JSON with
 `_assembled_content` / `_reasoning_content`). uvicorn's access/error logs are reformatted
 to match this `timestamp - level - message` style.
+
+Both flags can be flipped at runtime — no restart required:
+
+```bash
+curl http://<host>:8000/logging                          # current state
+curl -X POST http://<host>:8000/logging \
+  -H "Authorization: Bearer <key>" \
+  -d '{"log_input": true, "log_output": true}'           # either key optional
+```
+
+The `POST` requires a valid proxy key when `PROXY_API_KEYS` is set (otherwise open). The
+env vars still set the state at boot; runtime changes are not persisted across restarts.
 
 > **Streaming token counts:** upstreams only emit a `usage` block in a streamed response
 > when the request sets `stream_options: {"include_usage": true}`. The proxy **injects
