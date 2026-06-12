@@ -111,6 +111,23 @@ def _log_summary(provider: str, model: str, in_tokens: int, out_tokens: int, dur
     )
 
 
+def _log_upstream_error(provider: str, model: str, status: int, body: str) -> None:
+    """Log an upstream error response with its body, always.
+
+    LOG_OUTPUT only gates successful-response logging; a backend rejecting a
+    request (bad param, auth, overload) must be diagnosable from the proxy log
+    alone — the body is where Google/OpenRouter/ollama say *why*.
+    """
+    snippet = body.strip()
+    try:
+        snippet = json.dumps(json.loads(snippet), indent=2, ensure_ascii=False)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    if len(snippet) > 4000:
+        snippet = snippet[:4000] + "... [truncated]"
+    logger.warning(f"Upstream error {status} from '{provider}' (model: {model}):\n{snippet}")
+
+
 def _record_metrics(provider: str, model: str, in_tokens: int, out_tokens: int, duration: float) -> None:
     REQUESTS_TOTAL.labels(provider=provider, model=model).inc()
     TOKENS_INPUT_TOTAL.labels(provider=provider, model=model).inc(in_tokens)
@@ -189,7 +206,9 @@ async def _handle_non_stream(
     except (json.JSONDecodeError, AttributeError):
         pass
 
-    if conf.LOG_OUTPUT:
+    if is_error:
+        _log_upstream_error(pname, model, status_code, resp_body)
+    elif conf.LOG_OUTPUT:
         pretty_body = resp_body
         try:
             parsed = json.loads(resp_body)
@@ -221,7 +240,7 @@ async def _handle_non_stream(
 async def _handle_stream(
     request: Request, provider: Provider, path: str, body: bytes, body_str: str, model: str,
     on_complete=None,
-) -> StreamingResponse:
+) -> Union[Response, StreamingResponse]:
     url = _build_url(provider, path)
     headers = _build_headers(provider, request)
     method = request.method.upper()
@@ -243,6 +262,32 @@ async def _handle_stream(
     except httpx.RequestError:
         await client.aclose()
         raise
+
+    # Upstream rejected the request outright (4xx/5xx). A StreamingResponse
+    # commits a 200 before its generator runs, which would bury the error in a
+    # bogus SSE stream the client can't interpret. Buffer the (small) error
+    # body instead and relay it verbatim with the upstream's real status.
+    if resp.is_error:
+        try:
+            raw = b"".join([chunk async for chunk in resp.aiter_raw()])
+            status_code = resp.status_code
+            resp_headers = dict(resp.headers)
+            content_encoding = resp.headers.get("content-encoding", "")
+        finally:
+            await stream_cm.__aexit__(None, None, None)
+            await client.aclose()
+            if on_complete is not None:
+                await on_complete()
+
+        resp_body = _decompress(raw, content_encoding).decode("utf-8", errors="replace")
+        _log_upstream_error(pname, model, status_code, resp_body)
+        if model != "unknown":
+            ERRORS_TOTAL.labels(provider=pname, model=model, status_code=str(status_code)).inc()
+
+        resp_headers.pop("content-length", None)
+        resp_headers.pop("transfer-encoding", None)
+        resp_headers.pop("content-encoding", None)
+        return Response(content=resp_body, status_code=status_code, headers=resp_headers)
 
     async def generate():
         start = time.time()
@@ -291,7 +336,7 @@ async def _handle_stream(
                         pass
         except Exception as e:
             error = True
-            logger.error(f"Stream error: {e}")
+            logger.error(f"Stream error from '{pname}' (model: {model}): {type(e).__name__}: {e}")
         finally:
             await stream_cm.__aexit__(None, None, None)
             await client.aclose()

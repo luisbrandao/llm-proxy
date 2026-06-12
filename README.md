@@ -282,6 +282,23 @@ curl -X POST http://<host>:8000/logging \
 The `POST` requires a valid proxy key when `PROXY_API_KEYS` is set (otherwise open). The
 env vars still set the state at boot; runtime changes are not persisted across restarts.
 
+### Error logging & relay
+
+Upstream errors are **always logged with their response body** (WARNING level, pretty-printed,
+truncated at 4 KB) regardless of `LOG_OUTPUT` — the body is where the backend says *why* it
+rejected the request:
+
+```
+2026-06-11 23:42:22 - WARNING - Upstream error 400 from 'google' (model: gemini-2.5-pro):
+{
+  "error": { "code": 400, "message": "Unknown name 'num_ctx': Cannot find field.", ... }
+}
+```
+
+The error body and status are also relayed to the client verbatim — including on **streaming**
+requests, where the upstream's 4xx/5xx is returned as a plain JSON response instead of being
+wrapped in a bogus `200` SSE stream.
+
 > **Streaming token counts:** upstreams only emit a `usage` block in a streamed response
 > when the request sets `stream_options: {"include_usage": true}`. The proxy **injects
 > this automatically** on streamed requests (unless the client explicitly set it), so
