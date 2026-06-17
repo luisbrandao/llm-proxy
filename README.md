@@ -44,30 +44,36 @@ Your App (OpenAI client)
 
 ## How routing works
 
-A client sends a **model name**. The proxy resolves it to an ordered list of
-**targets** (a real model on a real backend), then admits the request to the
-highest-priority target that has a free slot.
+A client sends a **canonical model name** — a clean, provider-agnostic id. Native
+(provider-specific) ids never leak to clients. The proxy resolves the canonical name to
+an ordered list of **targets** (a real native model on a real backend), then admits the
+request to the highest-priority target that has a free slot.
+
+Two layers turn native ids into canonical names: a backend's `model_map` (per-provider
+native↔canonical dictionary) and the `models:` block (cross-provider routing table). They
+compose — the logical model picks the backends and order; each backend's `model_map`
+supplies the native id. See [Canonical names](#canonical-names).
 
 **Resolution order:**
-1. **Alias** — a global short name → `provider:model` (e.g. `chat` → `deepseek:deepseek-chat`).
-2. **Explicit `provider:model`** — forces one backend (manual override / pinning).
-3. **Logical model** — an explicit `models:` entry mapping one client-facing name to
-   several prioritized targets (used when the real ids differ across backends).
-4. **Auto-group** — the same model id served by multiple backends is load-balanced
+1. **Alias** — a global short name → `provider:canonical` (e.g. `chat` → `deepseek:deepseek-v4-pro`).
+2. **Explicit `provider:model`** — forces one backend (the model part is canonical, rewritten to native).
+3. **Logical model** — a `models:` entry mapping one canonical name to several prioritized targets.
+4. **Auto-group** — the same canonical name served by multiple backends is load-balanced
    automatically, ordered by each backend's `priority` (no config needed).
-5. **Fallback** — first backend whose `enabled_models` lists it, else the first backend.
+5. **Fallback** — first backend whose `enabled_models` serves it, else the first backend.
 
 ### Slots, priority & queueing
 
 Each backend declares `slots` (max concurrent in-flight requests, shared across all its
 models) and `priority` (lower = preferred). When a request arrives the proxy takes a
-slot from the **highest-priority candidate that has one free**. If all candidates are
-full it **waits** (indefinitely by default, or up to `routing.queue_timeout`) for the
-first slot to free.
+slot from the **highest-priority candidate that has one free**. When several candidates
+**tie on priority**, it round-robins across the tied backends that have a free slot, so
+equal-priority backends share load evenly. If all candidates are full it **waits**
+(indefinitely by default, or up to `routing.queue_timeout`) for the first slot to free.
 
-> Example: `local.qwen-medium:low` runs on `ollamaCitrine` (fast, 1 slot, priority 1)
-> and `ollamaGW` (slow, 1 slot, priority 2). Request 1 → citrine, request 2 → gw,
-> request 3 → waits for whichever frees first.
+> Example: `glm-4.7-flash` runs on `ollamaCitrine` (fast, priority 1) and `ollamaGW`
+> (slow, priority 2). Citrine is preferred until full, then gw; if both are full the
+> request waits. Two backends at the *same* priority would instead alternate per request.
 
 ### Failover
 
@@ -83,19 +89,20 @@ go inline, or optionally via `${ENV_VAR}` interpolation. Proxy auth keys and run
 flags come from the environment.
 
 ```yaml
-aliases:                          # optional short names -> provider:model
-  chat: deepseek:deepseek-chat
+aliases:                          # optional short names -> provider:canonical
+  chat: deepseek:deepseek-v4-pro
 
 providers:
   - name: deepseek
     api_key: "sk-..."             # or "${DEEPSEEK_API_KEY}"
     require_permission: true      # paid -> only authenticated callers
     base_url: "https://api.deepseek.com"
-    enabled_models: [deepseek-v4-pro, deepseek-v4-flash]
+    enabled_models: [deepseek-chat, deepseek-reasoner]   # native ids
     slots: 10
     cache_ttl: 3600
-    model_map:
+    model_map:                    # native -> canonical
       deepseek-chat: deepseek-v4-pro
+      deepseek-reasoner: deepseek-v4-flash
 
   - name: ollamaCitrine
     api_key: ""                   # empty -> no auth header (Ollama)
@@ -114,23 +121,27 @@ providers:
     api_key: "sk-or-..."
     require_permission: true
     base_url: "https://openrouter.ai/api"
-    enabled_models: [deepseek/deepseek-v4-flash, z-ai/glm-5.1]
+    enabled_models: [z-ai/glm-5.2]            # native ids
     slots: 10
-    provider_routing:             # pin OpenRouter's upstream choice
+    model_map:                                # native -> canonical
+      z-ai/glm-5.2: glm-5.2
+      deepseek/deepseek-v4-flash: deepseek-v4-flash
+    provider_routing:                         # pin OpenRouter's upstream (native key)
       deepseek/deepseek-v4-flash: [deepseek]
 
-# One client-facing name backed by several prioritized targets (differing real ids).
+# One canonical name backed by several prioritized targets. Omit `model:` to inherit
+# the native id from each provider's model_map; set it to pin a specific native id.
 models:
   deepseek-v4-flash:
     targets:
-      - {provider: openRouter, model: deepseek/deepseek-v4-flash, priority: 1}
-      - {provider: deepseek,   model: deepseek-v4-flash,         priority: 2}
+      - {provider: openRouter, priority: 1}   # native via model_map
+      - {provider: deepseek,   priority: 2}
 
 # Global routing behavior.
 routing:
   queue_timeout: 0    # seconds to wait for a free slot; 0 = wait forever
   failover: true      # retry the next target on backend error
-  auto_group: true    # identical model ids across backends load-balance
+  auto_group: true    # identical canonical names across backends load-balance
   down_backoff: 15    # seconds a failed backend is skipped before retry
 ```
 
@@ -141,20 +152,37 @@ routing:
 | `name` | Backend key, also the `provider:` routing prefix |
 | `base_url` | Upstream base URL |
 | `api_key` | Sent as `Authorization: Bearer` upstream. Empty → no auth header (e.g. Ollama) |
-| `enabled_models` | **Empty** = expose all (live-queried). **Non-empty** = exactly these (no live call) |
+| `enabled_models` | Allow-list in **native** ids. **Empty** = expose all (live-queried). **Non-empty** = exactly these (no live call) |
 | `slots` | Max concurrent in-flight requests (shared across the backend's models). Omit = unlimited |
-| `priority` | Preference when a model has several backends; lower wins. Default = config order |
+| `priority` | Preference when a model has several backends; lower wins. Default = config order. Ties round-robin across backends with a free slot |
 | `require_permission` | `true` → gated behind a proxy auth key (default `false`) |
 | `strip_path_prefix` | Path segment removed before appending to `base_url`. For OpenAI-compatible backends whose root isn't `/v1` — e.g. Google Gemini (`v1` → its `/v1beta/openai/...`) |
 | `strip_fields` | Top-level request-body keys to drop before forwarding. For strict backends that 400 on unknown fields (e.g. Google rejects the `num_ctx` some clients inject) |
-| `model_map` | Optional incoming→upstream model name rewrites |
-| `provider_routing` | OpenRouter only — per-model upstream pinning (list = strict order, dict = verbatim `provider` field) |
+| `model_map` | Per-provider **native → canonical** dictionary. Drives `/v1/models` display (native→canonical) and request rewrite (canonical→native). Must be a bijection |
+| `provider_routing` | OpenRouter only — per-model upstream pinning, keyed by **native** id (list = strict order, dict = verbatim `provider` field) |
 | `cache_ttl` | Seconds the live `/models` result is cached for this backend |
+
+### Canonical names
+
+Clients only ever see and send **canonical** names; native (provider-specific) ids stay
+internal. Two layers mint canonical names:
+
+- **`model_map`** (per provider) — the native↔canonical dictionary for *one* backend. A
+  pure rename/translation; no routing. Keyed by the native id.
+- **`models:`** (global) — the cross-provider routing table in canonical space (priority,
+  failover, load-balancing). A target's native id is its explicit `model:`, or — when
+  omitted — inherited from that provider's `model_map`.
+
+They compose without overlap: `models:` decides *which backends in what order*; `model_map`
+decides *what each backend calls the thing*. A canonical name reachable both as a logical
+model and via auto-group resolves as the logical model (it's earlier in the order).
 
 ### `models:` and `routing:`
 
-- **`models:`** — declare logical models whose targets have *different real ids* per
-  backend (the flash example). Backends sharing the *same* id auto-group without an entry.
+- **`models:`** — declare logical models in canonical space (the flash example). Use an
+  explicit `model:` only to pin a specific native id (e.g. a per-box quant); otherwise it's
+  inherited from `model_map`. Backends sharing the *same* canonical name auto-group without
+  an entry.
 - **`routing:`** — `queue_timeout`, `failover`, `auto_group`, `down_backoff` (see above).
 
 ### Environment variables
@@ -214,13 +242,14 @@ model name (e.g. `deepseek-v4-flash`). Pass `Authorization: Bearer <key>` for ga
 
 ### `/models` aggregation
 
-Lists, deduplicated: aliases, logical models, and each bare model id once. A model served
-by several backends appears a **single** time (the proxy load-balances behind it).
-Backend-prefixed `provider:model` ids are **not** listed — they still work for pinning a
-specific backend, but advertising them would just duplicate the clean names. Likewise, any
-id that is a **target of a logical model is hidden** — clients use the stable logical name
-instead, so per-backend variants (e.g. quantizations) don't flap in and out of the list as
-backends come and go. Live-discovered backends are queried (`GET {base_url}/v1/models`),
+Lists, deduplicated, in **canonical** names: aliases, logical models, and each remaining
+canonical model once (native ids translated through `model_map`). A model served by several
+backends appears a **single** time (the proxy load-balances behind it). Backend-prefixed
+`provider:model` ids are **not** listed — they still work for pinning a specific backend, but
+advertising them would just duplicate the clean names. Likewise, anything a logical model
+fronts is **hidden** — both its canonical name and the concrete native ids of its targets —
+so clients use the stable logical name instead, and per-backend variants (e.g. quantizations)
+don't flap in and out of the list as backends come and go. Live-discovered backends are queried (`GET {base_url}/v1/models`),
 cached for `cache_ttl`, coalesced via single-flight so a burst of cold requests triggers one
 probe per backend; offline backends drop out. Gated backends are hidden from callers
 without a valid key.

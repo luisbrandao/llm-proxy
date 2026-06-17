@@ -24,11 +24,19 @@ class Provider:
     name: str
     base_url: str
     api_key: str = ""
+    # Native model ids this backend may serve, in the backend's own vocabulary.
+    # Empty => expose every id the backend live-reports (see `lists_all`).
     enabled_models: List[str] = field(default_factory=list)
+    # Per-provider native<->canonical dictionary, keyed by the backend's NATIVE
+    # id with the clean client-facing canonical name as the value, e.g.
+    # `{"deepseek/deepseek-v4-pro": "deepseek-v4-pro"}`. Used both ways:
+    #   - listing: native id -> canonical name (`to_canonical`)
+    #   - routing: canonical request -> native id on the wire (`to_native`)
+    # Must be a bijection per provider so the reverse lookup is unambiguous.
     model_map: Dict[str, str] = field(default_factory=dict)
     # Optional per-model upstream routing (OpenRouter `provider` field). Keyed
-    # by resolved model id; value is a list of upstream slugs (strict pin) or a
-    # dict passed through verbatim. A "*" key applies to unlisted models.
+    # by resolved NATIVE model id; value is a list of upstream slugs (strict pin)
+    # or a dict passed through verbatim. A "*" key applies to unlisted models.
     provider_routing: Dict[str, object] = field(default_factory=dict)
     cache_ttl: int = 60
     # Max concurrent in-flight requests this backend will handle. None means
@@ -50,11 +58,24 @@ class Provider:
     # backends (Google rejects any unknown field with a 400) — e.g. clients that
     # inject Ollama-isms like `num_ctx`. Default: keep everything.
     strip_fields: List[str] = field(default_factory=list)
+    # Reverse of model_map (canonical name -> native id), built in __post_init__.
+    _to_native: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self):
+        self._to_native = {v: k for k, v in self.model_map.items()}
 
     @property
     def lists_all(self) -> bool:
         """Empty enabled_models means: expose every model the provider has."""
         return not self.enabled_models
+
+    def to_canonical(self, native: str) -> str:
+        """Native backend id -> clean client-facing name (identity if unmapped)."""
+        return self.model_map.get(native, native)
+
+    def to_native(self, canonical: str) -> str:
+        """Client-facing name -> native backend id on the wire (identity if unmapped)."""
+        return self._to_native.get(canonical, canonical)
 
 
 def strip_prefix(provider, path: str) -> str:
@@ -68,9 +89,15 @@ def strip_prefix(provider, path: str) -> str:
 
 @dataclass
 class Target:
-    """A concrete place a request can run: a real model on a real provider."""
+    """A concrete place a request can run: a real model on a real provider.
+
+    `model` is the NATIVE id sent on the wire. In a `models:` logical target it
+    may be None, meaning "inherit from the provider's model_map" (the logical
+    name reverse-mapped to native); set it explicitly only to override (e.g. to
+    pin a specific quant). In a resolved target it is always concrete.
+    """
     provider: str
-    model: str
+    model: Optional[str] = None
     priority: int = 100
 
 
@@ -124,7 +151,7 @@ def _load():
             targets.append(
                 Target(
                     provider=t["provider"],
-                    model=t.get("model", name),
+                    model=t.get("model"),  # None => inherit native via model_map
                     priority=int(t.get("priority", 100)),
                 )
             )

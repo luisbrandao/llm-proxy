@@ -134,11 +134,18 @@ async def list_models(authorized: bool = True) -> dict:
             continue
         add(name, ",".join(owners) or "logical")
 
-    # Model ids that are reachable through a logical model. We hide their raw
-    # bare ids below: clients should use the stable logical name, and the raw
-    # ids (e.g. per-quant variants) would otherwise flap in/out of the list as
-    # backends come and go.
-    logical_targets = {t.model for lm in conf.LOGICAL_MODELS.values() for t in lm.targets}
+    # Things a logical model already fronts, hidden from the flat list below so
+    # clients use the stable logical name and the underlying native ids (e.g.
+    # per-quant variants) don't flap in/out as backends come and go. We hide by
+    # canonical name (covers model_map-inherited targets) and by the concrete
+    # (provider, native id) of each target (covers explicit per-quant overrides).
+    logical_names = set(conf.LOGICAL_MODELS.keys())
+    logical_target_natives = set()
+    for lm in conf.LOGICAL_MODELS.values():
+        for t in lm.targets:
+            p = conf.PROVIDERS_BY_NAME.get(t.provider)
+            native = t.model if t.model is not None else (p.to_native(lm.name) if p else lm.name)
+            logical_target_natives.add((t.provider, native))
 
     # Probe only the backends visible to this caller, concurrently.
     live_providers = [p for p in conf.PROVIDERS if p.lists_all and visible(p.name)]
@@ -154,21 +161,25 @@ async def list_models(authorized: bool = True) -> dict:
         else:
             live_ids[provider.name] = result
 
-    # Group each model id by the visible backends that serve it, skipping ids
-    # that a logical model already fronts.
+    # Group each model by its canonical name (native ids translated through the
+    # provider's model_map) across the visible backends that serve it, skipping
+    # names a logical model already fronts.
     by_model = {}
     for provider in conf.PROVIDERS:
         if not visible(provider.name):
             continue
         ids = live_ids.get(provider.name, []) if provider.lists_all else provider.enabled_models
-        for mid in ids:
-            if mid in logical_targets:
+        for native in ids:
+            if (provider.name, native) in logical_target_natives:
                 continue
-            by_model.setdefault(mid, []).append(provider.name)
+            canon = provider.to_canonical(native)
+            if canon in logical_names:
+                continue
+            by_model.setdefault(canon, []).append(provider.name)
 
-    # Each model id once, by its clean server-less name. When several backends
-    # serve it, they share the entry (and the proxy load-balances behind it).
-    for mid, owners in by_model.items():
-        add(mid, ",".join(owners) if len(owners) > 1 else owners[0])
+    # Each canonical name once. When several backends serve it, they share the
+    # entry (and the proxy load-balances behind it).
+    for canon, owners in by_model.items():
+        add(canon, ",".join(owners) if len(owners) > 1 else owners[0])
 
     return {"object": "list", "data": data}

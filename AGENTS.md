@@ -17,7 +17,7 @@ decompresses the response. Single process, async, one uvicorn worker.
 |---|---|
 | `app/config.py` | Loads `config.yaml` + env. Dataclasses `Provider`, `Target`, `LogicalModel`, `Routing`. Exposes `PROVIDERS`, `PROVIDERS_BY_NAME`, `ALIASES`, `LOGICAL_MODELS`, `ROUTING`, `AUTH_KEYS`. |
 | `app/router.py` | `resolve(model) -> [Target]` (async). Resolution order: alias → `provider:model` → `models:` logical → auto-group → fallback. |
-| `app/slots.py` | Per-provider concurrency. `acquire(targets, timeout)` / `release(provider)` / `slot()` ctx mgr. Priority admission + queue via a lazily-created `asyncio.Condition`. |
+| `app/slots.py` | Per-provider concurrency. `acquire(targets, timeout)` / `release(provider)` / `slot()` ctx mgr. Priority admission (round-robin within a tie tier) + queue via a lazily-created `asyncio.Condition`. |
 | `app/registry.py` | `/v1/models` listing, live model discovery (cached, single-flight), and backend health (`mark_down`/`is_down`/`clear_down`). |
 | `app/auth.py` | Bearer-key gate: `is_authorized(request)`, `restricted(provider)`. |
 | `app/proxy.py` | Request lifecycle: parse → resolve → gate → `_dispatch` (acquire slot, build body, forward, failover) → `_handle_non_stream` / `_handle_stream`. Also decompression + upstream error mapping. |
@@ -92,11 +92,31 @@ priority admission, queue-when-full, cancellation (no slot leak), failover, the 
 and streaming slot release. Prefer adding a real `tests/` suite (pytest + pytest-asyncio)
 if you extend behavior substantially.
 
+## Canonical naming model
+
+Clients only ever see/send **canonical** names; native (provider-specific) ids never leak.
+
+- **`provider.model_map`** is a per-provider native↔canonical dictionary keyed by the
+  **native** id (`{native: canonical}`). `to_canonical(native)` drives `/v1/models` display;
+  `to_native(canonical)` rewrites the wire id when that provider is chosen. Must be a bijection
+  per provider (the reverse lookup is built once in `__post_init__`).
+- **`enabled_models`** is the allow-list in **native** ids (empty = live-discover all).
+- **`models:` logical targets** live in canonical space. A target's `model` is the native id;
+  omit it to inherit `provider.to_native(logical_name)`, set it to pin a specific native id
+  (the per-quant case). `Target.model` is `None` when omitted — resolution fills it in.
+- `router.resolve` returns Targets whose `model` is already the **native** wire id; `_build_body`
+  sends it verbatim. `provider_routing` is keyed by that native id.
+- `registry.list_models` hides anything a logical model fronts — by canonical name *and* by the
+  concrete `(provider, native)` of each target (so explicit per-quant ids stay hidden too).
+
 ## Gotchas
 
 - Model ids can contain `:` (e.g. `local.qwen-medium:low`). `provider:model` splits on the
   **first** `:` only, and only treats the prefix as explicit if it matches a known provider.
-- `priority` lower = preferred; defaults to config order.
+  Canonical names are colon-free by convention, so a native id like `zai-org/glm-5.2:thinking`
+  maps cleanly to a canonical `glm-5.2`.
+- `priority` lower = preferred; defaults to config order. Within a tie tier, admission
+  round-robins across the tied backends that currently have a free slot (`slots._pick_free`).
 - `queue_timeout: 0` means wait forever (the current default).
 - Live discovery is cached per backend for `cache_ttl`; a down backend caches an empty list
   for the full ttl (no hammering) and silently rejoins on recovery.

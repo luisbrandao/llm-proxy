@@ -2,10 +2,12 @@
 
 Each provider has a slot budget (its `slots` config; None = unlimited). A request
 carries an ordered list of candidate targets (highest priority first). Admission
-scans the candidates and takes a slot from the first provider that has one free.
-If none are free the request waits on a shared Condition until some other request
-releases a slot, then re-scans — so priority is honored on every wake and waiters
-queue fairly (Condition wakes them roughly FIFO).
+walks the priority tiers best-first and takes a slot from a free provider in the
+first tier that has one; within a tier it round-robins across the free providers
+so equal-priority backends share load evenly. If nothing is free the request waits
+on a shared Condition until some other request releases a slot, then re-scans — so
+priority is honored on every wake and waiters queue fairly (Condition wakes them
+roughly FIFO).
 
 State is process-local, which is correct here because the app runs as a single
 uvicorn worker. Running multiple workers would split the accounting and must use
@@ -13,6 +15,7 @@ a shared store instead.
 """
 import asyncio
 from contextlib import asynccontextmanager
+from itertools import groupby
 
 from app import config as conf
 from app.metrics import QUEUE_WAITING, SLOTS_IN_USE
@@ -21,6 +24,7 @@ from app.metrics import QUEUE_WAITING, SLOTS_IN_USE
 # not whatever loop happened to exist at import time.
 _cond = None
 _in_use = {}  # provider name -> current in-flight count
+_rr = {}      # round-robin cursor per set of equal-priority free providers
 
 
 def _condition() -> asyncio.Condition:
@@ -51,6 +55,26 @@ def _take(provider_name: str) -> None:
     SLOTS_IN_USE.labels(provider=provider_name).set(_in_use[provider_name])
 
 
+def _pick_free(targets):
+    """Best free target: first priority tier with a free provider, round-robined.
+
+    `targets` is already priority-sorted. Within a tier we rotate across the
+    providers that currently have a free slot so equal-priority backends share
+    load; a single free provider is returned directly. None => nothing free.
+    """
+    for prio, tier in groupby(targets, key=lambda t: t.priority):
+        free = [t for t in tier if _free(t.provider)]
+        if not free:
+            continue
+        if len(free) == 1:
+            return free[0]
+        key = (prio,) + tuple(t.provider for t in free)
+        i = _rr.get(key, 0) % len(free)
+        _rr[key] = i + 1
+        return free[i]
+    return None
+
+
 async def acquire(targets, timeout: float = 0.0):
     """Reserve a slot on the best available target. Waits if all are full.
 
@@ -65,10 +89,10 @@ async def acquire(targets, timeout: float = 0.0):
         waiting = False
         try:
             while True:
-                for t in targets:
-                    if _free(t.provider):
-                        _take(t.provider)
-                        return t
+                t = _pick_free(targets)
+                if t is not None:
+                    _take(t.provider)
+                    return t
                 # Nothing free: queue until a slot is released.
                 if not waiting:
                     waiting = True

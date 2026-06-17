@@ -5,15 +5,22 @@
 # Runtime flags (LOG_INPUT, LOG_OUTPUT, PORT) and the proxy auth keys
 # (PROXY_API_KEYS) are NOT here — set them as environment variables in
 # docker-compose.yml / .env.
+#
+# ── Canonical namespace ─────────────────────────────────────────────────────
+# Clients only ever see and send CANONICAL names. Native (provider-specific) ids
+# never leak out. Two layers produce canonical names:
+#   - providers.model_map  : per-provider native<->canonical dictionary.
+#   - models:              : cross-provider routing table in canonical space.
+# They compose — a logical model picks the providers + order; each provider's
+# model_map supplies the native id. Nothing is named twice.
 
-# Global aliases: simple name -> "provider:model" target.
-# Clients can request `model: "chat"` and it resolves to deepseek:deepseek-chat.
+# Global aliases: simple name -> "provider:canonical" target. The model part is a
+# canonical name (reverse-mapped to the provider's native id on the wire).
+# Clients can request `model: "chat"` and it resolves to deepseek:deepseek-v4-pro.
 # Aliases are also listed in /models so they're discoverable.
 aliases:
-  chat: deepseek:deepseek-chat
-  reasoner: deepseek:deepseek-reasoner
-  llama: ollamaCitrine:llama3
-  sonnet: openRouter:anthropic/claude-3.5-sonnet
+  chat: deepseek:deepseek-v4-pro
+  reasoner: deepseek:deepseek-v4-flash
 
 # Proxy auth keys gate any backend marked `require_permission: true`. Set them
 # via the PROXY_API_KEYS env var (comma-separated for several). Clients pass one
@@ -21,19 +28,26 @@ aliases:
 # everything; a caller without one only sees/uses the open backends. With no
 # keys configured the gate is inert (everything open).
 
-# Each backend has `slots` (max concurrent in-flight requests, shared across all
-# its models; omit = unlimited), `priority` (lower = preferred when a model is
-# served by several backends; defaults to config order), and an optional
-# `require_permission` flag (default false) that puts it behind the auth gate.
+# Each backend has:
+#   slots             max concurrent in-flight requests (shared across all its
+#                     models; omit = unlimited).
+#   priority          lower = preferred when a model is served by several
+#                     backends; defaults to config order. Ties round-robin
+#                     across the tied backends that currently have a free slot.
+#   require_permission  (default false) puts the backend behind the auth gate.
+#   enabled_models    allow-list in NATIVE ids; empty = expose all (live-discovered).
+#   model_map         native id -> clean canonical name. Drives /models display
+#                     (native->canonical) and request rewrite (canonical->native).
+#                     Must be a bijection per provider.
 providers:
   - name: deepseek
     api_key: "sk-your-deepseek-key"   # or "${DEEPSEEK_API_KEY}" to read from env
     require_permission: true   # paid backend -> only authenticated callers
     base_url: "https://api.deepseek.com"
-    enabled_models: [deepseek-v4-pro, deepseek-v4-flash]
+    enabled_models: [deepseek-chat, deepseek-reasoner]   # native ids
     slots: 10
     cache_ttl: 3600
-    model_map:
+    model_map:                 # native -> canonical
       deepseek-chat: deepseek-v4-pro
       deepseek-reasoner: deepseek-v4-flash
 
@@ -50,21 +64,24 @@ providers:
     base_url: "http://other_machine:11434"        # Ollama serves plain HTTP
     enabled_models: []        # empty = expose all models (live-discovered)
     slots: 1
-    priority: 2               # slower -> only used when citrine is busy
+    priority: 2               # slower -> only used when the faster box is busy
     cache_ttl: 10
 
   - name: openRouter
     api_key: "sk-your-openrouter-key"   # or "${OPENROUTER_API_KEY}" to read from env
     require_permission: true   # paid backend -> only authenticated callers
     base_url: "https://openrouter.ai/api"
-    # OpenRouter has too many models — pick the ones to expose upstream.
+    # OpenRouter has too many models — pick the native ids to expose upstream.
     enabled_models:
       - anthropic/claude-3.5-sonnet
       - openai/gpt-4o
+    model_map:                 # native -> canonical (clean names clients see)
+      anthropic/claude-3.5-sonnet: sonnet
+      openai/gpt-4o: gpt-4o
     # Optional: pin which upstream OpenRouter routes a model to, otherwise it
     # picks the cheapest/available one (which may not be who you want). Keyed by
-    # resolved model id. A list pins strictly (order + allow_fallbacks=false); a
-    # dict is forwarded verbatim as OpenRouter's `provider` field. Clients that
+    # resolved NATIVE model id. A list pins strictly (order + allow_fallbacks=false);
+    # a dict is forwarded verbatim as OpenRouter's `provider` field. Clients that
     # send their own `provider` field override this.
     provider_routing:
       anthropic/claude-3.5-sonnet: [anthropic]
@@ -86,20 +103,27 @@ providers:
     slots: 10
     cache_ttl: 3600
 
-# Logical models: one client-facing name backed by several prioritized targets.
-# Use this when the same logical model exists on backends under *different* real
-# ids (e.g. flash on OpenRouter vs DeepSeek). Backends that expose the *same* id
-# (e.g. an Ollama model on two boxes) auto-group with no entry here, ordered by
-# provider priority. Explicit `provider:model` always still pins one backend.
+# Logical models: one canonical name backed by several prioritized targets — the
+# cross-provider routing/failover/load-balance table.
+#   - Omit a target's `model:` and the native id is inherited from that provider's
+#     model_map (the canonical name reverse-mapped).
+#   - Set `model:` explicitly to pin a specific native id — e.g. an Ollama model
+#     served as a different quant on each box.
+# Backends that expose the *same* canonical id auto-group with no entry here,
+# ordered by provider priority. Explicit `provider:model` always still pins one.
 models:
   deepseek-v4-flash:
-    targets:
-      - {provider: openRouter, model: deepseek/deepseek-v4-flash, priority: 1}
-      - {provider: deepseek,   model: deepseek-v4-flash,         priority: 2}
+    targets:                    # native ids inherited via each provider's model_map
+      - {provider: openRouter, priority: 1}
+      - {provider: deepseek,   priority: 2}
+  glm-4.7-flash:
+    targets:                    # per-quant: native differs per box -> set model:
+      - {provider: ollama,   model: "glm-4.7-flash:Q8_0",   priority: 1}
+      - {provider: ollamaGW, model: "glm-4.7-flash:Q4_K_M", priority: 2}
 
 # Global routing behavior.
 routing:
   queue_timeout: 0     # seconds to wait for a free slot; 0 = wait indefinitely
   failover: true       # on backend error, retry the next-priority target
-  auto_group: true     # identical model ids across backends load-balance
+  auto_group: true     # identical canonical names across backends load-balance
   down_backoff: 15     # seconds a failed backend is skipped before retrying
