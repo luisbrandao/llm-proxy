@@ -1,9 +1,10 @@
 import gzip
 import json
 import logging
+import math
 import time
 import zlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Union
 
 import httpx
@@ -178,7 +179,9 @@ async def _emit_request_log(
             "stream": "true" if stream else "false",
             "in": in_tokens,
             "out": out_tokens,
-            "dur_s": f"{duration:.3f}",
+            # H:MM:SS, rounded UP to the whole second so a sub-second request
+            # reads 0:00:01, never a misleading 0:00:00.
+            "dur": str(timedelta(seconds=math.ceil(duration))),
             "speed_tps": f"{out_tokens / duration if duration > 0 else 0:.2f}",
         })
     fields.update({
