@@ -75,7 +75,9 @@ decompresses the response. Single process, async, one uvicorn worker.
   `llm-proxy` logger; timestamps are local-time ISO-8601 with offset (set `TZ`, image
   ships tzdata). One structured logfmt line per request (`event=request …`) goes to the
   prefix-free `llm-proxy.event` logger so Loki parses it with `| logfmt`. Caller
-  identification lives in `app/clientinfo.py`.
+  identification lives in `app/clientinfo.py`. All handlers (ours + uvicorn's, the
+  latter re-pointed in `_unify_logging`) write to **stdout**, not stderr, so
+  `docker logs | grep` works without `2>&1`.
 
 ## Testing
 

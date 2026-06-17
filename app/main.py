@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -29,8 +30,11 @@ class _LocalTimeFormatter(logging.Formatter):
         return datetime.fromtimestamp(record.created).astimezone().isoformat(timespec="seconds")
 
 
+# All logs go to stdout (Python's StreamHandler — and uvicorn — default to
+# stderr, which means `docker logs <c> | grep` silently misses everything until
+# you add `2>&1`). One stream, greppable by default.
 _formatter = _LocalTimeFormatter(LOG_FORMAT)
-_handler = logging.StreamHandler()
+_handler = logging.StreamHandler(sys.stdout)
 _handler.setFormatter(_formatter)
 logging.basicConfig(level=logging.INFO, handlers=[_handler])
 
@@ -38,7 +42,7 @@ logging.basicConfig(level=logging.INFO, handlers=[_handler])
 # on a dedicated logger with a message-only formatter — no human prefix to trip
 # Loki's `| logfmt`. Kept off the root handler via propagate=False so it isn't
 # double-stamped. Everything else keeps the readable `<ts> LEVEL <msg>` format.
-_event_handler = logging.StreamHandler()
+_event_handler = logging.StreamHandler(sys.stdout)
 _event_handler.setFormatter(logging.Formatter("%(message)s"))
 _event_logger = logging.getLogger("llm-proxy.event")
 _event_logger.setLevel(logging.INFO)
@@ -47,15 +51,21 @@ _event_logger.propagate = False
 
 
 def _unify_logging() -> None:
-    """Align uvicorn's loggers with the rest of the app's format.
+    """Align uvicorn's loggers with the rest of the app's format and stream.
 
     uvicorn installs its own handlers (the `INFO:     ...` style) on the
     uvicorn/uvicorn.access/uvicorn.error loggers with propagate=False, so they
-    ignore basicConfig. Re-point them at our formatter so every line matches.
+    ignore basicConfig. Re-point them at our formatter — and at stdout — so
+    every line matches and lives on one greppable stream.
     """
     for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
         for handler in logging.getLogger(name).handlers:
             handler.setFormatter(_formatter)
+            # uvicorn's handlers are plain StreamHandlers on stderr; move them to
+            # stdout. Guard against FileHandler (a StreamHandler subclass) so we
+            # never redirect a file-backed handler.
+            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                handler.setStream(sys.stdout)
 
 
 @asynccontextmanager
