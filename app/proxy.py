@@ -178,7 +178,7 @@ async def _emit_request_log(
             "stream": "true" if stream else "false",
             "in": in_tokens,
             "out": out_tokens,
-            "dur_s": f"{duration:.1f}",
+            "dur_s": f"{duration:.3f}",
             "speed_tps": f"{out_tokens / duration if duration > 0 else 0:.2f}",
         })
     fields.update({

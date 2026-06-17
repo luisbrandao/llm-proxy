@@ -296,7 +296,7 @@ Every completed request — success **or** error — emits exactly one structure
 [logfmt](https://brandur.org/logfmt) line on stdout:
 
 ```
-ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=z-ai/glm-5.2 status=200 stream=true in=5524 out=890 dur_s=25.1 speed_tps=34.91 client_ip=192.168.1.50 client_host=workstation.lan svc=OpenWebUI ua="OpenWebUI/0.5"
+ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=z-ai/glm-5.2 status=200 stream=true in=5524 out=890 dur_s=25.493 speed_tps=34.91 client_ip=192.168.1.50 client_host=workstation.lan svc=OpenWebUI ua="OpenWebUI/0.5"
 ```
 
 | Field | Meaning |
@@ -305,7 +305,7 @@ ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=
 | `provider`, `model` | Backend chosen and the upstream model id sent to it |
 | `status` | Upstream HTTP status relayed to the client |
 | `stream` | Whether the response was streamed |
-| `in`, `out`, `dur_s`, `speed_tps` | Prompt/completion tokens, duration (s), output tokens/s |
+| `in`, `out`, `dur_s`, `speed_tps` | Prompt/completion tokens, duration in seconds (ms resolution, e.g. `0.047`), output tokens/s |
 | `client_ip` | Caller address (`X-Forwarded-For`/`X-Real-IP` honored when `TRUST_PROXY_HEADERS`) |
 | `client_host` | Reverse-DNS of `client_ip` (omitted if unresolved or `RESOLVE_CLIENT_HOST=false`) |
 | `svc`, `ua` | Service guessed from the User-Agent's leading token, and the full User-Agent |
