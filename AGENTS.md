@@ -71,7 +71,11 @@ decompresses the response. Single process, async, one uvicorn worker.
 - Secrets: provider keys inline in `config.yaml` (or `${ENV}`); proxy auth keys via
   `PROXY_API_KEYS`. Never hard-code keys in `app/`. `config.yaml` and `.env` are not
   committed; keep `config.example.yaml` / `.env.example` in sync.
-- Logging is unified to `timestamp - level - message`; use the `deepseek-proxy` logger.
+- Logging: human-readable lines (incl. uvicorn) use `<iso-ts> LEVEL <msg>` via the
+  `llm-proxy` logger; timestamps are local-time ISO-8601 with offset (set `TZ`, image
+  ships tzdata). One structured logfmt line per request (`event=request …`) goes to the
+  prefix-free `llm-proxy.event` logger so Loki parses it with `| logfmt`. Caller
+  identification lives in `app/clientinfo.py`.
 
 ## Testing
 

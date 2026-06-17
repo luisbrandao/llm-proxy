@@ -168,6 +168,10 @@ Set in `docker-compose.yml` / `.env` — **not** in `config.yaml`:
 | `LOG_OUTPUT` | `false` | Log the upstream response (pretty JSON; streaming reassembled). Toggleable at runtime via `/logging` |
 | `PORT` | `8000` | Port the proxy binds to inside the container |
 | `CONFIG_PATH` | `config.yaml` | Path to the YAML config |
+| `TZ` | `America/Sao_Paulo` | Timezone for log timestamps (image ships tzdata; timestamps are ISO-8601 with offset) |
+| `RESOLVE_CLIENT_HOST` | `true` | Reverse-DNS the caller IP for the request log (cached, off-loop, time-bounded) |
+| `CLIENT_DNS_TIMEOUT` | `1.0` | Seconds to wait for a reverse-DNS lookup before logging IP-only |
+| `TRUST_PROXY_HEADERS` | `true` | Trust `X-Forwarded-For` / `X-Real-IP` for the caller IP (set `false` behind no proxy) |
 
 > **Single worker required.** Slot/queue accounting is in-process, so run **one**
 > uvicorn worker (the default). Multiple workers would split the accounting and break
@@ -257,18 +261,42 @@ recreated empty each restart and persistence is a no-op.
 | `METRICS_PERSIST_PATH` | `metrics_state.json` | Where the snapshot is written (use a mounted volume) |
 | `METRICS_FLUSH_INTERVAL` | `30` | Seconds between lazy snapshots |
 
-## Token Logging
+## Request Logging
 
-Every completed request emits one line:
+Every completed request — success **or** error — emits exactly one structured
+[logfmt](https://brandur.org/logfmt) line on stdout:
 
 ```
-2026-06-09 14:19:03 - INFO - Tokens - Provider: deepseek, Model: deepseek-v4-pro, In: 29323, Out: 142, Time: 0:00:10, Speed: 13.76 t/s
+ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=z-ai/glm-5.2 status=200 stream=true in=5524 out=890 dur_s=25.1 speed_tps=34.91 client_ip=192.168.1.50 client_host=workstation.lan svc=OpenWebUI ua="OpenWebUI/0.5"
 ```
+
+| Field | Meaning |
+|---|---|
+| `ts` | ISO-8601 timestamp **with offset** (local time per `TZ`; unambiguous regardless of reader) |
+| `provider`, `model` | Backend chosen and the upstream model id sent to it |
+| `status` | Upstream HTTP status relayed to the client |
+| `stream` | Whether the response was streamed |
+| `in`, `out`, `dur_s`, `speed_tps` | Prompt/completion tokens, duration (s), output tokens/s |
+| `client_ip` | Caller address (`X-Forwarded-For`/`X-Real-IP` honored when `TRUST_PROXY_HEADERS`) |
+| `client_host` | Reverse-DNS of `client_ip` (omitted if unresolved or `RESOLVE_CLIENT_HOST=false`) |
+| `svc`, `ua` | Service guessed from the User-Agent's leading token, and the full User-Agent |
+| `err` | Short error category (`invalid_request`, `unauthorized`, `rate_limited`, `upstream_error`…); absent on success |
+
+Because it's logfmt, Loki/Grafana parse it with no regex:
+
+```logql
+{container="llm-proxy"} | logfmt | status>=`400`            # all failed requests
+{container="llm-proxy"} | logfmt | provider=`openRouter`    # one backend
+sum by (client_host) (count_over_time({container="llm-proxy"} | logfmt [1h]))  # calls per caller machine
+```
+
+The line is emitted **after** the response is delivered (background task / stream
+end), so reverse-DNS never adds latency to the caller.
 
 `LOG_INPUT` logs the full proxied request curl-style (auth masked); `LOG_OUTPUT` logs the
 upstream response pretty-printed (streaming reassembled into one JSON with
-`_assembled_content` / `_reasoning_content`). uvicorn's access/error logs are reformatted
-to match this `timestamp - level - message` style.
+`_assembled_content` / `_reasoning_content`). These verbose dumps and uvicorn's access/error
+logs use the human-readable `<ts> LEVEL <msg>` format (same ISO-8601 timestamp).
 
 Both flags can be flipped at runtime — no restart required:
 
@@ -289,7 +317,7 @@ truncated at 4 KB) regardless of `LOG_OUTPUT` — the body is where the backend 
 rejected the request:
 
 ```
-2026-06-11 23:42:22 - WARNING - Upstream error 400 from 'google' (model: gemini-2.5-pro):
+2026-06-11T23:42:22-03:00 WARNING Upstream error 400 from 'google' (model: gemini-2.5-pro):
 {
   "error": { "code": 400, "message": "Unknown name 'num_ctx': Cannot find field.", ... }
 }
@@ -297,7 +325,8 @@ rejected the request:
 
 The error body and status are also relayed to the client verbatim — including on **streaming**
 requests, where the upstream's 4xx/5xx is returned as a plain JSON response instead of being
-wrapped in a bogus `200` SSE stream.
+wrapped in a bogus `200` SSE stream. The one-line `event=request … status=400 err=invalid_request`
+summary above is emitted in addition, so you can both alert on it and read the full reason.
 
 > **Streaming token counts:** upstreams only emit a `usage` block in a streamed response
 > when the request sets `stream_options: {"include_usage": true}`. The proxy **injects

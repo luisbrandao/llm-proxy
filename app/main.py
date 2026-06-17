@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -11,10 +12,38 @@ from app.metrics import metrics_response
 from app.proxy import proxy_request
 from app.registry import list_models
 
-LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
-DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=DATE_FORMAT)
+
+class _LocalTimeFormatter(logging.Formatter):
+    """Stamp every line with a local-time ISO-8601 timestamp that carries an
+    explicit UTC offset, e.g. `2026-06-17T02:48:13-03:00`.
+
+    Two problems this solves: the timestamp is unambiguous no matter what
+    timezone the reader (Loki, a teammate) assumes, and "local" follows the
+    container's TZ — so set `TZ` (e.g. America/Sao_Paulo) and ship tzdata in
+    the image and the wall-clock matches where the box actually is.
+    """
+
+    def formatTime(self, record, datefmt=None):
+        return datetime.fromtimestamp(record.created).astimezone().isoformat(timespec="seconds")
+
+
+_formatter = _LocalTimeFormatter(LOG_FORMAT)
+_handler = logging.StreamHandler()
+_handler.setFormatter(_formatter)
+logging.basicConfig(level=logging.INFO, handlers=[_handler])
+
+# Per-request events are emitted as pure logfmt (`ts=.. level=.. event=request ..`)
+# on a dedicated logger with a message-only formatter — no human prefix to trip
+# Loki's `| logfmt`. Kept off the root handler via propagate=False so it isn't
+# double-stamped. Everything else keeps the readable `<ts> LEVEL <msg>` format.
+_event_handler = logging.StreamHandler()
+_event_handler.setFormatter(logging.Formatter("%(message)s"))
+_event_logger = logging.getLogger("llm-proxy.event")
+_event_logger.setLevel(logging.INFO)
+_event_logger.addHandler(_event_handler)
+_event_logger.propagate = False
 
 
 def _unify_logging() -> None:
@@ -24,10 +53,9 @@ def _unify_logging() -> None:
     uvicorn/uvicorn.access/uvicorn.error loggers with propagate=False, so they
     ignore basicConfig. Re-point them at our formatter so every line matches.
     """
-    fmt = logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT)
     for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
         for handler in logging.getLogger(name).handlers:
-            handler.setFormatter(fmt)
+            handler.setFormatter(_formatter)
 
 
 @asynccontextmanager

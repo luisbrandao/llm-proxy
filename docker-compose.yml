@@ -3,6 +3,7 @@ services:
     build: .
     container_name: llm-proxy
     environment:
+      - TZ=America/Sao_Paulo
       - CONFIG_PATH=/app/config.yaml
       - LOG_INPUT=false
       - LOG_OUTPUT=false

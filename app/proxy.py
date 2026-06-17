@@ -3,15 +3,16 @@ import json
 import logging
 import time
 import zlib
-from datetime import timedelta
+from datetime import datetime
 from typing import Optional, Union
 
 import httpx
 from fastapi import Request
 from fastapi.responses import Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 from app import config as conf
-from app import auth, registry, router, slots
+from app import auth, clientinfo, registry, router, slots
 from app.config import Provider
 from app.metrics import (
     ERRORS_TOTAL,
@@ -23,6 +24,8 @@ from app.metrics import (
 )
 
 logger = logging.getLogger("llm-proxy")
+# Pure-logfmt, prefix-free per-request events (configured in app.main).
+event_logger = logging.getLogger("llm-proxy.event")
 
 
 def _build_url(provider: Provider, path: str) -> str:
@@ -102,13 +105,71 @@ def _log_curl(method: str, url: str, headers: dict, body: str) -> None:
     logger.info(f"Request:\n{cmd}")
 
 
-def _log_summary(provider: str, model: str, in_tokens: int, out_tokens: int, duration: float) -> None:
-    speed = out_tokens / duration if duration > 0 else 0
-    time_str = str(timedelta(seconds=int(duration)))
-    logger.info(
-        f"Tokens - Provider: {provider}, Model: {model}, In: {in_tokens}, Out: {out_tokens}, "
-        f"Time: {time_str}, Speed: {speed:.2f} t/s"
-    )
+def _logfmt(fields: dict) -> str:
+    """Render an ordered dict as a logfmt line (key=value, space-separated).
+
+    Values are quoted when they would otherwise break tokenization (contain
+    whitespace, quotes or '='). None values are dropped so absent fields just
+    don't appear. Parses cleanly in Loki/Grafana with `| logfmt`.
+    """
+    parts = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        s = str(value)
+        if s == "" or any(c in s for c in ' "=\n\r\t'):
+            s = '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").replace("\r", " ").replace("\t", " ") + '"'
+        parts.append(f"{key}={s}")
+    return " ".join(parts)
+
+
+def _err_kind(status: int) -> Optional[str]:
+    """A short, stable error category for an HTTP status (None when not an error)."""
+    if status < 400:
+        return None
+    if status in (401, 403):
+        return "unauthorized"
+    if status == 404:
+        return "not_found"
+    if status == 429:
+        return "rate_limited"
+    if status < 500:
+        return "invalid_request"
+    return "upstream_error"
+
+
+async def _emit_request_log(
+    request: Request, provider: str, model: str, status: int,
+    in_tokens: int, out_tokens: int, duration: float, stream: bool,
+) -> None:
+    """Emit the single, always-on, parseable line summarizing one request.
+
+    Carries who called (ip/host/service), what ran (provider/model), the
+    outcome (status, token counts, speed) and whether it streamed. Runs after
+    the response is delivered (background task / stream finally) so the
+    reverse-DNS lookup never adds latency to the client.
+    """
+    ip = clientinfo.client_ip(request)
+    host = await clientinfo.client_host(ip)
+    ua = (request.headers.get("user-agent") or "").strip() or None
+    event_logger.info(_logfmt({
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "level": "info",
+        "event": "request",
+        "provider": provider,
+        "model": model,
+        "status": status,
+        "stream": "true" if stream else "false",
+        "in": in_tokens,
+        "out": out_tokens,
+        "dur_s": f"{duration:.1f}",
+        "speed_tps": f"{out_tokens / duration if duration > 0 else 0:.2f}",
+        "client_ip": ip,
+        "client_host": host,
+        "svc": clientinfo.service_from_ua(ua),
+        "ua": ua,
+        "err": _err_kind(status),
+    }))
 
 
 def _log_upstream_error(provider: str, model: str, status: int, body: str) -> None:
@@ -223,9 +284,6 @@ async def _handle_non_stream(
         else:
             _record_metrics(pname, model, in_tokens, out_tokens, duration)
 
-    if in_tokens > 0 or out_tokens > 0:
-        _log_summary(pname, model, in_tokens, out_tokens, duration)
-
     resp_headers.pop("content-length", None)
     resp_headers.pop("transfer-encoding", None)
     resp_headers.pop("content-encoding", None)
@@ -234,6 +292,10 @@ async def _handle_non_stream(
         content=resp_body,
         status_code=status_code,
         headers=resp_headers,
+        background=BackgroundTask(
+            _emit_request_log, request, pname, model, status_code,
+            in_tokens, out_tokens, duration, False,
+        ),
     )
 
 
@@ -287,7 +349,14 @@ async def _handle_stream(
         resp_headers.pop("content-length", None)
         resp_headers.pop("transfer-encoding", None)
         resp_headers.pop("content-encoding", None)
-        return Response(content=resp_body, status_code=status_code, headers=resp_headers)
+        return Response(
+            content=resp_body,
+            status_code=status_code,
+            headers=resp_headers,
+            background=BackgroundTask(
+                _emit_request_log, request, pname, model, status_code, 0, 0, 0.0, True,
+            ),
+        )
 
     async def generate():
         start = time.time()
@@ -348,8 +417,9 @@ async def _handle_stream(
                     ERRORS_TOTAL.labels(provider=pname, model=model, status_code=str(status_code)).inc()
                 else:
                     _record_metrics(pname, model, in_tokens, out_tokens, duration)
-            if in_tokens > 0 or out_tokens > 0:
-                _log_summary(pname, model, in_tokens, out_tokens, duration)
+            await _emit_request_log(
+                request, pname, model, status_code, in_tokens, out_tokens, duration, True,
+            )
             if delta_contents is not None:
                 full_text = "".join(delta_contents)
                 reasoning_text = "".join(reasoning_contents) if reasoning_contents else ""
