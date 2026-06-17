@@ -58,6 +58,10 @@ class Provider:
     # backends (Google rejects any unknown field with a 400) — e.g. clients that
     # inject Ollama-isms like `num_ctx`. Default: keep everything.
     strip_fields: List[str] = field(default_factory=list)
+    # Extra headers to send upstream, applied as defaults (a header the client
+    # already sent wins). Use for backend attribution the client can't set
+    # itself — e.g. OpenRouter app identity: {"HTTP-Referer": "...", "X-Title": "..."}.
+    headers: Dict[str, str] = field(default_factory=dict)
     # Reverse of model_map (canonical name -> native id), built in __post_init__.
     _to_native: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
@@ -140,6 +144,7 @@ def _load():
                 require_permission=bool(item.get("require_permission", False)),
                 strip_path_prefix=str(item.get("strip_path_prefix", "")),
                 strip_fields=item.get("strip_fields") or [],
+                headers={str(k): _interpolate(str(v)) for k, v in (item.get("headers") or {}).items()},
             )
         )
 

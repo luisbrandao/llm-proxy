@@ -41,6 +41,13 @@ def _build_headers(provider: Provider, request: Request) -> dict:
         headers["authorization"] = f"Bearer {provider.api_key}"
     else:
         headers.pop("authorization", None)
+    # Operator-configured per-backend headers (e.g. OpenRouter attribution:
+    # HTTP-Referer / X-Title). Applied as defaults — a header the client already
+    # sent wins, so per-app attribution still passes through. Keys are lowercased
+    # to match the forwarded set (HTTP header names are case-insensitive) and
+    # avoid sending a duplicate.
+    for k, v in provider.headers.items():
+        headers.setdefault(k.lower(), v)
     # Forward the caller's User-Agent verbatim. When the caller sent none, httpx
     # would otherwise inject its own `python-httpx/x.y` default, which surfaces at
     # the backend (e.g. OpenRouter) as a bogus/"missing" client. Ensuring the key

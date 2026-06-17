@@ -87,6 +87,13 @@ providers:
       anthropic/claude-3.5-sonnet: [anthropic]
       # full control form:
       # openai/gpt-4o: { order: [openai], allow_fallbacks: true }
+    # Extra headers sent upstream (defaults — a header the client already sent
+    # wins). OpenRouter attributes the calling app by HTTP-Referer + X-Title;
+    # clients pointed at a generic OpenAI endpoint don't send these, so set them
+    # here to claim your app on OpenRouter's dashboard.
+    headers:
+      HTTP-Referer: "https://github.com/luisbrandao/llm-proxy"
+      X-Title: "llm-proxy"
     slots: 10
     cache_ttl: 3600
 

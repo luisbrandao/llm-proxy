@@ -160,6 +160,7 @@ routing:
 | `strip_fields` | Top-level request-body keys to drop before forwarding. For strict backends that 400 on unknown fields (e.g. Google rejects the `num_ctx` some clients inject) |
 | `model_map` | Per-provider **native → canonical** dictionary. Drives `/v1/models` display (native→canonical) and request rewrite (canonical→native). Must be a bijection |
 | `provider_routing` | OpenRouter only — per-model upstream pinning, keyed by **native** id (list = strict order, dict = verbatim `provider` field) |
+| `headers` | Extra headers sent upstream, applied as **defaults** (a header the client already sent wins). For backend attribution the client can't set itself — e.g. OpenRouter app identity (`HTTP-Referer` / `X-Title`). Values support `${ENV}` |
 | `cache_ttl` | Seconds the live `/models` result is cached for this backend |
 
 ### Canonical names
