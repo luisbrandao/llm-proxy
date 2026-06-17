@@ -148,28 +148,47 @@ async def _emit_request_log(
     outcome (status, token counts, speed) and whether it streamed. Runs after
     the response is delivered (background task / stream finally) so the
     reverse-DNS lookup never adds latency to the client.
+
+    A model-less passthrough (non-chat / multipart body, nothing to resolve) is
+    logged as `event=passthrough` keyed by request path — never as a bogus
+    `model=unknown`, which would pollute the per-model view.
     """
     ip = clientinfo.client_ip(request)
     host = await clientinfo.client_host(ip)
     ua = (request.headers.get("user-agent") or "").strip() or None
-    event_logger.info(_logfmt({
+    fields = {
         "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
         "level": "info",
-        "event": "request",
-        "provider": provider,
-        "model": model,
-        "status": status,
-        "stream": "true" if stream else "false",
-        "in": in_tokens,
-        "out": out_tokens,
-        "dur_s": f"{duration:.1f}",
-        "speed_tps": f"{out_tokens / duration if duration > 0 else 0:.2f}",
+    }
+    if model == "unknown":
+        fields.update({
+            "event": "passthrough",
+            "provider": provider,
+            "method": request.method,
+            "path": request.url.path,
+            "status": status,
+            "stream": "true" if stream else "false",
+        })
+    else:
+        fields.update({
+            "event": "request",
+            "provider": provider,
+            "model": model,
+            "status": status,
+            "stream": "true" if stream else "false",
+            "in": in_tokens,
+            "out": out_tokens,
+            "dur_s": f"{duration:.1f}",
+            "speed_tps": f"{out_tokens / duration if duration > 0 else 0:.2f}",
+        })
+    fields.update({
         "client_ip": ip,
         "client_host": host,
         "svc": clientinfo.service_from_ua(ua),
         "ua": ua,
         "err": _err_kind(status),
-    }))
+    })
+    event_logger.info(_logfmt(fields))
 
 
 def _log_upstream_error(provider: str, model: str, status: int, body: str) -> None:
@@ -186,7 +205,8 @@ def _log_upstream_error(provider: str, model: str, status: int, body: str) -> No
         pass
     if len(snippet) > 4000:
         snippet = snippet[:4000] + "... [truncated]"
-    logger.warning(f"Upstream error {status} from '{provider}' (model: {model}):\n{snippet}")
+    qualifier = "passthrough" if model == "unknown" else f"model: {model}"
+    logger.warning(f"Upstream error {status} from '{provider}' ({qualifier}):\n{snippet}")
 
 
 def _record_metrics(provider: str, model: str, in_tokens: int, out_tokens: int, duration: float) -> None:

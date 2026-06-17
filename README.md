@@ -282,6 +282,18 @@ ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=
 | `svc`, `ua` | Service guessed from the User-Agent's leading token, and the full User-Agent |
 | `err` | Short error category (`invalid_request`, `unauthorized`, `rate_limited`, `upstream_error`…); absent on success |
 
+A request whose body carries no resolvable `model` (a non-chat / multipart passthrough —
+forwarded untouched to the first provider) is logged instead as **`event=passthrough`**,
+keyed by `method` + `path` rather than a model, e.g.:
+
+```
+ts=2026-06-17T12:10:23-03:00 level=info event=passthrough provider=deepseek method=POST path=/models status=405 stream=false client_ip=192.168.0.79 client_host=luis.brandao svc=PostmanRuntime ua="PostmanRuntime/7.52.0" err=invalid_request
+```
+
+So `model=` never appears as `unknown`, and these requests stay out of per-model dashboards
+(they're also excluded from the `llm_proxy_*` model metrics). Split them in Loki with
+`| logfmt | event="request"` vs `event="passthrough"`.
+
 Because it's logfmt, Loki/Grafana parse it with no regex:
 
 ```logql
