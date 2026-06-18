@@ -188,7 +188,7 @@ model and via auto-group resolves as the logical model (it's earlier in the orde
 
 ### Environment variables
 
-Set in `docker-compose.yml` / `.env` — **not** in `config.yaml`:
+Set in `docker-compose.yml` — **not** in `config.yaml`:
 
 | Env var | Default | Description |
 |---|---|---|
@@ -222,8 +222,8 @@ carries `Authorization: Bearer <key>` with a key listed in `PROXY_API_KEYS`.
 ## Quick Start
 
 ```bash
-cp .env.example .env                 # set PROXY_API_KEYS
 cp config.example.yaml config.yaml   # edit backends, slots, priorities, keys
+# set PROXY_API_KEYS and other env vars in docker-compose.yml (see table above)
 docker compose up -d
 ```
 

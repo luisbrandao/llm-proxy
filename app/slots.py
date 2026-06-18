@@ -14,7 +14,6 @@ uvicorn worker. Running multiple workers would split the accounting and must use
 a shared store instead.
 """
 import asyncio
-from contextlib import asynccontextmanager
 from itertools import groupby
 
 from app import config as conf
@@ -120,12 +119,3 @@ async def release(provider_name: str) -> None:
             _in_use[provider_name] = current - 1
             SLOTS_IN_USE.labels(provider=provider_name).set(current - 1)
         cond.notify()
-
-
-@asynccontextmanager
-async def slot(targets, timeout: float = 0.0):
-    target = await acquire(targets, timeout)
-    try:
-        yield target
-    finally:
-        await release(target.provider)
