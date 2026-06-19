@@ -118,6 +118,13 @@ class Routing:
     failover: bool = True        # on backend error, try the next-priority target
     auto_group: bool = True      # group identical model ids across providers
     down_backoff: float = 15.0   # seconds a failed backend is skipped for
+    # Upstream HTTP error statuses that trigger failover to the next target
+    # (rather than relaying the error to the client). Server errors + rate
+    # limiting by default; 4xx like 400/404 are request problems every backend
+    # would reject identically, so they're relayed as-is.
+    failover_statuses: frozenset = field(
+        default_factory=lambda: frozenset({429, 500, 502, 503, 504})
+    )
 
 
 def _load():
@@ -164,11 +171,17 @@ def _load():
         logical[str(name)] = LogicalModel(name=str(name), targets=targets)
 
     r = raw.get("routing") or {}
+    fos = r.get("failover_statuses")
     routing = Routing(
         queue_timeout=float(r.get("queue_timeout", 0) or 0),
         failover=bool(r.get("failover", True)),
         auto_group=bool(r.get("auto_group", True)),
         down_backoff=float(r.get("down_backoff", 15)),
+        failover_statuses=(
+            frozenset(int(s) for s in fos)
+            if fos is not None
+            else frozenset({429, 500, 502, 503, 504})
+        ),
     )
 
     # Accepted proxy keys gate the `require_permission` backends. Sourced from

@@ -134,3 +134,7 @@ routing:
   failover: true       # on backend error, retry the next-priority target
   auto_group: true     # identical canonical names across backends load-balance
   down_backoff: 15     # seconds a failed backend is skipped before retrying
+  # Upstream HTTP statuses that count as a "backend error" and trigger failover
+  # to the next target (a connection failure always does). 4xx like 400/404 are
+  # relayed as-is — every backend would reject them the same way. Default below.
+  failover_statuses: [429, 500, 502, 503, 504]

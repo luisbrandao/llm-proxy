@@ -77,10 +77,16 @@ equal-priority backends share load evenly. If all candidates are full it **waits
 
 ### Failover
 
-If a chosen backend errors (connection refused, timeout, …) the proxy releases the slot,
-marks the backend down for `routing.down_backoff` seconds, and retries the next-priority
-target. Only if **all** candidates fail does the client get an error. Streaming requests
-can fail over up to the first byte (after that the HTTP status is already committed).
+If a chosen backend errors the proxy releases the slot, marks the backend down for
+`routing.down_backoff` seconds, and retries the next-priority target. "Errors" means both
+a connection-level failure (connection refused, timeout, …) **and** an upstream HTTP
+response whose status is in `routing.failover_statuses` (default `429, 500, 502, 503,
+504`) — a backend that answers `503 Service Unavailable` is failed over just like one
+that's unreachable. Deliberate 4xx (bad request, auth) are relayed to the client as-is,
+since every backend would reject them identically. Once **all** candidates fail, the
+client gets the last upstream error verbatim (its real status and body), not a synthetic
+502. Streaming requests can fail over up to the first byte (after that the HTTP status is
+already committed).
 
 ## Configuration
 
@@ -143,6 +149,7 @@ routing:
   failover: true      # retry the next target on backend error
   auto_group: true    # identical canonical names across backends load-balance
   down_backoff: 15    # seconds a failed backend is skipped before retry
+  failover_statuses: [429, 500, 502, 503, 504]  # upstream statuses that fail over
 ```
 
 ### Provider fields
@@ -184,7 +191,8 @@ model and via auto-group resolves as the logical model (it's earlier in the orde
   explicit `model:` only to pin a specific native id (e.g. a per-box quant); otherwise it's
   inherited from `model_map`. Backends sharing the *same* canonical name auto-group without
   an entry.
-- **`routing:`** — `queue_timeout`, `failover`, `auto_group`, `down_backoff` (see above).
+- **`routing:`** — `queue_timeout`, `failover`, `auto_group`, `down_backoff`,
+  `failover_statuses` (see above).
 
 ### Environment variables
 

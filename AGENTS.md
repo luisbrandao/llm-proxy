@@ -32,7 +32,7 @@ decompresses the response. Single process, async, one uvicorn worker.
 3. `router.resolve(model)` → ordered targets.
 4. Gate: if unauthorized, drop `require_permission` targets; none left → **401**.
 5. Drop currently-down targets (keep as last resort).
-6. `_dispatch`: loop — `slots.acquire` → `_build_body` (rewrite model id, inject `provider_routing`) → forward. On `httpx.RequestError`: release slot, `mark_down`, try next target. Exhausted → `_backend_error`.
+6. `_dispatch`: loop — `slots.acquire` → `_build_body` (rewrite model id, inject `provider_routing`) → forward. Fails over on two conditions: an `httpx.RequestError` (connection failure) **or** an upstream response whose status is in `ROUTING.failover_statuses` (`_should_failover`, default 429/5xx). Either one → release slot, `mark_down`, drop this target, try next. Exhausted: a connection failure → `_backend_error`; a relayed upstream error → that last response **verbatim** (real status + body). `clear_down` runs only on a `< 400` response.
 
 ## Invariants — do not break these
 
@@ -50,8 +50,11 @@ decompresses the response. Single process, async, one uvicorn worker.
   the next target *before* a `StreamingResponse` commits its 200 status. Don't move the
   error handling inside the body generator.
 - **Handlers raise, the dispatcher decides.** `_handle_non_stream` / `_handle_stream`
-  must let `httpx.RequestError` propagate (for failover). Only `_dispatch` /
-  `proxy_request` convert errors to client responses (`_backend_error`, 401, 503).
+  must let `httpx.RequestError` propagate (for connection-level failover) and return a
+  buffered `Response` carrying the upstream status for HTTP errors. `_dispatch` owns *both*
+  failover triggers — the `RequestError` except-branch and the `_should_failover(status)`
+  check on the returned response — and is the only place that converts errors to terminal
+  client responses (`_backend_error`, 401, 503) or relays an upstream error verbatim.
 - **Decompression reads raw bytes.** `_handle_non_stream` uses `aiter_raw()` + manual
   `_decompress` because httpx can't decode brotli without the lib. The forwarded
   `Accept-Encoding` is capped to `gzip, deflate` in `_build_headers`. Keep these aligned.

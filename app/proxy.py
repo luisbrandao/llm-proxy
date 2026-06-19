@@ -522,11 +522,28 @@ def _build_body(payload: dict, provider: Provider, model: str):
     return body, body.decode("utf-8")
 
 
+def _should_failover(status: int) -> bool:
+    """Whether an upstream HTTP error status should trigger trying the next target.
+
+    A backend that *answered* with 503/500/429 is as unusable for this request as
+    one we couldn't reach at all, so it gets the same failover treatment as a
+    connection error. A deliberate 4xx (bad request, auth) is left out — every
+    backend would reject it identically, so relay it instead of burning retries.
+    """
+    return conf.ROUTING.failover and status in conf.ROUTING.failover_statuses
+
+
 async def _dispatch(
     request: Request, path: str, payload: dict, is_stream: bool, targets: list
 ) -> Union[Response, StreamingResponse]:
     """Acquire a slot on the best available target and forward, failing over to
-    the next-priority target if a backend errors out (when failover is enabled)."""
+    the next-priority target when a backend errors out (when failover is enabled).
+
+    Failover fires on a connection-level `httpx.RequestError` *and* on a retryable
+    upstream HTTP status (`Routing.failover_statuses`, e.g. 503). Once targets are
+    exhausted the client gets the last upstream error verbatim — its real status
+    and body, not a synthetic 502 — so the reason for the failure survives.
+    """
     remaining = list(targets)
     last_provider = None
     last_exc = None
@@ -550,17 +567,14 @@ async def _dispatch(
                 async def _release(p=target.provider):
                     await slots.release(p)
 
+                # Slot is released by the generator's finally once streaming ends,
+                # or — on a pre-first-byte error — via on_complete inside the handler.
                 resp = await _handle_stream(
                     request, provider, path, body, body_str, target.model, on_complete=_release
                 )
-                # Slot is released by the generator's finally once streaming ends.
-                registry.clear_down(target.provider)
-                return resp
-
-            resp = await _handle_non_stream(request, provider, path, body, body_str, target.model)
-            await slots.release(target.provider)
-            registry.clear_down(target.provider)
-            return resp
+            else:
+                resp = await _handle_non_stream(request, provider, path, body, body_str, target.model)
+                await slots.release(target.provider)
         except httpx.RequestError as e:
             await slots.release(target.provider)
             last_exc = e
@@ -573,8 +587,30 @@ async def _dispatch(
                 f"Failover: '{target.provider}' failed ({type(e).__name__}); "
                 f"{len(remaining)} target(s) left for model '{target.model}'"
             )
+            continue
 
-    # Every candidate failed.
+        # The backend answered with a retryable error status (the connection was
+        # fine, the response wasn't). Try the next target if any remain; otherwise
+        # fall through and relay this error to the client verbatim.
+        if _should_failover(resp.status_code):
+            others = [t for t in remaining if t.provider != target.provider]
+            if others:
+                registry.mark_down(target.provider, conf.ROUTING.down_backoff)
+                FAILOVERS_TOTAL.labels(provider=target.provider).inc()
+                remaining = others
+                logger.warning(
+                    f"Failover: '{target.provider}' returned {resp.status_code}; "
+                    f"{len(others)} target(s) left for model '{target.model}'"
+                )
+                continue
+
+        # A genuinely good response clears any down-mark; an error we're relaying
+        # (terminal, no targets left) must not — the backend is still unhealthy.
+        if resp.status_code < 400:
+            registry.clear_down(target.provider)
+        return resp
+
+    # Every candidate failed with a connection error.
     if last_exc is None:
         last_exc = httpx.ConnectError("no backends available")
     return _backend_error(last_provider, "unknown", last_exc)
