@@ -66,6 +66,23 @@ _attach_buffer(logging.getLogger())
 _attach_buffer(_event_logger)
 
 
+# Access-log paths that are pure noise: the web console tails logs by polling
+# /admin/logs every ~1.5s, which would otherwise flood the very view you're
+# watching (and docker logs). Matched as a substring of the rendered access line.
+_ACCESS_LOG_MUTE = ("/admin/logs",)
+
+
+class _MutePollingFilter(logging.Filter):
+    """Drop uvicorn access-log records for the console's own polling endpoints."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:  # noqa: BLE001 - never let a filter crash logging
+            return True
+        return not any(p in msg for p in _ACCESS_LOG_MUTE)
+
+
 def _unify_logging() -> None:
     """Align uvicorn's loggers with the rest of the app's format and stream.
 
@@ -86,6 +103,13 @@ def _unify_logging() -> None:
         # uvicorn's loggers have propagate=False, so the buffer on root won't see
         # them — attach it directly so access/error lines show up in /admin/logs.
         _attach_buffer(uvicorn_logger)
+
+    # Mute the console's own log-tail polling at the access logger, so those lines
+    # reach neither stdout nor the ring buffer (otherwise the Logging tab floods
+    # itself every poll).
+    access = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, _MutePollingFilter) for f in access.filters):
+        access.addFilter(_MutePollingFilter())
 
 
 @asynccontextmanager
