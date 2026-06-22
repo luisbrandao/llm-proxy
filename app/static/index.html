@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLM Proxy · Console</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">⇄</span>
+      <h1>LLM&nbsp;Proxy <span class="sub">console</span></h1>
+    </div>
+    <div class="key-area">
+      <span id="conn-dot" class="dot" title="connection status"></span>
+      <label for="api-key" class="key-label">Proxy key</label>
+      <input id="api-key" type="password" placeholder="Bearer token (e.g. sk-…)" autocomplete="off" spellcheck="false">
+      <button id="save-key" class="btn primary">Sign in</button>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="logging">Logging</button>
+    <button class="tab" data-tab="models">Models</button>
+    <button class="tab" data-tab="routing">Routing</button>
+  </nav>
+
+  <main>
+    <!-- ───────────────────────── LOGGING ───────────────────────── -->
+    <section id="tab-logging" class="panel active">
+      <div class="toolbar">
+        <label class="switch"><input type="checkbox" id="log-input"><span>LOG_INPUT</span></label>
+        <label class="switch"><input type="checkbox" id="log-output"><span>LOG_OUTPUT</span></label>
+        <span class="sep"></span>
+        <label class="field">level
+          <select id="log-level">
+            <option value="DEBUG">DEBUG</option>
+            <option value="INFO" selected>INFO</option>
+            <option value="WARNING">WARNING</option>
+            <option value="ERROR">ERROR</option>
+          </select>
+        </label>
+        <label class="switch"><input type="checkbox" id="log-pause"><span>Pause</span></label>
+        <label class="switch"><input type="checkbox" id="log-autoscroll" checked><span>Autoscroll</span></label>
+        <button id="log-clear" class="btn">Clear</button>
+        <span class="grow"></span>
+        <span id="log-count" class="muted"></span>
+      </div>
+      <div id="log-pane" class="logpane"></div>
+    </section>
+
+    <!-- ───────────────────────── MODELS ───────────────────────── -->
+    <section id="tab-models" class="panel">
+      <div class="toolbar">
+        <button id="models-refresh" class="btn">Refresh catalog</button>
+        <button id="models-probe" class="btn primary">Probe upstreams</button>
+        <span class="grow"></span>
+        <span id="models-count" class="muted"></span>
+      </div>
+      <div class="cols">
+        <div class="col">
+          <h2>Aggregated catalog <small class="muted">what clients see · /v1/models</small></h2>
+          <div id="catalog"></div>
+        </div>
+        <div class="col">
+          <h2>Per-upstream <small class="muted">raw /v1/models from each backend</small></h2>
+          <div id="upstreams" class="hint">Click <b>Probe upstreams</b> to query every backend directly and see its full catalog — independent of the <code>enabled_models</code> allow-list.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ───────────────────────── ROUTING ───────────────────────── -->
+    <section id="tab-routing" class="panel">
+      <div class="toolbar">
+        <button id="routing-refresh" class="btn">Refresh</button>
+        <span class="sep"></span>
+        <span id="routing-autogroup" class="muted"></span>
+        <span class="grow"></span>
+        <span class="muted">reorder with ↑ ↓ or edit a priority · changes are live, reset on restart</span>
+      </div>
+      <div id="providers" class="providers"></div>
+      <div id="logical" class="logical"></div>
+      <div id="aliases-wrap">
+        <h2>Aliases <small class="muted">read-only</small></h2>
+        <div id="aliases"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>

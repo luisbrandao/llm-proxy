@@ -37,6 +37,12 @@ class SlotTimeout(Exception):
     """Raised when no slot becomes free within the configured queue timeout."""
 
 
+def in_use(provider_name: str) -> int:
+    """Current in-flight count for a provider (0 if idle). Read-only view of the
+    live slot accounting, for introspection (e.g. the admin routing view)."""
+    return _in_use.get(provider_name, 0)
+
+
 def _capacity(provider_name: str):
     p = conf.PROVIDERS_BY_NAME.get(provider_name)
     return p.slots if p else None  # None => unlimited

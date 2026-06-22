@@ -1,13 +1,15 @@
 import asyncio
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 
-from app import auth, persistence
+from app import auth, logbuffer, persistence, registry, slots
 from app import config as conf
 from app.metrics import metrics_response
 from app.proxy import proxy_request
@@ -50,6 +52,20 @@ _event_logger.addHandler(_event_handler)
 _event_logger.propagate = False
 
 
+# Mirror every log line into an in-memory ring buffer so the /admin/logs view can
+# tail logs without a file or docker-socket access. Attached to the root logger
+# (catches `llm-proxy` and anything else that propagates) and, separately, to the
+# event logger (propagate=False, so its lines never reach root). uvicorn's own
+# loggers are wired up in _unify_logging, after uvicorn installs its handlers.
+def _attach_buffer(target: logging.Logger) -> None:
+    if logbuffer.handler not in target.handlers:
+        target.addHandler(logbuffer.handler)
+
+
+_attach_buffer(logging.getLogger())
+_attach_buffer(_event_logger)
+
+
 def _unify_logging() -> None:
     """Align uvicorn's loggers with the rest of the app's format and stream.
 
@@ -59,13 +75,17 @@ def _unify_logging() -> None:
     every line matches and lives on one greppable stream.
     """
     for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
-        for handler in logging.getLogger(name).handlers:
+        uvicorn_logger = logging.getLogger(name)
+        for handler in uvicorn_logger.handlers:
             handler.setFormatter(_formatter)
             # uvicorn's handlers are plain StreamHandlers on stderr; move them to
             # stdout. Guard against FileHandler (a StreamHandler subclass) so we
             # never redirect a file-backed handler.
             if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
                 handler.setStream(sys.stdout)
+        # uvicorn's loggers have propagate=False, so the buffer on root won't see
+        # them — attach it directly so access/error lines show up in /admin/logs.
+        _attach_buffer(uvicorn_logger)
 
 
 @asynccontextmanager
@@ -131,6 +151,188 @@ async def set_logging(request: Request):
 @app.get("/v1/models")
 async def models(request: Request):
     return await list_models(authorized=auth.is_authorized(request))
+
+
+# --- Admin API (backend for the /ui web dashboard) -----------------------------
+# Everything under /admin is gated by the same bearer keys as restricted backends
+# and POST /logging. The gate is required, not cosmetic: the log buffer can hold
+# full request/response bodies once LOG_INPUT/LOG_OUTPUT are on. Provider
+# serialization deliberately omits api_key — secrets never leave the process.
+
+
+def _admin_gate(request: Request):
+    """Return a 403 JSONResponse if the caller isn't authorized, else None."""
+    if not auth.is_authorized(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=403)
+    return None
+
+
+def _levelno(name: str) -> int:
+    value = logging.getLevelName(name)
+    return value if isinstance(value, int) else logging.INFO
+
+
+def _resolved_native(model_name: str, target) -> str:
+    """The native wire id a logical target uses: its explicit `model`, else the
+    canonical name reverse-mapped through the provider's model_map (mirrors
+    router._from_logical). Stable identity for matching a UI reorder to a target.
+    """
+    p = conf.PROVIDERS_BY_NAME.get(target.provider)
+    if target.model is not None:
+        return target.model
+    return p.to_native(model_name) if p else model_name
+
+
+def _serialize_targets(model_name: str, lm) -> list:
+    return [
+        {
+            "provider": t.provider,
+            "model": _resolved_native(model_name, t),
+            "priority": t.priority,
+            "is_down": registry.is_down(t.provider),
+            "known_provider": t.provider in conf.PROVIDERS_BY_NAME,
+        }
+        for t in lm.targets
+    ]
+
+
+@app.get("/admin/logs")
+async def admin_logs(request: Request, since: int = 0, level: str = "DEBUG"):
+    """Recent log lines with seq > `since` (the UI's live-tail cursor).
+
+    `last_seq` always reflects the newest buffered line — even one filtered out
+    by `level` — so the cursor advances past filtered lines instead of re-pulling
+    them on every poll.
+    """
+    denied = _admin_gate(request)
+    if denied:
+        return denied
+    new = logbuffer.handler.entries(since)
+    last_seq = new[-1]["seq"] if new else since
+    threshold = _levelno((level or "DEBUG").upper())
+    if threshold > logging.DEBUG:
+        new = [e for e in new if _levelno(e["level"]) >= threshold]
+    return {"entries": new, "last_seq": last_seq}
+
+
+@app.get("/admin/upstream-models")
+async def admin_upstream_models(request: Request):
+    """Probe each backend's real /v1/models concurrently — the 'bypass' button.
+
+    Shows every id a backend actually serves, regardless of its enabled_models
+    allow-list, so each endpoint's full catalog is visible in one place.
+    """
+    denied = _admin_gate(request)
+    if denied:
+        return denied
+
+    async def probe(p):
+        try:
+            ids = await registry._fetch_live(p)
+            return {"provider": p.name, "ok": True, "ids": sorted(ids)}
+        except Exception as e:  # noqa: BLE001 - report per-backend, never 500 the page
+            return {"provider": p.name, "ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    results = await asyncio.gather(*(probe(p) for p in conf.PROVIDERS))
+    return {"providers": results}
+
+
+@app.get("/admin/routing")
+async def admin_routing(request: Request):
+    """The routing graph: providers (with live slot/health state), explicit
+    logical models and their prioritized targets, and aliases. No api_key."""
+    denied = _admin_gate(request)
+    if denied:
+        return denied
+    providers = [
+        {
+            "name": p.name,
+            "base_url": p.base_url,
+            "slots": p.slots,
+            "in_use": slots.in_use(p.name),
+            "is_down": registry.is_down(p.name),
+            "require_permission": p.require_permission,
+            "lists_all": p.lists_all,
+            "priority": p.priority,
+        }
+        for p in conf.PROVIDERS
+    ]
+    logical_models = [
+        {"name": name, "editable": True, "targets": _serialize_targets(name, lm)}
+        for name, lm in conf.LOGICAL_MODELS.items()
+    ]
+    return {
+        "auto_group": conf.ROUTING.auto_group,
+        "providers": providers,
+        "logical_models": logical_models,
+        "aliases": conf.ALIASES,
+    }
+
+
+@app.post("/admin/routing/{model}")
+async def admin_set_routing(model: str, request: Request):
+    """Rearrange a logical model's target priorities live (in-memory; resets on
+    restart). Reorder only — the (provider, model) set must match exactly. The new
+    priorities are written to the live Targets and the list re-sorted so the slot
+    picker's priority tiers stay correct on the next request.
+    """
+    denied = _admin_gate(request)
+    if denied:
+        return denied
+    lm = conf.LOGICAL_MODELS.get(model)
+    if lm is None:
+        return JSONResponse({"error": f"unknown logical model '{model}'"}, status_code=404)
+
+    body = await request.json()
+    incoming = body.get("targets")
+    if not isinstance(incoming, list) or not incoming:
+        return JSONResponse(
+            {"error": 'body must be {"targets": [{"provider","model","priority"}, ...]}'},
+            status_code=422,
+        )
+    try:
+        wanted = {(item["provider"], item["model"]): int(item["priority"]) for item in incoming}
+    except (KeyError, TypeError, ValueError):
+        return JSONResponse(
+            {"error": "each target needs provider, model and an integer priority"},
+            status_code=422,
+        )
+
+    existing = {(t.provider, _resolved_native(model, t)): t for t in lm.targets}
+    if set(wanted) != set(existing):
+        return JSONResponse(
+            {"error": "targets must match the model's existing (provider, model) set exactly — reorder only, no add/remove"},
+            status_code=422,
+        )
+
+    for key, target in existing.items():
+        target.priority = wanted[key]
+    lm.targets.sort(key=lambda t: t.priority)
+    logging.getLogger("llm-proxy").info(
+        "Routing priorities updated for '%s': %s",
+        model,
+        ", ".join(f"{t.provider}={t.priority}" for t in lm.targets),
+    )
+    return {"name": model, "editable": True, "targets": _serialize_targets(model, lm)}
+
+
+# Convenience redirects to the dashboard. The StaticFiles mount only serves
+# `/ui/...`; a bare `/ui` — or someone guessing `/admin` — would otherwise fall
+# through to the catch-all proxy and get a confusing 401. Send them to /ui/.
+@app.get("/ui")
+@app.get("/admin")
+@app.get("/admin/")
+async def _ui_redirect():
+    return RedirectResponse(url="/ui/")
+
+
+# Static web dashboard. Mounted before the catch-all so /ui/* wins over the proxy;
+# html=True serves index.html at /ui/. Lives under app/static (already COPYd in).
+app.mount(
+    "/ui",
+    StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static"), html=True),
+    name="ui",
+)
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])

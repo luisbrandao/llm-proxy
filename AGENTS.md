@@ -23,7 +23,9 @@ decompresses the response. Single process, async, one uvicorn worker.
 | `app/proxy.py` | Request lifecycle: parse → resolve → gate → `_dispatch` (acquire slot, build body, forward, failover) → `_handle_non_stream` / `_handle_stream`. Also decompression + upstream error mapping. |
 | `app/metrics.py` | Prometheus counters/gauges (`llm_proxy_` prefix) + `PERSISTABLE_COUNTERS`. |
 | `app/persistence.py` | Optional: snapshot/restore cumulative counters to disk (`load`/`dump`/`flush_loop`). |
-| `app/main.py` | FastAPI app, routes, logging unification, lifespan (metrics load/flush/dump). |
+| `app/logbuffer.py` | In-memory ring buffer (`logging.Handler`) of recent log lines, seq-stamped, for the `/admin/logs` tail. Process-local like the slot/health state. |
+| `app/main.py` | FastAPI app, routes, logging unification, lifespan (metrics load/flush/dump). Also the `/admin/*` API + `/ui` static mount that back the web console. |
+| `app/static/` | The web console (`index.html` + `app.css` + `app.js`). Vanilla, no build step; served via `StaticFiles` at `/ui/`. |
 
 ## Request lifecycle (`proxy.proxy_request`)
 
@@ -60,6 +62,14 @@ decompresses the response. Single process, async, one uvicorn worker.
   `Accept-Encoding` is capped to `gzip, deflate` in `_build_headers`. Keep these aligned.
 - **Auth gate consistency.** Any new model-listing or routing path must apply the same
   `require_permission` filtering as `registry.list_models` and `proxy_request`.
+- **Admin surface (`/admin/*`, `/ui`).** Every `/admin/*` endpoint is gated by
+  `auth.is_authorized` (the log buffer can hold request/response bodies once
+  `LOG_INPUT`/`LOG_OUTPUT` are on). Provider serialization must **never** include
+  `api_key` — secrets stay in-process. `POST /admin/routing/{model}` mutates
+  `LOGICAL_MODELS[*].targets` priorities **in place and in memory only** (no config
+  write-back; resets on restart) and must re-`sort` the target list afterwards, or the
+  priority-tier `groupby` in `slots._pick_free` breaks. Routes + the `/ui` mount live
+  **above** the catch-all in `main.py` so they win over the proxy path.
 - **Metric names use the `llm_proxy_` prefix** (renamed from `deepseek_proxy_`). Only
   cumulative counters are persisted (`metrics.PERSISTABLE_COUNTERS`); never persist gauges
   or the histogram. Persistence must never crash startup or a request — failures are logged

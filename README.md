@@ -247,7 +247,32 @@ model name (e.g. `deepseek-v4-flash`). Pass `Authorization: Bearer <key>` for ga
 | `/models`, `/v1/models` | `GET` | Aggregated model list (clean names; honors the auth gate) |
 | `/logging` | `GET` | Current `log_input` / `log_output` state |
 | `/logging` | `POST` | Toggle request/response logging at runtime (honors the auth gate) |
+| `/ui/` | `GET` | Web console (Logging / Models / Routing). Static, served by the proxy |
+| `/admin/logs` | `GET` | Recent log lines from an in-memory ring buffer (`?since=<seq>&level=<min>`) |
+| `/admin/upstream-models` | `GET` | Probes every backend's raw `/v1/models` directly |
+| `/admin/routing` | `GET` | Routing graph: providers (live slots/health), logical models + priorities, aliases |
+| `/admin/routing/{model}` | `POST` | Rearrange a logical model's target priorities, live (in-memory) |
 | `/*` | any | Catch-all proxy — routed from the request body's `model` |
+
+All `/admin/*` endpoints are gated by the same bearer keys as `POST /logging` (the
+log buffer can contain request/response bodies when `LOG_INPUT`/`LOG_OUTPUT` are on),
+and never serialize provider `api_key`s.
+
+### Web console (`/ui/`)
+
+A built-in, dependency-free dashboard served by the proxy itself — open
+`http://<host>:9999/ui/` and paste a proxy key (stored in your browser's
+`localStorage`, sent as `Authorization: Bearer`). Three tabs:
+
+- **Logging** — live log tail (level filter, pause, autoscroll) plus the
+  `LOG_INPUT` / `LOG_OUTPUT` runtime toggles.
+- **Models** — the aggregated catalog, plus a **Probe upstreams** button that queries
+  each backend's real `/v1/models` so every endpoint's full list is visible at once
+  (independent of `enabled_models`).
+- **Routing** — each logical model drawn as connected boxes (model → prioritized
+  targets) with live down/busy badges; rearrange priorities with `↑`/`↓` or by editing
+  the number. Edits apply immediately and reset to `config.yaml` on restart. Auto-grouped
+  models and aliases are shown read-only.
 
 ### `/models` aggregation
 
