@@ -131,18 +131,55 @@ function renderLogNotice(text) {
   $("#log-pane").innerHTML = `<div class="notice">${escapeHtml(text)}</div>`;
 }
 
+const logQuery = () => ($("#log-search").value || "").toLowerCase().trim();
+
+// Build one log line. Multi-line messages (the curl-style Request/Response dumps
+// from LOG_INPUT/LOG_OUTPUT) become collapsible: a ▶/▼ toggle, a one-line preview
+// when collapsed, the full pre-wrapped text when expanded. Single-line entries
+// render as-is. The full text is stashed on dataset.search so the grep box can
+// match even content hidden inside a collapsed entry.
+function makeLogLine(e) {
+  const level = e.level || "INFO";
+  const msg = e.msg || "";
+  const nl = msg.indexOf("\n");
+  const multiline = nl !== -1;
+  const line = el("div", "logline lvl-" + level.toLowerCase() + (multiline ? " multiline collapsed" : ""));
+  line.dataset.search = (level + " " + (e.logger || "") + " " + msg).toLowerCase();
+
+  let tog = null;
+  if (multiline) {
+    tog = el("button", "ltog", "▶");
+    tog.title = "expand / collapse";
+    tog.addEventListener("click", () => {
+      const collapsed = line.classList.toggle("collapsed");
+      tog.textContent = collapsed ? "▶" : "▼";
+    });
+    line.appendChild(tog);
+  }
+  line.append(
+    el("span", "lt", (e.ts || "").replace("T", " ")),
+    el("span", "lv", level),
+    el("span", "lg", e.logger || "")
+  );
+  if (multiline) {
+    const preview = el("span", "lm-preview");
+    preview.appendChild(document.createTextNode(msg.slice(0, nl) || "(multi-line)"));
+    preview.appendChild(el("span", "more", `⋯ +${msg.split("\n").length - 1} lines`));
+    preview.addEventListener("click", () => { line.classList.remove("collapsed"); if (tog) tog.textContent = "▼"; });
+    line.appendChild(preview);
+  }
+  line.appendChild(el("span", "lm", msg));
+  return line;
+}
+
 function appendLogs(entries) {
   const pane = $("#log-pane");
   const atBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 40;
+  const q = logQuery();
   const frag = document.createDocumentFragment();
   for (const e of entries) {
-    const line = el("div", "logline lvl-" + (e.level || "INFO").toLowerCase());
-    line.append(
-      el("span", "lt", (e.ts || "").replace("T", " ")),
-      el("span", "lv", e.level || ""),
-      el("span", "lg", e.logger || ""),
-      el("span", "lm", e.msg || "")
-    );
+    const line = makeLogLine(e);
+    if (q && !line.dataset.search.includes(q)) line.style.display = "none";
     frag.appendChild(line);
   }
   pane.appendChild(frag);
@@ -150,6 +187,16 @@ function appendLogs(entries) {
   while (pane.childElementCount > MAX_LOG_LINES) pane.removeChild(pane.firstChild);
   $("#log-count").textContent = logLineCount.toLocaleString() + " lines";
   if ($("#log-autoscroll").checked && atBottom) pane.scrollTop = pane.scrollHeight;
+}
+
+// Re-evaluate every buffered line against the grep box (skips the notice div).
+function applyLogFilter() {
+  const q = logQuery();
+  for (const ln of $("#log-pane").children) {
+    if (ln.dataset && ln.dataset.search !== undefined) {
+      ln.style.display = !q || ln.dataset.search.includes(q) ? "" : "none";
+    }
+  }
 }
 
 function resetLogTail() {
@@ -414,6 +461,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("#log-input").addEventListener("change", (e) => setLogFlag("log_input", e.target.checked));
   $("#log-output").addEventListener("change", (e) => setLogFlag("log_output", e.target.checked));
   $("#log-level").addEventListener("change", resetLogTail);
+  $("#log-search").addEventListener("input", applyLogFilter);
   $("#log-clear").addEventListener("click", () => { $("#log-pane").innerHTML = ""; logLineCount = 0; $("#log-count").textContent = ""; });
 
   $("#models-refresh").addEventListener("click", loadCatalog);

@@ -146,6 +146,13 @@ h2 small { text-transform: none; letter-spacing: 0; font-weight: 400; margin-lef
   background: var(--bg); border: 1px solid var(--line-2); color: var(--text);
   border-radius: 6px; padding: 5px 8px; font-size: 12px;
 }
+.search {
+  flex: 1 1 160px; min-width: 120px;
+  background: var(--bg); border: 1px solid var(--line-2); color: var(--text);
+  border-radius: 7px; padding: 6px 10px; font-size: 12.5px; font-family: var(--mono);
+}
+.search:focus { outline: none; border-color: var(--accent-2); }
+.search::placeholder { color: var(--muted); font-family: var(--sans); }
 
 /* ── Log pane ──────────────────────────────────────────────── */
 .logpane {
@@ -160,15 +167,26 @@ h2 small { text-transform: none; letter-spacing: 0; font-weight: 400; margin-lef
   line-height: 1.5;
 }
 .logline {
-  padding: 1px 0;
+  position: relative;
+  padding: 1px 0 1px 16px;
   border-bottom: 1px solid rgba(42,50,61,.35);
-  white-space: pre-wrap;
   word-break: break-word;
 }
+.ltog {
+  position: absolute; left: 0; top: 1px;
+  background: none; border: none; color: var(--muted);
+  cursor: pointer; font-size: 10px; width: 14px; padding: 0; line-height: 1.6;
+}
+.ltog:hover { color: var(--text); }
 .logline .lt { color: #5e6b7a; margin-right: 8px; }
 .logline .lv { font-weight: 600; margin-right: 8px; }
 .logline .lg { color: #6f7d8c; margin-right: 8px; }
-.logline .lm { color: var(--text); }
+.logline .lm { color: var(--text); white-space: pre-wrap; }
+.logline .lm-preview { display: none; cursor: pointer; }
+.logline .lm-preview .more { color: var(--muted); margin-left: 10px; font-style: italic; }
+.logline.multiline.collapsed .lm-preview { display: inline; }
+.logline.multiline.collapsed .lm { display: none; }
+.logline.multiline:not(.collapsed) .lm { display: block; margin-top: 2px; }
 .lvl-info   .lv { color: var(--accent); }
 .lvl-warning { background: rgba(224,169,59,.06); }
 .lvl-warning .lv { color: var(--amber); }
