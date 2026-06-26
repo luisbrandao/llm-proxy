@@ -133,6 +133,47 @@ function renderLogNotice(text) {
 
 const logQuery = () => ($("#log-search").value || "").toLowerCase().trim();
 
+// Each line keeps its original (un-highlighted) text so the grep box can
+// re-render highlights from scratch on every keystroke without losing data.
+const logMeta = new WeakMap();
+
+// Append `text` to `parent`, wrapping case-insensitive matches of `q` in <mark>.
+function appendHighlighted(parent, text, q) {
+  if (!q) { parent.appendChild(document.createTextNode(text)); return; }
+  const lower = text.toLowerCase();
+  let i = 0, idx;
+  while ((idx = lower.indexOf(q, i)) !== -1) {
+    if (idx > i) parent.appendChild(document.createTextNode(text.slice(i, idx)));
+    parent.appendChild(el("mark", "hl", text.slice(idx, idx + q.length)));
+    i = idx + q.length;
+  }
+  if (i < text.length) parent.appendChild(document.createTextNode(text.slice(i)));
+}
+
+function renderHighlighted(span, text, q) {
+  span.textContent = "";
+  appendHighlighted(span, text, q);
+}
+
+// Re-render a matching line's logger + message with the query highlighted (plain
+// when q is empty). The full message is highlighted even while collapsed, so
+// expanding a hit found in a request/response body reveals the mark.
+function highlightLine(line, q) {
+  const meta = logMeta.get(line);
+  if (!meta) return;
+  const lg = line.querySelector(".lg");
+  if (lg) renderHighlighted(lg, meta.logger, q);
+  const lm = line.querySelector(".lm");
+  if (lm) renderHighlighted(lm, meta.msg, q);
+  const prev = line.querySelector(".lm-preview");
+  if (prev) {
+    const more = prev.querySelector(".more");
+    prev.textContent = "";
+    appendHighlighted(prev, meta.firstLine, q);
+    if (more) prev.appendChild(more);
+  }
+}
+
 // Build one log line. Multi-line messages (the curl-style Request/Response dumps
 // from LOG_INPUT/LOG_OUTPUT) become collapsible: a ▶/▼ toggle, a one-line preview
 // when collapsed, the full pre-wrapped text when expanded. Single-line entries
@@ -144,7 +185,10 @@ function makeLogLine(e) {
   const nl = msg.indexOf("\n");
   const multiline = nl !== -1;
   const line = el("div", "logline lvl-" + level.toLowerCase() + (multiline ? " multiline collapsed" : ""));
-  line.dataset.search = (level + " " + (e.logger || "") + " " + msg).toLowerCase();
+  // Grep matches logger + message (level has its own dropdown), so what you can
+  // search is exactly what gets highlighted.
+  line.dataset.search = ((e.logger || "") + " " + msg).toLowerCase();
+  logMeta.set(line, { logger: e.logger || "", msg, firstLine: multiline ? msg.slice(0, nl) : msg });
 
   let tog = null;
   if (multiline) {
@@ -179,7 +223,10 @@ function appendLogs(entries) {
   const frag = document.createDocumentFragment();
   for (const e of entries) {
     const line = makeLogLine(e);
-    if (q && !line.dataset.search.includes(q)) line.style.display = "none";
+    if (q) {
+      if (line.dataset.search.includes(q)) highlightLine(line, q);
+      else line.style.display = "none";
+    }
     frag.appendChild(line);
   }
   pane.appendChild(frag);
@@ -193,9 +240,10 @@ function appendLogs(entries) {
 function applyLogFilter() {
   const q = logQuery();
   for (const ln of $("#log-pane").children) {
-    if (ln.dataset && ln.dataset.search !== undefined) {
-      ln.style.display = !q || ln.dataset.search.includes(q) ? "" : "none";
-    }
+    if (!ln.dataset || ln.dataset.search === undefined) continue;
+    const match = !q || ln.dataset.search.includes(q);
+    ln.style.display = match ? "" : "none";
+    if (match) highlightLine(ln, q);
   }
 }
 

@@ -187,6 +187,7 @@ h2 small { text-transform: none; letter-spacing: 0; font-weight: 400; margin-lef
 .logline.multiline.collapsed .lm-preview { display: inline; }
 .logline.multiline.collapsed .lm { display: none; }
 .logline.multiline:not(.collapsed) .lm { display: block; margin-top: 2px; }
+mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1px; }
 .lvl-info   .lv { color: var(--accent); }
 .lvl-warning { background: rgba(224,169,59,.06); }
 .lvl-warning .lv { color: var(--amber); }
