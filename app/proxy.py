@@ -178,10 +178,17 @@ async def _emit_request_log(
             "stream": "true" if stream else "false",
         })
     else:
+        # Embeddings emit no completion tokens, so out-tokens/sec is always 0.00
+        # and skews throughput dashboards. Tag the op and report input throughput
+        # (the figure that matters for an embed call) instead of speed_tps. The
+        # None-valued fields are dropped by _logfmt, so non-embedding lines are
+        # unchanged. Detection is by request path (/embeddings, /api/embed, …).
+        embedding = "/embed" in request.url.path.lower()
         fields.update({
             "event": "request",
             "provider": provider,
             "model": model,
+            "op": "embedding" if embedding else None,
             "status": status,
             "stream": "true" if stream else "false",
             "in": in_tokens,
@@ -189,7 +196,8 @@ async def _emit_request_log(
             # H:MM:SS, rounded UP to the whole second so a sub-second request
             # reads 0:00:01, never a misleading 0:00:00.
             "dur": str(timedelta(seconds=math.ceil(duration))),
-            "speed_tps": f"{out_tokens / duration if duration > 0 else 0:.2f}",
+            "speed_tps": None if embedding else f"{out_tokens / duration if duration > 0 else 0:.2f}",
+            "embed_tps": f"{in_tokens / duration if duration > 0 else 0:.2f}" if embedding else None,
         })
     fields.update({
         "client_ip": ip,

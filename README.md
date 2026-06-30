@@ -339,11 +339,22 @@ ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=
 | `provider`, `model` | Backend chosen and the upstream model id sent to it |
 | `status` | Upstream HTTP status relayed to the client |
 | `stream` | Whether the response was streamed |
-| `in`, `out`, `dur`, `speed_tps` | Prompt/completion tokens, wall-clock duration as `H:MM:SS` (rounded up to the second, so a fast request reads `0:00:01` not `0:00:00`), output tokens/s |
+| `in`, `out`, `dur` | Prompt/completion tokens and wall-clock duration as `H:MM:SS` (rounded up to the second, so a fast request reads `0:00:01` not `0:00:00`) |
+| `speed_tps` | Output tokens/s. **Omitted for embeddings** — there are no completion tokens, so it would always be a misleading `0.00` |
+| `op`, `embed_tps` | Present only on **embedding** requests: `op=embedding` plus input tokens/s (the throughput that matters when nothing is generated) |
 | `client_ip` | Caller address (`X-Forwarded-For`/`X-Real-IP` honored when `TRUST_PROXY_HEADERS`) |
 | `client_host` | Reverse-DNS of `client_ip` (omitted if unresolved or `RESOLVE_CLIENT_HOST=false`) |
 | `svc`, `ua` | Service guessed from the User-Agent's leading token, and the full User-Agent |
 | `err` | Short error category (`invalid_request`, `unauthorized`, `rate_limited`, `upstream_error`…); absent on success |
+
+An **embedding** request (path `/v1/embeddings`, `/api/embed`, …) is tagged `op=embedding`
+and reports `embed_tps` (input tokens/s) in place of `speed_tps`, since embeddings return
+no completion tokens — `out=0` and an output-tokens/s figure would just be a constant `0.00`
+that skews throughput panels:
+
+```
+ts=2026-06-30T11:55:52-03:00 level=info event=request provider=ollamaLuis model=Qwen3-Embedding-8B op=embedding status=200 stream=false in=988 out=0 dur=0:00:01 embed_tps=988.00 client_ip=172.19.0.19 client_host=open-webui.main svc=Python ua="Python/3.11 aiohttp/3.13.5"
+```
 
 A request whose body carries no resolvable `model` (a non-chat / multipart passthrough —
 forwarded untouched to the first provider) is logged instead as **`event=passthrough`**,
