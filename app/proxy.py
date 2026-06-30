@@ -146,6 +146,24 @@ def _err_kind(status: int) -> Optional[str]:
     return "upstream_error"
 
 
+def _op_kind(path: str, model: str):
+    """Classify no-output operations so the request log can tag them and skip the
+    meaningless output-tokens/sec. Embeddings and rerankers return no completion
+    tokens, so `out` is always 0 and a tokens/s figure would be a constant 0.00.
+
+    Matched against both the request path (`/v1/embeddings`, `/v1/rerank`, …) and
+    the model id (e.g. a `*-Reranker-*` / `*-Embedding-*` name), so it still works
+    when a backend serves these over a nonstandard path. Returns None for ordinary
+    generation. Extend the keyword list for other no-output ops (e.g. moderation).
+    """
+    hay = f"{path} {model}".lower()
+    if "embed" in hay:
+        return "embedding"
+    if "rerank" in hay:
+        return "rerank"
+    return None
+
+
 async def _emit_request_log(
     request: Request, provider: str, model: str, status: int,
     in_tokens: int, out_tokens: int, duration: float, stream: bool,
@@ -178,17 +196,16 @@ async def _emit_request_log(
             "stream": "true" if stream else "false",
         })
     else:
-        # Embeddings emit no completion tokens, so out-tokens/sec is always 0.00
-        # and skews throughput dashboards. Tag the op and report input throughput
-        # (the figure that matters for an embed call) instead of speed_tps. The
-        # None-valued fields are dropped by _logfmt, so non-embedding lines are
-        # unchanged. Detection is by request path (/embeddings, /api/embed, …).
-        embedding = "/embed" in request.url.path.lower()
+        # Embeddings and rerankers return no completion tokens, so out-tokens/sec
+        # is always 0.00 and skews throughput dashboards. Tag the op and report
+        # input throughput (in_tps) instead of speed_tps. The None-valued fields
+        # are dropped by _logfmt, so ordinary generation lines are unchanged.
+        op = _op_kind(request.url.path, model)
         fields.update({
             "event": "request",
             "provider": provider,
             "model": model,
-            "op": "embedding" if embedding else None,
+            "op": op,
             "status": status,
             "stream": "true" if stream else "false",
             "in": in_tokens,
@@ -196,8 +213,8 @@ async def _emit_request_log(
             # H:MM:SS, rounded UP to the whole second so a sub-second request
             # reads 0:00:01, never a misleading 0:00:00.
             "dur": str(timedelta(seconds=math.ceil(duration))),
-            "speed_tps": None if embedding else f"{out_tokens / duration if duration > 0 else 0:.2f}",
-            "embed_tps": f"{in_tokens / duration if duration > 0 else 0:.2f}" if embedding else None,
+            "speed_tps": None if op else f"{out_tokens / duration if duration > 0 else 0:.2f}",
+            "in_tps": f"{in_tokens / duration if duration > 0 else 0:.2f}" if op else None,
         })
     fields.update({
         "client_ip": ip,
