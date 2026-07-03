@@ -24,6 +24,7 @@ decompresses the response. Single process, async, one uvicorn worker.
 | `app/metrics.py` | Prometheus counters/gauges (`llm_proxy_` prefix) + `PERSISTABLE_COUNTERS`. |
 | `app/persistence.py` | Optional: snapshot/restore cumulative counters to disk (`load`/`dump`/`flush_loop`). |
 | `app/logbuffer.py` | In-memory ring buffer (`logging.Handler`) of recent log lines, seq-stamped, for the `/admin/logs` tail. Process-local like the slot/health state. |
+| `app/configwrite.py` | Persists runtime routing edits into `CONFIG_PATH` via a surgical, priority-digits-only text rewrite (comments/format preserved). Abort-don't-corrupt; in-place write (bind-mount inode). |
 | `app/main.py` | FastAPI app, routes, logging unification, lifespan (metrics load/flush/dump). Also the `/admin/*` API + `/ui` static mount that back the web console. |
 | `app/static/` | The web console (`index.html` + `app.css` + `app.js`). Vanilla, no build step; served via `StaticFiles` at `/ui/`. |
 
@@ -66,10 +67,19 @@ decompresses the response. Single process, async, one uvicorn worker.
   `auth.is_authorized` (the log buffer can hold request/response bodies once
   `LOG_INPUT`/`LOG_OUTPUT` are on). Provider serialization must **never** include
   `api_key` — secrets stay in-process. `POST /admin/routing/{model}` mutates
-  `LOGICAL_MODELS[*].targets` priorities **in place and in memory only** (no config
-  write-back; resets on restart) and must re-`sort` the target list afterwards, or the
-  priority-tier `groupby` in `slots._pick_free` breaks. Routes + the `/ui` mount live
-  **above** the catch-all in `main.py` so they win over the proxy path.
+  `LOGICAL_MODELS[*].targets` priorities in place and must re-`sort` the target list
+  afterwards, or the priority-tier `groupby` in `slots._pick_free` breaks. Routes +
+  the `/ui` mount live **above** the catch-all in `main.py` so they win over the
+  proxy path.
+- **Config write-back (`configwrite.py`).** Persisting a routing edit rewrites ONLY
+  the `priority: N` digits of the matched flow-style target lines; never re-emit the
+  file through a YAML dumper (comments/format must survive — the config is
+  git-tracked on the deploy host). The write must be **in-place** (`r+` + truncate):
+  `/app/config.yaml` is a single-file bind mount, so replace-by-rename detaches from
+  the host inode. Abort-don't-corrupt: any surprise (unmatched target, no
+  `priority:` field, failed parse-back self-check) returns `(False, reason)` with
+  the file untouched; the live change stands and the endpoint reports
+  `persisted: false`. Persist failures are warnings, never 500s.
 - **Metric names use the `llm_proxy_` prefix** (renamed from `deepseek_proxy_`). Only
   cumulative counters are persisted (`metrics.PERSISTABLE_COUNTERS`); never persist gauges
   or the histogram. Persistence must never crash startup or a request — failures are logged

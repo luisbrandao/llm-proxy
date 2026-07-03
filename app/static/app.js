@@ -325,6 +325,16 @@ async function loadRouting() {
   if (!res.ok) { $("#logical").innerHTML = '<div class="notice">Failed to load routing.</div>'; return; }
   const data = await res.json();
   $("#routing-autogroup").textContent = "auto_group: " + data.auto_group;
+  const cfg = $("#routing-config");
+  if (data.config_writable) {
+    cfg.textContent = "config: writable";
+    cfg.style.color = "";
+    cfg.title = "priority changes are written back to the config file";
+  } else {
+    cfg.textContent = "config: read-only — changes won't survive a restart";
+    cfg.style.color = "var(--amber)";
+    cfg.title = "the config file mount is read-only; drop :ro on the volume to persist changes";
+  }
   const downSet = new Set((data.providers || []).filter((p) => p.is_down).map((p) => p.name));
   renderProviders(data.providers || []);
   renderLogical(data.logical_models || [], downSet);
@@ -459,7 +469,11 @@ function modelCard(model, downSet) {
       targets = updated.targets.map((t) => ({ ...t }));
       refresh();
       saveBtn.textContent = "Saved ✓";
-      toast("Saved routing for " + model.name);
+      if (updated.persisted) {
+        toast("Saved " + model.name + " (live + config)");
+      } else {
+        toast("Saved " + model.name + " live only — not persisted: " + (updated.persist_error || "unknown"), "bad");
+      }
       setTimeout(() => { saveBtn.textContent = label; }, 1200);
     } catch {
       toast("Save error", "bad");

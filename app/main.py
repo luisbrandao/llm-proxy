@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app import auth, logbuffer, persistence, registry, slots
+from app import auth, configwrite, logbuffer, persistence, registry, slots
 from app import config as conf
 from app.metrics import metrics_response
 from app.proxy import proxy_request
@@ -287,6 +287,7 @@ async def admin_routing(request: Request):
     ]
     return {
         "auto_group": conf.ROUTING.auto_group,
+        "config_writable": configwrite.config_writable(),
         "providers": providers,
         "logical_models": logical_models,
         "aliases": conf.ALIASES,
@@ -295,10 +296,14 @@ async def admin_routing(request: Request):
 
 @app.post("/admin/routing/{model}")
 async def admin_set_routing(model: str, request: Request):
-    """Rearrange a logical model's target priorities live (in-memory; resets on
-    restart). Reorder only — the (provider, model) set must match exactly. The new
-    priorities are written to the live Targets and the list re-sorted so the slot
-    picker's priority tiers stay correct on the next request.
+    """Rearrange a logical model's target priorities: applied live, then persisted
+    into the config file (surgical priority-only rewrite; see app/configwrite.py).
+
+    Reorder only — the (provider, model) set must match exactly. The new priorities
+    are written to the live Targets and the list re-sorted so the slot picker's
+    priority tiers stay correct on the next request. Persistence is best-effort:
+    on a read-only mount (or unrecognized config format) the live change stands
+    and the response says `persisted: false` with the reason.
     """
     denied = _admin_gate(request)
     if denied:
@@ -337,7 +342,19 @@ async def admin_set_routing(model: str, request: Request):
         model,
         ", ".join(f"{t.provider}={t.priority}" for t in lm.targets),
     )
-    return {"name": model, "editable": True, "targets": _serialize_targets(model, lm)}
+
+    persisted, persist_error = await configwrite.persist_model_priorities(model, lm.targets)
+    if not persisted:
+        logging.getLogger("llm-proxy").warning(
+            "Routing change for '%s' applied live but NOT persisted: %s", model, persist_error
+        )
+    return {
+        "name": model,
+        "editable": True,
+        "targets": _serialize_targets(model, lm),
+        "persisted": persisted,
+        "persist_error": persist_error,
+    }
 
 
 # Convenience redirects to the dashboard. The StaticFiles mount only serves

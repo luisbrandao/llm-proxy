@@ -14,7 +14,8 @@ services:
       - METRICS_PERSIST_PATH=/app/data/metrics_state.json
       - METRICS_FLUSH_INTERVAL=30
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
+      # rw so runtime routing edits from the web console persist into the file.
+      - ./config.yaml:/app/config.yaml
       - ./data:/app/data            # holds metrics_state.json across restarts
     ports:
       - "9999:8000"

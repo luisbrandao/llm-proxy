@@ -118,6 +118,8 @@ providers:
 #     served as a different quant on each box.
 # Backends that expose the *same* canonical id auto-group with no entry here,
 # ordered by provider priority. Explicit `provider:model` always still pins one.
+# Keep targets in this one-line flow style — the web console's runtime priority
+# editor persists changes by rewriting exactly these lines (config mount must be rw).
 models:
   deepseek-v4-flash:
     targets:                    # native ids inherited via each provider's model_map

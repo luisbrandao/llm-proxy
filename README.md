@@ -251,7 +251,7 @@ model name (e.g. `deepseek-v4-flash`). Pass `Authorization: Bearer <key>` for ga
 | `/admin/logs` | `GET` | Recent log lines from an in-memory ring buffer (`?since=<seq>&level=<min>`) |
 | `/admin/upstream-models` | `GET` | Probes every backend's raw `/v1/models` directly |
 | `/admin/routing` | `GET` | Routing graph: providers (live slots/health), logical models + priorities, aliases |
-| `/admin/routing/{model}` | `POST` | Rearrange a logical model's target priorities, live (in-memory) |
+| `/admin/routing/{model}` | `POST` | Rearrange a logical model's target priorities — applied live **and** persisted into the config file |
 | `/*` | any | Catch-all proxy — routed from the request body's `model` |
 
 All `/admin/*` endpoints are gated by the same bearer keys as `POST /logging` (the
@@ -271,8 +271,25 @@ A built-in, dependency-free dashboard served by the proxy itself — open
   (independent of `enabled_models`).
 - **Routing** — each logical model drawn as connected boxes (model → prioritized
   targets) with live down/busy badges; rearrange priorities with `↑`/`↓` or by editing
-  the number. Edits apply immediately and reset to `config.yaml` on restart. Auto-grouped
-  models and aliases are shown read-only.
+  the number. Edits apply immediately **and are written back into the config file**.
+  Auto-grouped models and aliases are shown read-only.
+
+#### Runtime routing persistence
+
+A priority change saved in the Routing tab is persisted into `config.yaml` with a
+**surgical rewrite**: only the `priority: N` digits on the matching target lines
+change — comments, alignment and everything else are preserved byte-for-byte, so a
+git-tracked config shows a minimal, reviewable diff. Requirements & behavior:
+
+- The config volume must be mounted **read-write** (the bundled compose does this).
+  On a `:ro` mount the change still applies live, the response/UI report
+  *"not persisted"*, and the file is untouched; the Routing tab shows a
+  `config: read-only` warning badge.
+- Targets must use the flow style used throughout this README:
+  `- {provider: X, model: "Y", priority: N}` (one per line). Unrecognized layouts
+  are refused cleanly (live-only), never rewritten.
+- The rewritten text is parsed back and verified against the request **before**
+  the file is written — a failed check aborts with the file untouched.
 
 ### `/models` aggregation
 
