@@ -5,6 +5,9 @@ services:
     environment:
       - TZ=America/Sao_Paulo
       - CONFIG_PATH=/app/config.yaml
+      # config.yaml edits are hot-reloaded (checked every N seconds; 0 disables).
+      # Edit the host file IN PLACE — a rename-replace save detaches the bind mount.
+      - CONFIG_RELOAD_INTERVAL=3
       - LOG_INPUT=false
       - LOG_OUTPUT=false
       - PORT=8000

@@ -1,3 +1,4 @@
+import hashlib
 import os
 import re
 from dataclasses import dataclass, field
@@ -127,9 +128,19 @@ class Routing:
     )
 
 
-def _load():
-    with open(CONFIG_PATH) as f:
-        raw = yaml.safe_load(f) or {}
+def _read_config() -> bytes:
+    with open(CONFIG_PATH, "rb") as f:
+        return f.read()
+
+
+def _stat_sig():
+    """Cheap change signature of the config file: (mtime_ns, size)."""
+    st = os.stat(CONFIG_PATH)
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _load(text: bytes):
+    raw = yaml.safe_load(text) or {}
 
     # Global aliases: simple name -> "provider:model" target.
     aliases = {str(k): str(v) for k, v in (raw.get("aliases") or {}).items()}
@@ -200,8 +211,57 @@ def _load():
     return providers, aliases, logical, routing, auth_keys
 
 
-PROVIDERS, ALIASES, LOGICAL_MODELS, ROUTING, AUTH_KEYS = _load()
+def _boot():
+    global _last_sig, _loaded_digest
+    # Stat before read: if the file changes in between, the next reload tick
+    # sees a signature mismatch and re-checks — a wasted read, never a miss.
+    _last_sig = _stat_sig()
+    text = _read_config()
+    _loaded_digest = hashlib.sha256(text).hexdigest()
+    return _load(text)
+
+
+PROVIDERS, ALIASES, LOGICAL_MODELS, ROUTING, AUTH_KEYS = _boot()
 PROVIDERS_BY_NAME = {p.name: p for p in PROVIDERS}
+
+
+def reload_if_changed() -> bool:
+    """Re-read CONFIG_PATH and swap the live config if its content changed.
+    Returns True only when a new config was applied.
+
+    Cheap when idle — one os.stat per call. The file is read only when
+    mtime/size move, and re-parsed only when the bytes actually differ (a
+    touch or deploy re-sync flips mtime without changing content). The swap
+    is a plain rebind of the module globals: every module reads config as
+    `conf.X` per operation (never a from-import snapshot), and since there is
+    no await between the rebinds, a request can't observe a half-applied
+    config. Requests already in flight keep the Provider objects they
+    resolved — they finish under the old settings.
+
+    A parse error propagates to the caller with the running config fully
+    intact. The failed signature is still recorded, so broken content is
+    parsed (and logged by the caller) once, not on every tick; the next real
+    edit triggers a retry.
+    """
+    global PROVIDERS, ALIASES, LOGICAL_MODELS, ROUTING, AUTH_KEYS, PROVIDERS_BY_NAME
+    global _last_sig, _loaded_digest
+    sig = _stat_sig()
+    if sig == _last_sig:
+        return False
+    text = _read_config()
+    _last_sig = sig
+    digest = hashlib.sha256(text).hexdigest()
+    if digest == _loaded_digest:
+        return False
+    providers, aliases, logical, routing, auth_keys = _load(text)
+    PROVIDERS = providers
+    ALIASES = aliases
+    LOGICAL_MODELS = logical
+    ROUTING = routing
+    AUTH_KEYS = auth_keys
+    PROVIDERS_BY_NAME = {p.name: p for p in providers}
+    _loaded_digest = digest
+    return True
 
 
 def _flag(key: str, default: str) -> bool:
@@ -212,6 +272,12 @@ def _flag(key: str, default: str) -> bool:
 LOG_INPUT = _flag("LOG_INPUT", "false")
 LOG_OUTPUT = _flag("LOG_OUTPUT", "false")
 PORT = int(os.environ.get("PORT", "8000"))
+
+# Hot reload: seconds between config-file change checks (0 disables). Polling,
+# not inotify — the config is a bind-mounted single file, where host-side edits
+# don't reliably raise inotify events inside the container, and a few stats per
+# minute cost nothing.
+CONFIG_RELOAD_INTERVAL = float(os.environ.get("CONFIG_RELOAD_INTERVAL", "3"))
 
 # Per-request log enrichment: identify the caller. Reverse-DNS is best-effort
 # (cached, run off the event loop, time-bounded) — disable it if your resolver

@@ -94,6 +94,19 @@ All routing config lives in `config.yaml` (see `config.example.yaml`). Provider 
 go inline, or optionally via `${ENV_VAR}` interpolation. Proxy auth keys and runtime
 flags come from the environment.
 
+Edits to `config.yaml` are **hot-reloaded** — the file is checked every
+`CONFIG_RELOAD_INTERVAL` seconds (default 3, `0` disables) and applied live, no restart
+needed. Requests already in flight finish under the settings they started with. A broken
+edit (YAML typo) is logged and ignored; the proxy keeps running on the previous config
+until the file parses again.
+
+> **Bind-mount gotcha:** with the default single-file mount
+> (`./config.yaml:/app/config.yaml`), edit the file **in place** on the host. Editors
+> that save by *rename-and-replace* (vim's default, `sed -i`) swap the host inode, and
+> the container keeps watching the old file — the edit never becomes visible inside.
+> `nano`, a `>` redirect, or `:set backupcopy=yes` in vim write in place. Mounting the
+> containing directory instead of the single file avoids the issue entirely.
+
 ```yaml
 aliases:                          # optional short names -> provider:canonical
   chat: deepseek:deepseek-v4-pro
@@ -205,6 +218,7 @@ Set in `docker-compose.yml` — **not** in `config.yaml`:
 | `LOG_OUTPUT` | `false` | Log the upstream response (pretty JSON; streaming reassembled). Toggleable at runtime via `/logging` |
 | `PORT` | `8000` | Port the proxy binds to inside the container |
 | `CONFIG_PATH` | `config.yaml` | Path to the YAML config |
+| `CONFIG_RELOAD_INTERVAL` | `3` | Seconds between config-file change checks (hot reload). `0` disables |
 | `TZ` | `America/Sao_Paulo` | Timezone for log timestamps (image ships tzdata; timestamps are ISO-8601 with offset) |
 | `RESOLVE_CLIENT_HOST` | `true` | Reverse-DNS the caller IP for the request log (cached, off-loop, time-bounded) |
 | `CLIENT_DNS_TIMEOUT` | `1.0` | Seconds to wait for a reverse-DNS lookup before logging IP-only |

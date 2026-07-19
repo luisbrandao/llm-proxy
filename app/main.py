@@ -112,6 +112,46 @@ def _unify_logging() -> None:
         access.addFilter(_MutePollingFilter())
 
 
+async def _config_reload_loop():
+    """Hot-apply edits to the config file, no restart needed.
+
+    Polls `conf.reload_if_changed()` every CONFIG_RELOAD_INTERVAL seconds. On a
+    change: the module globals are swapped (in-flight requests finish under the
+    old Provider objects), the live-discovery cache is dropped so new
+    base_urls/allow-lists take effect immediately, and queued slot waiters are
+    woken in case the edit created capacity. A bad edit (YAML typo, torn
+    read mid-write by an external editor) is logged and skipped — the running
+    config stays until the file parses again.
+
+    The console's own routing edits (configwrite) also land here one tick
+    later; that reload is a no-op state-wise since memory already matches.
+    """
+    log = logging.getLogger("llm-proxy")
+    while True:
+        await asyncio.sleep(conf.CONFIG_RELOAD_INTERVAL)
+        try:
+            if conf.reload_if_changed():
+                registry.clear_cache()
+                await slots.poke()
+                log.info(
+                    "Config reloaded from %s: %d providers, %d logical models, %d aliases",
+                    conf.CONFIG_PATH,
+                    len(conf.PROVIDERS),
+                    len(conf.LOGICAL_MODELS),
+                    len(conf.ALIASES),
+                )
+        except FileNotFoundError:
+            # Transient hole while an editor/deploy replaces the file; the
+            # next tick sees the settled result. Keep the running config.
+            pass
+        except Exception as e:  # noqa: BLE001 - a bad edit must never kill the app
+            log.warning(
+                "Config reload failed — keeping the running config: %s: %s",
+                type(e).__name__,
+                e,
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Runs after uvicorn has configured its logging, so our reformat sticks.
@@ -119,9 +159,16 @@ async def lifespan(app: FastAPI):
     # Restore persisted counters, then snapshot them periodically and on shutdown.
     persistence.load()
     flush_task = asyncio.create_task(persistence.flush_loop())
+    reload_task = (
+        asyncio.create_task(_config_reload_loop())
+        if conf.CONFIG_RELOAD_INTERVAL > 0
+        else None
+    )
     try:
         yield
     finally:
+        if reload_task is not None:
+            reload_task.cancel()
         flush_task.cancel()
         persistence.dump()
 

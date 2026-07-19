@@ -117,6 +117,15 @@ async def acquire(targets, timeout: float = 0.0):
                 QUEUE_WAITING.dec()
 
 
+async def poke() -> None:
+    """Wake every queued waiter to re-scan capacity. Called after a config
+    reload: a raised slot budget (or a new provider) creates capacity without
+    any release() happening, and waiters only re-check when notified."""
+    cond = _condition()
+    async with cond:
+        cond.notify_all()
+
+
 async def release(provider_name: str) -> None:
     cond = _condition()
     async with cond:

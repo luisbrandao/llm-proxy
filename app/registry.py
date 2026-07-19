@@ -35,6 +35,13 @@ def _lock_for(provider_name: str) -> asyncio.Lock:
 _down_until = {}
 
 
+def clear_cache() -> None:
+    """Drop every cached live-discovery list. Called after a config reload:
+    a provider's base_url / enabled_models / cache_ttl may have changed, so
+    the next request re-probes instead of serving a list from the old config."""
+    _cache.clear()
+
+
 def mark_down(provider_name: str, seconds: float) -> None:
     _down_until[provider_name] = time.time() + seconds
 

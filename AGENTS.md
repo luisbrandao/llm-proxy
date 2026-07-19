@@ -15,7 +15,7 @@ decompresses the response. Single process, async, one uvicorn worker.
 
 | File | Responsibility |
 |---|---|
-| `app/config.py` | Loads `config.yaml` + env. Dataclasses `Provider`, `Target`, `LogicalModel`, `Routing`. Exposes `PROVIDERS`, `PROVIDERS_BY_NAME`, `ALIASES`, `LOGICAL_MODELS`, `ROUTING`, `AUTH_KEYS`. |
+| `app/config.py` | Loads `config.yaml` + env. Dataclasses `Provider`, `Target`, `LogicalModel`, `Routing`. Exposes `PROVIDERS`, `PROVIDERS_BY_NAME`, `ALIASES`, `LOGICAL_MODELS`, `ROUTING`, `AUTH_KEYS`. Hot reload: `reload_if_changed()` re-reads the file and rebinds those globals (polled from `main._config_reload_loop`). |
 | `app/router.py` | `resolve(model) -> [Target]` (async). Resolution order: alias → `provider:model` → `models:` logical → auto-group → fallback. |
 | `app/slots.py` | Per-provider concurrency. `acquire(targets, timeout)` / `release(provider)` / `slot()` ctx mgr. Priority admission (round-robin within a tie tier) + queue via a lazily-created `asyncio.Condition`. |
 | `app/registry.py` | `/v1/models` listing, live model discovery (cached, single-flight), and backend health (`mark_down`/`is_down`/`clear_down`). |
@@ -25,7 +25,7 @@ decompresses the response. Single process, async, one uvicorn worker.
 | `app/persistence.py` | Optional: snapshot/restore cumulative counters to disk (`load`/`dump`/`flush_loop`). |
 | `app/logbuffer.py` | In-memory ring buffer (`logging.Handler`) of recent log lines, seq-stamped, for the `/admin/logs` tail. Process-local like the slot/health state. |
 | `app/configwrite.py` | Persists runtime routing edits into `CONFIG_PATH` via a surgical, priority-digits-only text rewrite (comments/format preserved). Abort-don't-corrupt; in-place write (bind-mount inode). |
-| `app/main.py` | FastAPI app, routes, logging unification, lifespan (metrics load/flush/dump). Also the `/admin/*` API + `/ui` static mount that back the web console. |
+| `app/main.py` | FastAPI app, routes, logging unification, lifespan (metrics load/flush/dump + the config hot-reload watcher). Also the `/admin/*` API + `/ui` static mount that back the web console. |
 | `app/static/` | The web console (`index.html` + `app.css` + `app.js`). Vanilla, no build step; served via `StaticFiles` at `/ui/`. |
 
 ## Request lifecycle (`proxy.proxy_request`)
@@ -41,6 +41,14 @@ decompresses the response. Single process, async, one uvicorn worker.
 
 - **Single worker.** Slot/queue/health state is in-process. Never add `--workers > 1`
   without moving that state to a shared store.
+- **Config is hot-reloaded — always read it as `conf.X` at use time.** Never
+  `from app.config import PROVIDERS` (a snapshot that goes stale after a reload; the
+  dataclasses/helpers like `Provider`/`Target`/`strip_prefix` are fine to import) and
+  never cache config values across requests. `reload_if_changed()` rebinds the module
+  globals with no `await` in between, so a request sees either the old or the new
+  config, never a mix. After a reload the watcher drops `registry._cache` and pokes
+  the slot Condition; derived state keyed by provider *name* (`slots._in_use`,
+  `registry._down_until`) intentionally survives.
 - **Every acquired slot must be released exactly once.** Non-stream: released in
   `_dispatch` after the call. Stream: released in the generator's `finally` via the
   `on_complete` callback (the handler returns before streaming finishes). If you add a
