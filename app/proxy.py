@@ -372,6 +372,12 @@ async def _handle_stream(
     # empty body instead of a clean error. A failure here propagates as
     # httpx.RequestError so the dispatcher can fail over before any bytes are
     # committed to the client (failover is impossible mid-stream).
+    # The clock starts before the request is sent so duration covers the full
+    # exchange, including prompt processing on the backend. A backend that
+    # buffers the whole completion before responding (e.g. an aggregator)
+    # spends all its time before the first byte — timing only the body read
+    # would yield near-zero durations and absurd tokens/sec.
+    start = time.time()
     client = httpx.AsyncClient(timeout=600.0)
     stream_cm = client.stream(method, url, headers=headers, content=body)
     try:
@@ -414,7 +420,6 @@ async def _handle_stream(
         )
 
     async def generate():
-        start = time.time()
         in_tokens = 0
         out_tokens = 0
         buffer = ""
