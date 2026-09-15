@@ -1,15 +1,15 @@
 :root {
-  --bg: #0f1318;
-  --bg-2: #161b22;
-  --bg-3: #1c232d;
-  --panel: #131820;
-  --line: #2a323d;
-  --line-2: #38424f;
-  --text: #d7dde5;
-  --muted: #8593a3;
-  --accent: #5b9dff;
-  --accent-2: #3b7be0;
-  --green: #46c46a;
+  --bg: #111312;
+  --bg-2: #181b1a;
+  --bg-3: #1f2321;
+  --panel: #151817;
+  --line: #2b302e;
+  --line-2: #3a403d;
+  --text: #dde2df;
+  --muted: #8b948f;
+  --accent: #34d399;
+  --accent-2: #0f9f6e;
+  --green: #3ecf7a;
   --amber: #e0a93b;
   --red: #e5604d;
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
@@ -83,8 +83,8 @@ body {
 }
 #api-key:focus { outline: none; border-color: var(--accent-2); }
 
-.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); box-shadow: 0 0 0 3px rgba(133,147,163,.12); }
-.dot.ok { background: var(--green); box-shadow: 0 0 0 3px rgba(70,196,106,.16); }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); box-shadow: 0 0 0 3px rgba(139,148,143,.12); }
+.dot.ok { background: var(--green); box-shadow: 0 0 0 3px rgba(62,207,122,.16); }
 .dot.bad { background: var(--red); box-shadow: 0 0 0 3px rgba(229,96,77,.16); }
 
 /* ── Buttons ───────────────────────────────────────────────── */
@@ -98,7 +98,7 @@ body {
   cursor: pointer;
   transition: background .12s, border-color .12s;
 }
-.btn:hover { background: #232c38; }
+.btn:hover { background: #262b29; }
 .btn:active { transform: translateY(1px); }
 .btn:disabled { opacity: .45; cursor: default; }
 .btn.primary { background: var(--accent-2); border-color: var(--accent-2); color: #fff; }
@@ -172,7 +172,7 @@ h2 small { text-transform: none; letter-spacing: 0; font-weight: 400; margin-lef
 .logpane {
   flex: 1 1 auto;
   overflow: auto;
-  background: #0b0e12;
+  background: #0c0e0d;
   border: 1px solid var(--line);
   border-radius: 9px;
   padding: 8px 10px;
@@ -183,7 +183,7 @@ h2 small { text-transform: none; letter-spacing: 0; font-weight: 400; margin-lef
 .logline {
   position: relative;
   padding: 1px 0 1px 16px;
-  border-bottom: 1px solid rgba(42,50,61,.35);
+  border-bottom: 1px solid rgba(43,48,46,.35);
   word-break: break-word;
 }
 .ltog {
@@ -192,9 +192,9 @@ h2 small { text-transform: none; letter-spacing: 0; font-weight: 400; margin-lef
   cursor: pointer; font-size: 10px; width: 14px; padding: 0; line-height: 1.6;
 }
 .ltog:hover { color: var(--text); }
-.logline .lt { color: #5e6b7a; margin-right: 8px; }
+.logline .lt { color: #636d68; margin-right: 8px; }
 .logline .lv { font-weight: 600; margin-right: 8px; }
-.logline .lg { color: #6f7d8c; margin-right: 8px; }
+.logline .lg { color: #76817b; margin-right: 8px; }
 .logline .lm { color: var(--text); white-space: pre-wrap; }
 .logline .lm-preview { display: none; cursor: pointer; }
 .logline .lm-preview .more { color: var(--muted); margin-left: 10px; font-style: italic; }
@@ -216,7 +216,7 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
   font-size: 12px; font-weight: 600; border-radius: 20px; padding: 3px 11px;
   border: 1px solid var(--line-2); background: var(--bg);
 }
-.flstat.run { color: var(--green); border-color: rgba(70,196,106,.4); }
+.flstat.run { color: var(--green); border-color: rgba(62,207,122,.4); }
 .flstat.queue { color: var(--muted); }
 .flstat.queue.hot { color: var(--amber); border-color: rgba(224,169,59,.5); background: rgba(224,169,59,.07); }
 .flstat.past { color: var(--muted); }
@@ -316,7 +316,7 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
 }
 .flbodyhead:first-child { margin-top: 0; }
 .flbodytext {
-  margin: 0; padding: 8px 10px; background: #0b0e12;
+  margin: 0; padding: 8px 10px; background: #0c0e0d;
   border: 1px solid var(--line); border-radius: 7px;
   font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
   white-space: pre-wrap; word-break: break-word; color: var(--text);
@@ -415,7 +415,7 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
   border-radius: 5px; width: 24px; height: 18px; line-height: 1; padding: 0;
   font-size: 11px; cursor: pointer;
 }
-.mini:hover { background: #283341; }
+.mini:hover { background: #2b3430; }
 .mini:disabled { opacity: .3; cursor: default; }
 
 .tinfo { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
