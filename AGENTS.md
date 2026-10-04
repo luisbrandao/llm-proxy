@@ -259,7 +259,10 @@ independent rules. If you add process-local state, add it to the reset list in
   spanning three backends resolves to three different native ids, so `model=` alone
   splits one model's traffic across three series and a failover moves a request between
   them mid-flight. `asked=` is the field to group by. It is omitted when the two are
-  equal, so an unmapped model logs exactly as before.
+  equal, so an unmapped model logs exactly as before. A third, `served=`, is the
+  `model` the backend's *response* reports, emitted only when it differs from the
+  native id — the one place a rolling alias (the claude CLI's `opus`) is pinned to the
+  version that actually answered. Never key dashboards on it; it is a diagnostic.
 - **The version string must stay identical to the image tag.** CI passes
   `APP_VERSION=master-${{ github.run_number }}` as a build-arg, which is the same value
   the metadata step turns into the `master-N` image tag; `app/version.py` reads it and

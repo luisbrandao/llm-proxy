@@ -268,6 +268,22 @@ def test_asked_is_omitted_when_it_equals_the_native_id(load_config, monkeypatch,
     assert "asked=" not in line
 
 
+def test_the_model_the_backend_reports_is_logged_as_served(client, upstreams, events):
+    """A native id is often a rolling alias; the response names what really ran."""
+    upstreams.set(lambda r: mock_response(200, json=completion(model="vendor/First-Native-2026-09")))
+    client.post("/v1/chat/completions", json={"model": "grouped"})
+    line = next(l for l in events() if "event=request" in l)
+    assert "model=vendor/First-Native " in line
+    assert "served=vendor/First-Native-2026-09" in line
+
+
+def test_served_is_omitted_when_the_backend_echoes_the_native_id(client, upstreams, events):
+    upstreams.set(lambda r: mock_response(200, json=completion(model="vendor/First-Native")))
+    client.post("/v1/chat/completions", json={"model": "grouped"})
+    line = next(l for l in events() if "event=request" in l)
+    assert "served=" not in line
+
+
 def test_token_counts_reach_the_log(client, upstreams, events):
     upstreams.set(lambda r: mock_response(200, json=completion(prompt=42, out=13)))
     client.post("/v1/chat/completions", json={"model": "grouped"})
@@ -420,6 +436,7 @@ def test_stream_records_usage_in_the_log(client, upstreams, events):
     assert "in=5" in line and "out=2" in line
     assert "stream=true" in line
     assert "asked=grouped" in line
+    assert "served=m " in line
 
 
 def test_stream_history_row_tokens_per_second_is_the_logged_number(client, upstreams, events):

@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 
 from app import claude_cli, clientinfo, registry, slots, upstream
 from app import config as conf
-from test_proxy import completion, mock_response
+from test_proxy import completion, events, mock_response  # noqa: F401 - events is a fixture
 
 FAKE = textwrap.dedent('''
     import json, os, sys, time
@@ -169,6 +169,14 @@ def test_a_chat_completion_runs_the_cli(client, cli):
     assert call["prompt"] == "hello"
     assert call["system"] == claude_cli.DEFAULT_SYSTEM
     assert idle() == {"claude": 0, "backup": 0}
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_the_log_names_the_concrete_model_behind_the_alias(client, cli, events, stream):
+    client.post("/v1/chat/completions", json=chat("claude-sonnet", stream=stream), headers=AUTH)
+    line = next(l for l in events() if "event=request" in l)
+    assert "model=sonnet " in line and "asked=claude-sonnet" in line
+    assert "served=claude-opus-test-1" in line
 
 
 def test_the_cli_runs_with_every_tool_off_in_an_empty_directory(client, cli):

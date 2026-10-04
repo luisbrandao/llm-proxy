@@ -181,6 +181,7 @@ async def _emit_request_log(
     request: Request, provider: str, model: str, status: int,
     in_tokens: int, out_tokens: int, duration: float, stream: bool,
     asked: Optional[str] = None, trimmed: Optional[dict] = None,
+    served: Optional[str] = None,
 ) -> None:
     """Emit the single, always-on, parseable line summarizing one request.
 
@@ -199,6 +200,13 @@ async def _emit_request_log(
     mid-flight. `asked=` is what somebody actually typed into a client, so it is
     the field to sum over. Both are kept: the native id is what you need to ask a
     backend about its own logs.
+
+    `served` is the third name: the `model` the backend's *response* reports
+    having run, emitted as `served=` when it differs from the native id. A
+    native id is often a rolling alias — the claude CLI's `opus`, an
+    aggregator's unversioned slug — and this is the only place the concrete
+    version that answered (`claude-opus-5-5`) is recorded. Omitted when the
+    backend echoes the id it was sent, so most lines are unchanged.
 
     A model-less passthrough (non-chat / multipart body, nothing to resolve) is
     logged as `event=passthrough` keyed by request path — never as a bogus
@@ -238,6 +246,8 @@ async def _emit_request_log(
             # id above. Dropped by _logfmt when equal or absent, so an unmapped
             # model logs exactly as it did before.
             "asked": asked if asked and asked != model else None,
+            # What the backend says actually ran, when that is not the id we sent.
+            "served": served if served and served != model else None,
             "op": op,
             "status": status,
             "stream": "true" if stream else "false",
@@ -379,11 +389,14 @@ async def _handle_non_stream(
 
     in_tokens = 0
     out_tokens = 0
+    served = None
     try:
         data = json.loads(resp_body)
         usage = data.get("usage", {})
         in_tokens = usage.get("prompt_tokens", 0)
         out_tokens = usage.get("completion_tokens", 0)
+        if isinstance(data.get("model"), str):
+            served = data["model"]
     except (json.JSONDecodeError, AttributeError):
         pass
 
@@ -414,7 +427,7 @@ async def _handle_non_stream(
         headers=_relay_headers(resp_headers),
         background=BackgroundTask(
             _emit_request_log, request, pname, model, status_code,
-            in_tokens, out_tokens, duration, False, asked, trimmed,
+            in_tokens, out_tokens, duration, False, asked, trimmed, served,
         ),
     )
 
@@ -585,7 +598,7 @@ async def _handle_stream(
                     _record_metrics(pname, model, in_tokens, out_tokens, duration)
             await _emit_request_log(
                 request, pname, model, status_code, in_tokens, out_tokens, duration,
-                True, asked, trimmed,
+                True, asked, trimmed, resp_model,
             )
             if delta_contents is not None:
                 full_text = "".join(delta_contents)

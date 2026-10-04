@@ -251,6 +251,10 @@ Until then every request answers 502 `Not logged in`. The binary is baked into t
 at a pinned, checksum-verified version (`CLAUDE_CODE_VERSION` build arg) with its
 self-updater off.
 
+`opus`, `sonnet`, … are the CLI's rolling aliases — always the newest model of the
+family, as of the CLI version in the image. The response's `model` field and the request
+log's `served=` name the concrete version that answered (`claude-opus-5-5`).
+
 How it fits in: the CLI is an `httpx` transport under the normal forwarding path
 (`app/claude_cli.py`), so slots, failover, metrics, the request log and the console's
 Kill button behave exactly as for an HTTP backend. A CLI error with an HTTP status is
@@ -733,6 +737,7 @@ ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=
 | `ts` | ISO-8601 timestamp **with offset** (local time per `TZ`; unambiguous regardless of reader) |
 | `provider`, `model` | Backend chosen and the **native** model id sent to it |
 | `asked` | The model name the **client** sent, when it differs from `model`. A group spanning three backends resolves to three different native ids, so `model=` alone splits one model's traffic across three series — and a failover moves a request between them mid-flight. Group by `asked` to chart what people actually requested; omitted when the two names are identical |
+| `served` | The model the backend's **response** says it ran, when it differs from `model`. A native id is often a rolling alias — the [Claude CLI](#claude-via-the-claude-code-cli)'s `opus`, an aggregator's unversioned slug — and this is where the concrete version that answered (`claude-opus-5-5`) is recorded; omitted when the backend echoes the id it was sent |
 | `status` | Upstream HTTP status relayed to the client |
 | `stream` | Whether the response was streamed |
 | `in`, `out`, `dur` | Prompt/completion tokens and wall-clock duration as `H:MM:SS` (rounded up to the second, so a fast request reads `0:00:01` not `0:00:00`) |
