@@ -80,6 +80,10 @@ async def provider_model_ids(provider: conf.Provider):
 
 
 async def _fetch_live(provider: conf.Provider):
+    if provider.kind == conf.KIND_CLAUDE_CLI:
+        # Nothing to probe: the CLI accepts its family aliases, so those are the
+        # catalog. Keeps "empty enabled_models = everything it serves" true here.
+        return list(conf.CLAUDE_CLI_MODELS)
     url = f"{provider.base_url}/{conf.strip_prefix(provider, 'v1/models')}"
     headers = {}
     if provider.api_key:

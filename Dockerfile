@@ -8,8 +8,36 @@ ENV TZ=America/Sao_Paulo
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tzdata \
+    && apt-get install -y --no-install-recommends tzdata curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# The official Claude Code CLI, for `kind: claude-cli` providers (app/claude_cli.py).
+# The same artifact Anthropic's install.sh fetches — pinned, sha256-checked against
+# the release manifest — but installed as the bare binary, without install.sh's
+# home-directory launcher and self-updater: in a container the CLI's version
+# changes with the image, never underneath it. Bump to a version listed at
+# https://downloads.claude.ai/claude-code-releases/stable. Above the pip layer
+# so a requirements change doesn't re-download ~240 MB.
+ARG CLAUDE_CODE_VERSION=2.1.285
+RUN set -eu; \
+    case "$(uname -m)" in \
+      x86_64) platform=linux-x64 ;; \
+      aarch64) platform=linux-arm64 ;; \
+      *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    base="https://downloads.claude.ai/claude-code-releases/${CLAUDE_CODE_VERSION}"; \
+    sum="$(curl -fsSL "$base/manifest.json" \
+      | python3 -c 'import json, sys; print(json.load(sys.stdin)["platforms"][sys.argv[1]]["checksum"])' "$platform")"; \
+    curl -fsSL -o /usr/local/bin/claude "$base/$platform/claude"; \
+    echo "$sum  /usr/local/bin/claude" | sha256sum -c -; \
+    chmod 755 /usr/local/bin/claude; \
+    claude --version
+
+# All of the CLI's state — its login above all — lives in one directory, which
+# the deploy mounts as a volume so a recreate does not log it out. Log in once:
+#   docker exec -it llm-proxy claude auth login --claudeai
+ENV CLAUDE_CONFIG_DIR=/claude \
+    DISABLE_AUTOUPDATER=1
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

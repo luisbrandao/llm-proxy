@@ -936,7 +936,7 @@ function cfgProviderCard(p) {
   const card = el("div", "mcard");
   const head = el("div", "mhead");
   head.appendChild(el("span", "mname", p.name));
-  head.appendChild(el("span", "mtcount muted", p.base_url));
+  head.appendChild(el("span", "mtcount muted", p.base_url || p.kind));
   if (p.require_permission) {
     const lock = el("span", "fltag", "🔒 key required");
     lock.title = "hidden from callers without a proxy key";
@@ -1481,7 +1481,7 @@ function renderProviders(providers) {
   const grid = el("div", "pgrid");
   for (const p of providers) {
     const chip = el("div", "pchip" + (p.is_down ? " down" : ""));
-    chip.title = p.base_url || "";
+    chip.title = p.base_url || p.kind || "";
     chip.appendChild(el("span", "pname", p.name));
     chip.appendChild(el("span", "pslot", p.slots == null ? "∞" : `${p.in_use}/${p.slots}`));
     if (p.require_permission) { const f = el("span", "pflag lock", "🔒"); f.title = "require_permission"; chip.appendChild(f); }

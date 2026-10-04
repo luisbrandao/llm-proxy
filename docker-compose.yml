@@ -24,6 +24,13 @@ services:
       # detects the stale state and refuses to write (a red banner in the Config
       # tab), but if you hit it, recreate: docker compose up -d --force-recreate.
       - ./config.yaml:/app/config.yaml
+      # The claude CLI's login (kind: claude-cli providers). A volume so recreating
+      # the container keeps it; log in once with
+      #   docker exec -it llm-proxy claude auth login --claudeai
+      - claude-cli:/claude
     ports:
       - "9999:8000"
     restart: unless-stopped
+
+volumes:
+  claude-cli:

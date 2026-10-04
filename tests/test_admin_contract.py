@@ -65,11 +65,11 @@ def client(load_config, monkeypatch):
 # Every p.<field> the console dereferences, per view.
 INFLIGHT_PROVIDER_FIELDS = {"name", "slots", "in_use", "is_down", "resident"}
 ROUTING_PROVIDER_FIELDS = {
-    "name", "base_url", "slots", "in_use", "is_down", "require_permission",
+    "name", "kind", "base_url", "slots", "in_use", "is_down", "require_permission",
     "lists_all", "priority",
 }
 CONFIG_PROVIDER_FIELDS = {
-    "name", "base_url", "slots", "priority", "require_permission", "cache_ttl",
+    "name", "kind", "base_url", "slots", "priority", "require_permission", "cache_ttl",
     "strip_path_prefix", "lists_all", "enabled_models", "model_map", "fronted",
     "has_api_key",
 }

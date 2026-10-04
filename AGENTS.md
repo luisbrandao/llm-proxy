@@ -24,6 +24,7 @@ decompresses the response. Single process, async, one uvicorn worker.
 | `app/proxy.py` | Request lifecycle: parse → resolve → gate → `_dispatch` (acquire slot, build body, forward, failover) → `_handle_non_stream` / `_handle_stream`. Also decompression, `_error` (the one OpenAI-shaped error envelope) and `_relay_headers`. |
 | `app/trim.py` | The context guardrail: `trim_request(payload, body_str, asked)` returns a shrunk copy of a chat body that declares `num_ctx` and is estimated to exceed it, or `None` when nothing needs to change. Excerpts old oversized tool results first, then drops the oldest turns at tool-call block boundaries; system messages always survive. Returns a `Trimmed` (payload + dropped/capped/before/after/budget) that `_route` writes to the entry (`Entry.mark_trimmed`) so the row badge and the log's `trimmed=`/`trim_capped=` fields carry the same numbers. Configured by the `trim:` section (`conf.TRIM`). Called once per request in `proxy._route`, before `_dispatch`. |
 | `app/version.py` | Build identity — `VERSION` (the image tag, e.g. `master-52`), `REVISION` (git sha), `summary()`, `as_dict()`. Read from `APP_VERSION`/`APP_REVISION` at import; baked in by the Dockerfile from CI build-args. **Not** hot-reloaded — it is build metadata, not config. |
+| `app/claude_cli.py` | The `kind: claude-cli` backend: an `httpx.AsyncBaseTransport` that answers `POST …/chat/completions` by running the official `claude` binary headless (`claude -p --output-format json`, every tool off, empty cwd). `translate(payload)` → (system prompt, prompt); the CLI's `result` JSON → an OpenAI `chat.completion` (or a one-chunk SSE stream). `client()` is the process-wide client `proxy._client_for` hands claude-cli providers instead of `upstream.forward_client()`. |
 | `app/upstream.py` | The two shared `httpx.AsyncClient`s and their timeouts. Everything outbound goes through here so connections are pooled; `FORWARD_TIMEOUT` is long-read/short-connect on purpose. Closed by `main`'s lifespan. |
 | `app/metrics.py` | Prometheus counters/gauges (`llm_proxy_` prefix). Never persisted — see the metrics note below. |
 | `app/logbuffer.py` | In-memory ring buffer (`logging.Handler`) of recent log lines, seq-stamped, for the `/admin/logs` tail. Process-local like the slot/health state. |
@@ -54,7 +55,7 @@ main.py                        ASGI entry: routes, /admin router, lifespan
   └─ proxy.py                  request lifecycle, failover
        └─ router.py            name -> ordered targets
             └─ registry.py     discovery + health
-  registry · slots · inflight · auth · clientinfo · configwrite · trim     services
+  registry · slots · inflight · auth · clientinfo · configwrite · trim · claude_cli   services
        └─ config.py            the leaf everything reads
   config.py · metrics.py · logbuffer.py · upstream.py · version.py   leaves
 ```
@@ -281,6 +282,21 @@ independent rules. If you add process-local state, add it to the reset list in
   is over budget. It reads `num_ctx` *before* `_build_body` applies `strip_fields`, so a
   Google target that strips the field still gets the trimmed conversation. Read it as
   `conf.TRIM` at call time — it hot-reloads like everything else.
+- **The claude-cli backend is a transport, and it stays disarmed.** It plugs in
+  *under* the forwarding path (`proxy._client_for`) rather than as a branch in
+  `_dispatch`, so slots, failover, metrics, the request log, the In-flight row and Kill
+  need no special case — keep it that way, and keep the backend contract: an answered
+  error is an HTTP status, an unanswered one (spawn failure, timeout) raises
+  `httpx.RequestError`. Three properties are load-bearing. **Lockdown:** the container
+  holds `config.yaml` with every backend's API key, so the CLI always runs with
+  `--tools ""`, no MCP, no setting sources, no slash commands, in an empty directory —
+  never add a flag that gives a prompt file, shell or network access. **No orphan
+  process:** `_run` kills the child on timeout *and* on cancellation (Kill button,
+  client disconnect) before the slot is released. **Credentials stay in the CLI:** the
+  proxy runs the unmodified binary and never reads, copies or forwards its login
+  (`/claude`, a volume) — lifting the subscription token into another client is what
+  Anthropic's terms forbid. The model-less passthrough skips non-`http` kinds; the
+  catalog of an empty `enabled_models` is `config.CLAUDE_CLI_MODELS`.
 - **Metric names use the `llm_proxy_` prefix** (renamed from `deepseek_proxy_`).
 - **Never persist or re-seed the counters.** A restart resetting them to zero is a real
   counter reset, and `rate()`/`increase()` handle it correctly. A snapshot restored from
@@ -330,6 +346,7 @@ one:
 | `tests/test_gate.py` | Catalog visibility with and without a key, the 401/404 distinction, admin gating, and that `api_key` never appears in a response. |
 | `tests/test_admin_contract.py` | The exact fields `app/static/app.js` dereferences from each admin view. The console is untyped with no build step, so a dropped field shows up as a blank cell rather than an error. |
 | `tests/test_trim.py` | The context guardrail is a no-op unless `num_ctx` is present and exceeded (a fitting body returns `None`, not a copy); system messages survive; the oldest turns go first; a tool call and its results are never separated at the cut (swept across budgets); old oversized tool results are excerpted before any turn is dropped while recent ones stay whole; the newest turn is always sent; images are counted flat; the `trim:` section parses and hot-reloads. `test_proxy.py` covers the wire: a trimmed body reaches the backend, a fitting one is forwarded verbatim, and a failover re-sends the same trimmed body. |
+| `tests/test_claude_cli.py` | The claude-cli backend through the real lifecycle, with the CLI replaced by a fake script run via the real subprocess path: the OpenAI ↔ CLI translation, the lockdown flags and empty cwd, a keyless caller never reaching the CLI, CLI errors → HTTP statuses and failover, tools/images refused with a 400, and **no `claude` process outliving its slot** on timeout or cancellation. |
 | `tests/test_inflight.py` | The feed's derived numbers, driven on `Entry` directly: tokens/s divides over upstream time (queue wait excluded), takes the handler's recorded duration over the clock, is reset by a failover, keeps the `~` estimate when a backend never reports usage, and rounds exactly as the log formats. `test_proxy.py` closes the loop by matching a history row to its `speed_tps` line. |
 
 Conventions that matter when adding tests:

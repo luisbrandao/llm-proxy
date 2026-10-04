@@ -14,7 +14,7 @@ from fastapi.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from app import config as conf
-from app import auth, clientinfo, inflight, registry, router, slots, trim, upstream
+from app import auth, claude_cli, clientinfo, inflight, registry, router, slots, trim, upstream
 from app.config import Provider
 from app.metrics import (
     ERRORS_TOTAL,
@@ -32,6 +32,15 @@ event_logger = logging.getLogger("llm-proxy.event")
 
 def _build_url(provider: Provider, path: str) -> str:
     return f"{provider.base_url}/{conf.strip_prefix(provider, path)}"
+
+
+def _client_for(provider: Provider) -> httpx.AsyncClient:
+    """Where a provider's requests go out: the shared HTTP pool, or — for the
+    `claude-cli` kind — the transport that runs the CLI (app/claude_cli.py).
+    Both are process-wide; never aclose() either from a request path."""
+    if provider.kind == conf.KIND_CLAUDE_CLI:
+        return claude_cli.client()
+    return upstream.forward_client()
 
 
 def _build_headers(provider: Provider, request: Request) -> dict:
@@ -352,7 +361,7 @@ async def _handle_non_stream(
     # fail over to the next backend; the response is fully buffered here. The
     # client is process-wide (see app/upstream.py) so the connection is reused —
     # never close it here.
-    client = upstream.forward_client()
+    client = _client_for(provider)
     async with client.stream(method, url, headers=headers, content=body) as resp:
         # Read the raw, undecoded bytes so we control decompression ourselves
         # (httpx cannot decode brotli/zstd without extra libs and would
@@ -437,7 +446,7 @@ async def _handle_stream(
     # spends all its time before the first byte — timing only the body read
     # would yield near-zero durations and absurd tokens/sec.
     start = time.time()
-    stream_cm = upstream.forward_client().stream(
+    stream_cm = _client_for(provider).stream(
         method, url, headers=headers, content=body
     )
     # A failure here — RequestError (the dispatcher fails over on it) or
@@ -887,12 +896,17 @@ async def _route(
     # First *permitted*, not first configured: picking PROVIDERS[0] blindly meant
     # an unauthenticated caller got "Authentication required" whenever the config
     # happened to list a paid backend first — another 401 about a backend they
-    # never chose.
+    # never chose. HTTP backends only: a passthrough forwards an arbitrary path
+    # untouched, and the CLI answers nothing but chat completions.
     if not raw_model:
         if not conf.PROVIDERS:
             return Response(content="No providers configured", status_code=503)
         provider = next(
-            (p for p in conf.PROVIDERS if authorized or not p.require_permission), None
+            (
+                p for p in conf.PROVIDERS
+                if (authorized or not p.require_permission) and p.kind == conf.KIND_HTTP
+            ),
+            None,
         )
         if provider is None:
             return _unauthorized("")

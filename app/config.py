@@ -20,6 +20,19 @@ def _interpolate(value):
     return value
 
 
+# How a provider is reached. `http` is an OpenAI-compatible server at base_url;
+# `claude-cli` runs the official `claude` binary headless (app/claude_cli.py),
+# authenticated by whatever that CLI is logged in as — no base_url, no api_key.
+KIND_HTTP = "http"
+KIND_CLAUDE_CLI = "claude-cli"
+KINDS = (KIND_HTTP, KIND_CLAUDE_CLI)
+
+# What a `claude-cli` provider "live-reports": the CLI's own model aliases, each
+# tracking the newest model of its family. There is no endpoint to ask, so this
+# stands in for discovery when enabled_models is empty.
+CLAUDE_CLI_MODELS = ("fable", "opus", "sonnet", "haiku")
+
+
 @dataclass
 class Provider:
     name: str
@@ -63,6 +76,10 @@ class Provider:
     # already sent wins). Use for backend attribution the client can't set
     # itself — e.g. OpenRouter app identity: {"HTTP-Referer": "...", "X-Title": "..."}.
     headers: Dict[str, str] = field(default_factory=dict)
+    # One of KINDS. Everything above about URLs, paths and headers applies to
+    # `http` only; the routing fields (models, slots, priority, permission) apply
+    # to every kind.
+    kind: str = KIND_HTTP
     # Reverse of model_map (canonical name -> native id), built in __post_init__.
     _to_native: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
@@ -201,10 +218,19 @@ def _load(text: bytes):
     providers = []
     for idx, item in enumerate(raw.get("providers", []) or []):
         slots = item.get("slots")
+        kind = str(item.get("kind") or KIND_HTTP)
+        if kind not in KINDS:
+            raise ValueError(
+                f"provider {item['name']!r}: unknown kind {kind!r} (expected one of {', '.join(KINDS)})"
+            )
+        # Required for http (a KeyError names the missing field); meaningless for
+        # the CLI kind, which has no endpoint.
+        base_url = item["base_url"] if kind == KIND_HTTP else item.get("base_url", "")
         providers.append(
             Provider(
                 name=item["name"],
-                base_url=_interpolate(item["base_url"]).rstrip("/"),
+                kind=kind,
+                base_url=_interpolate(base_url).rstrip("/"),
                 api_key=_interpolate(item.get("api_key", "")),
                 enabled_models=item.get("enabled_models") or [],
                 model_map=item.get("model_map") or {},

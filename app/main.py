@@ -329,6 +329,7 @@ def _provider_view(p, *, live=False, editable=False, fronted=None) -> dict:
     """
     out = {
         "name": p.name,
+        "kind": p.kind,
         "base_url": p.base_url,
         "slots": p.slots,
         "priority": p.priority,

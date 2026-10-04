@@ -110,6 +110,23 @@ providers:
     slots: 10
     cache_ttl: 3600
 
+  # Claude through the official Claude Code CLI, run headless in the proxy's
+  # container — draws from the Claude subscription the CLI is logged in as, not
+  # an API key. No base_url / api_key; log the CLI in once with
+  #   docker exec -it llm-proxy claude auth login --claudeai
+  # Text-only chat completions (streams arrive as one chunk). Keep it behind the
+  # key — the subscription is personal — and slots low: each request is a process.
+  - name: claude
+    kind: claude-cli
+    require_permission: true
+    slots: 1
+    enabled_models: []          # [] = the CLI's aliases: fable, opus, sonnet, haiku
+    model_map:                  # native (CLI alias) -> canonical
+      fable: claude-fable
+      opus: claude-opus
+      sonnet: claude-sonnet
+      haiku: claude-haiku
+
 # Logical models: one canonical name backed by several prioritized targets — the
 # cross-provider routing/failover/load-balance table.
 #   - Omit a target's `model:` and the native id is inherited from that provider's

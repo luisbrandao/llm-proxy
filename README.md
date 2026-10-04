@@ -26,6 +26,9 @@ request a **clean model name** — the proxy decides *which* backend actually se
   with a valid `Authorization: Bearer` key see or use them.
 - **OpenRouter provider routing** — pin which upstream OpenRouter uses (e.g. force
   DeepSeek-official instead of whatever's cheapest).
+- **Claude on your subscription** — a `kind: claude-cli` backend runs the official
+  Claude Code CLI headless inside the container, so Claude routes like any other
+  backend and draws from your Claude plan instead of an API key.
 - **Response decompression** — transparently decodes gzip/deflate/brotli upstream
   bodies that a client couldn't otherwise read.
 
@@ -220,6 +223,59 @@ Its timeouts are split on purpose:
   such request to a single-slot local backend used to stall it for a full ten minutes,
   with `down_backoff` never kicking in because nothing had failed yet.
 
+### Claude via the Claude Code CLI
+
+A provider with `kind: claude-cli` has no URL: each request runs the official `claude`
+binary headless (`claude -p`) inside the proxy's container, logged in with your own
+Claude subscription. Usage counts against that plan's limits — the same pool your
+interactive Claude Code draws from — not against an API key.
+
+```yaml
+  - name: claude
+    kind: claude-cli
+    require_permission: true      # the subscription is yours: keep it behind the key
+    slots: 1                      # one `claude` process at a time
+    enabled_models: []            # [] = the CLI's aliases: fable, opus, sonnet, haiku
+    model_map:                    # native (CLI alias) -> canonical
+      opus: claude-opus
+      sonnet: claude-sonnet
+```
+
+Log the CLI in once; the login lives in the `/claude` volume and survives recreates:
+
+```bash
+docker exec -it llm-proxy claude auth login --claudeai
+```
+
+Until then every request answers 502 `Not logged in`. The binary is baked into the image
+at a pinned, checksum-verified version (`CLAUDE_CODE_VERSION` build arg) with its
+self-updater off.
+
+How it fits in: the CLI is an `httpx` transport under the normal forwarding path
+(`app/claude_cli.py`), so slots, failover, metrics, the request log and the console's
+Kill button behave exactly as for an HTTP backend. A CLI error with an HTTP status is
+relayed with that status (a usage-limit 429 fails over like any 429); Anthropic's 529
+becomes 503; a refused CLI login becomes 502 rather than a 401 the caller would read as
+their own key; a binary that will not start or runs past the 600s read timeout is a
+connection failure.
+
+What it serves, and what it refuses:
+
+- **Text chat completions only.** Leading system messages become the system prompt; a
+  single user message is sent as-is; longer conversations are sent as a role-tagged
+  transcript (`claude -p` takes one prompt). `reasoning_effort` maps to `--effort`.
+- **Streaming is synthesized** — the answer arrives as one SSE chunk when it is done.
+- **Tools, images and audio are refused with a 400**, not silently dropped.
+- **The agent is disarmed.** Every built-in tool, MCP server, settings file and slash
+  command is switched off and the process runs in an empty directory, because the
+  container also holds `config.yaml` with every other backend's API key.
+- Other OpenAI parameters (`temperature`, `max_tokens`, …) have no CLI equivalent and
+  are ignored.
+
+The proxy never touches the CLI's credentials; it only runs the unmodified binary.
+Anthropic's terms allow your own subscription in the official CLI and forbid lifting its
+token into another client or sharing the account — hence `require_permission: true`.
+
 ## Configuration
 
 All routing config lives in `config.yaml` (see `config.example.yaml`). Provider API keys
@@ -310,7 +366,8 @@ trim:
 | Field | Description |
 |---|---|
 | `name` | Backend key, also the `provider:` routing prefix |
-| `base_url` | Upstream base URL |
+| `kind` | `http` (default): an OpenAI-compatible server at `base_url`. `claude-cli`: the Claude Code CLI run in the container — see [Claude via the Claude Code CLI](#claude-via-the-claude-code-cli). The URL/path/header fields below apply to `http` only |
+| `base_url` | Upstream base URL (`http` only; required there) |
 | `api_key` | Sent as `Authorization: Bearer` upstream. Empty → no auth header (e.g. Ollama) |
 | `enabled_models` | Allow-list in **native** ids. **Empty** = expose all (live-queried). **Non-empty** = exactly these (no live call) |
 | `slots` | Max concurrent in-flight requests (shared across the backend's models). Omit = unlimited |
