@@ -51,11 +51,12 @@ single SSE chunk, so streaming clients work but see the reply arrive all at once
 """
 import asyncio
 import json
+import math
 import os
 import tempfile
 import time
 import uuid
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import httpx
 
@@ -141,15 +142,17 @@ _REPLY = json.dumps({
 class Translated(NamedTuple):
     system: str
     prompt: str
-    # The functions the model may call this turn; empty for a plain chat.
-    names: Tuple[str, ...] = ()
+    # The functions the model may call this turn, name -> parameters schema;
+    # empty for a plain chat.
+    functions: Dict[str, dict] = {}
     # parallel_tool_calls: false — at most one call per turn.
     single: bool = False
 
 
-def _offer(payload: dict) -> Tuple[str, Tuple[str, ...], bool]:
-    """The functions a request offers -> (system prompt addendum, callable names,
-    one call at most); ("", (), False) when it offers none, or forbids calling them.
+def _offer(payload: dict) -> Tuple[str, Dict[str, dict], bool]:
+    """The functions a request offers -> (system prompt addendum, callable
+    functions, one call at most); ("", {}, False) when it offers none, or forbids
+    calling them.
 
     The client's parameter schemas go into the prompt as they are, never into a
     validated schema: they are of any size and dialect, and a validator rejecting
@@ -160,7 +163,7 @@ def _offer(payload: dict) -> Tuple[str, Tuple[str, ...], bool]:
         raise Unsupported(_LEGACY)
     tools, choice = payload.get("tools"), payload.get("tool_choice")
     if not tools or choice == "none":
-        return "", (), False
+        return "", {}, False
     if not isinstance(tools, list):
         raise Unsupported("'tools' must be a list")
     functions = []
@@ -176,8 +179,8 @@ def _offer(payload: dict) -> Tuple[str, Tuple[str, ...], bool]:
             "description": fn.get("description") or "",
             "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
         })
-    names = tuple(f["name"] for f in functions)
-    if len(set(names)) != len(names):
+    offered = {f["name"]: f["parameters"] for f in functions}
+    if len(offered) != len(functions):
         raise Unsupported("tool function names must be unique")
 
     # A call can't be forced, only asked for: the model calls of its own accord.
@@ -185,9 +188,9 @@ def _offer(payload: dict) -> Tuple[str, Tuple[str, ...], bool]:
     notes = []
     if isinstance(choice, dict):
         forced = (choice.get("function") or {}).get("name") if choice.get("type") == "function" else None
-        if forced not in names:
+        if forced not in offered:
             raise Unsupported("tool_choice must name a function listed in 'tools'")
-        names = (forced,)
+        offered = {forced: offered[forced]}
         notes.append(f"This turn, call `{forced}`.")
     elif choice == "required":
         notes.append("This turn, call at least one function.")
@@ -199,7 +202,7 @@ def _offer(payload: dict) -> Tuple[str, Tuple[str, ...], bool]:
 
     listing = "\n".join(json.dumps(f, ensure_ascii=False) for f in functions)
     addendum = "\n\n".join([_FUNCTIONS, *notes, f"<functions>\n{listing}\n</functions>"])
-    return addendum, names, single
+    return addendum, offered, single
 
 
 def _attrs(**values) -> str:
@@ -238,7 +241,7 @@ def translate(payload: dict) -> Translated:
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         raise Unsupported("'messages' must be a non-empty list")
-    addendum, names, single = _offer(payload)
+    addendum, functions, single = _offer(payload)
 
     system, turns, called = [], [], {}
     for m in messages:
@@ -266,16 +269,16 @@ def translate(payload: dict) -> Translated:
     if addendum:
         system_prompt = f"{system_prompt}\n\n{addendum}"
     if len(turns) == 1 and turns[0][0] == "user":
-        return Translated(system_prompt, turns[0][2], names, single)
+        return Translated(system_prompt, turns[0][2], functions, single)
     transcript = "\n".join(f"<{tag}{attrs}>\n{text}\n</{tag}>" for tag, attrs, text in turns)
     ask = (
         "Take the assistant's next step in the conversation above: call the functions "
         "it needs, or write its message, without role tags."
-        if names else
+        if functions else
         "Write the assistant's next message in the conversation above. "
         "Reply with the message text only, without role tags."
     )
-    return Translated(system_prompt, f"<conversation>\n{transcript}\n</conversation>\n\n{ask}", names, single)
+    return Translated(system_prompt, f"<conversation>\n{transcript}\n</conversation>\n\n{ask}", functions, single)
 
 
 def _workdir() -> str:
@@ -315,8 +318,8 @@ class _Watch:
     reads that error; the call goes back to the client as `tool_calls`.
     """
 
-    def __init__(self, names: Tuple[str, ...]):
-        self.names = names
+    def __init__(self, functions: Dict[str, dict]):
+        self.functions = functions
         self.calls: List[dict] = []
         self.text: List[str] = []
         self.message: dict = {}
@@ -343,7 +346,7 @@ class _Watch:
                 continue
             if block.get("type") == "text":
                 self.text.append(str(block.get("text") or ""))
-            elif block.get("type") == "tool_use" and block.get("name") in self.names:
+            elif block.get("type") == "tool_use" and block.get("name") in self.functions:
                 self.calls.append(block)
                 self.message = message
         return False
@@ -485,6 +488,46 @@ def _completion(result: dict, model: str, structured: bool = False) -> dict:
     )
 
 
+def _scalar(value, kind):
+    """One argument put into the scalar type its schema asks for, when it converts
+    cleanly; otherwise as it was."""
+    try:
+        if isinstance(value, str):
+            text = value.strip()
+            if kind == "integer":
+                return int(text)
+            if kind == "number":
+                number = int(text) if text.lstrip("-").isdigit() else float(text)
+                return number if math.isfinite(number) else value
+            if kind == "boolean" and text.lower() in ("true", "false"):
+                return text.lower() == "true"
+        elif kind == "string" and isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)
+    except ValueError:
+        pass
+    return value
+
+
+def _coerce(args, parameters) -> dict:
+    """A call's arguments, with the scalar types the model got loosely wrong put
+    right against the client's own parameter schema (`"5"` for an integer).
+
+    The functions reach the model as prompt text, not as declared tools, so
+    nothing shaped these arguments by their schema the way a native call is — and
+    a client's typed handler can fail on a string where it expects a count.
+    Top-level properties only; anything that does not convert cleanly is left alone.
+    """
+    if not isinstance(args, dict):
+        return {}
+    properties = parameters.get("properties") if isinstance(parameters, dict) else None
+    if not isinstance(properties, dict):
+        return args
+    return {
+        key: _scalar(value, (properties.get(key) or {}).get("type") if isinstance(properties.get(key), dict) else None)
+        for key, value in args.items()
+    }
+
+
 def _caught(watch: _Watch, model: str, single: bool) -> dict:
     """Calls the watch caught -> an OpenAI completion that asks the client to run them.
 
@@ -497,7 +540,9 @@ def _caught(watch: _Watch, model: str, single: bool) -> dict:
             "type": "function",
             "function": {
                 "name": block["name"],
-                "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                "arguments": json.dumps(
+                    _coerce(block.get("input"), watch.functions.get(block["name"])), ensure_ascii=False
+                ),
             },
         }
         for block in (watch.calls[:1] if single else watch.calls)
@@ -570,8 +615,8 @@ class Transport(httpx.AsyncBaseTransport):
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(translated.system)
-            functions = bool(translated.names)
-            watch = _Watch(translated.names) if functions else None
+            functions = bool(translated.functions)
+            watch = _Watch(translated.functions) if functions else None
             argv = _argv(model, system_file, payload, functions)
             code, out, err = await _run(argv, translated.prompt, timeout, request, watch)
         finally:

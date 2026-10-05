@@ -390,6 +390,24 @@ def test_a_call_is_caught_and_goes_back_as_tool_calls(client, cli, monkeypatch):
     assert idle() == {"claude": 0, "backup": 0}
 
 
+def test_loosely_typed_arguments_are_put_right_by_the_schema(client, cli, monkeypatch):
+    """Seen live: opus sent search_web's integer `count` as "5"."""
+    properties = {
+        "query": {"type": "string"}, "count": {"type": "integer"}, "ratio": {"type": "number"},
+        "exact": {"type": "boolean"}, "page": {"type": "integer"},
+    }
+    tools = [{"type": "function", "function": {
+        "name": "search_web", "parameters": {"type": "object", "properties": properties},
+    }}]
+    args = {"query": 42, "count": "5", "ratio": "0.5", "exact": "true", "page": "two", "extra": "x"}
+    monkeypatch.setenv("FAKE_CLAUDE_CALLS", json.dumps([["search_web", args]]))
+    r = client.post("/v1/chat/completions", json=chat("claude-sonnet", tools=tools), headers=AUTH)
+    (call,) = r.json()["choices"][0]["message"]["tool_calls"]
+    assert json.loads(call["function"]["arguments"]) == {
+        "query": "42", "count": 5, "ratio": 0.5, "exact": True, "page": "two", "extra": "x",
+    }
+
+
 def test_calls_made_together_go_back_together(client, cli, monkeypatch):
     monkeypatch.setenv("FAKE_CLAUDE_CALLS", json.dumps(WEATHER + [["search_web", {"query": "rain"}]]))
     calls = ask(client).json()["choices"][0]["message"]["tool_calls"]

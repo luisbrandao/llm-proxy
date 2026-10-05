@@ -271,7 +271,9 @@ What it serves, and what it refuses:
 - **Function calling is emulated.** The request's `tools` are listed in the system
   prompt and the model calls them as tools; the proxy catches each call in the CLI's
   event stream, stops the run, and returns it as `tool_calls` for the client to run.
-  The results come back in the next request's transcript. `tool_choice`
+  The results come back in the next request's transcript. Since nothing validates
+  the arguments, scalars the model types loosely (`"5"` for an integer) are converted
+  to what the function's parameter schema asks for. `tool_choice`
   (`none`/`auto`/`required`/a named function) and `parallel_tool_calls: false` are
   honored, the last two by asking — a call cannot be forced, only which calls go back
   is enforced. Every request re-sends the conversation and the function list, so a
