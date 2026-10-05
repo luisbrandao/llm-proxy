@@ -29,8 +29,22 @@ An agent. The CLI ships file, shell and web tools, and the proxy's container
 holds a config with every other backend's API key, so a prompt must not be able
 to reach any of them: tools, MCP servers, settings files, slash commands and
 session persistence are all switched off, and the process runs in an empty
-scratch directory. A request that needs tools, images or audio is refused with a
-400 rather than quietly degraded into something it did not ask for.
+scratch directory. A request that needs images or audio is refused with a 400
+rather than quietly degraded into something it did not ask for.
+
+## Function calling, emulated
+
+A client's `tools` cannot reach the CLI as tools: it only takes tools through
+MCP, and in the OpenAI protocol it is the *client* that runs a call, in a later
+request. So the functions travel as text, listed in the system prompt, and the
+model calls them as tools anyway — the CLI has no such tool, but the call is
+complete in its event stream (`stream-json`) before the CLI can answer "no such
+tool". `_Watch` catches it there, the process is killed, and the call goes back
+out as OpenAI `tool_calls`. Earlier calls and their results come back in as part
+of the transcript. The CLI's own tool list stays empty throughout: the model can
+only *ask* for a call, and only the client can make one. A run that calls nothing
+answers through structured output (`--json-schema`), which is there to switch
+tool use on at all (see `_REPLY`).
 
 Streaming is synthesized: the CLI runs to completion and the answer goes out as a
 single SSE chunk, so streaming clients work but see the reply arrive all at once.
@@ -41,7 +55,7 @@ import os
 import tempfile
 import time
 import uuid
-from typing import List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 import httpx
 
@@ -94,48 +108,174 @@ def _text(content) -> str:
     raise Unsupported("message content must be a string or a list of text parts")
 
 
-def translate(payload: dict) -> Tuple[str, str]:
-    """An OpenAI chat body -> (system prompt, prompt) for `claude -p`.
+_LEGACY = "legacy `functions`/`function_call` calling is not supported by this backend; send `tools`"
+
+# Appended to the system prompt when the request offers functions. It invites the
+# model to call them as tools, which is what it does anyway: told instead to
+# request calls through a field of its structured reply, it still invoked them
+# directly, hit "no such tool", and gave up on the call.
+_FUNCTIONS = """\
+# Functions
+
+You can call the functions listed below as tools. Invoke one with its arguments
+and the application you are running in runs it, then continues this
+conversation with the result, so never guess a result: wait for it. Call a
+function only when the reply needs it.
+
+Calls made earlier appear in the conversation as <function_call> and
+<function_result>. Never write a call out as text like that: invoke the tool.
+
+Your reply to the user goes in the `content` of your structured output."""
+
+# The reply schema (`--json-schema`). It is needed less for its shape than for what
+# it switches on: with every CLI tool off, the API request declares no tools, and
+# then the model never emits a real call — it writes one out as text and invents
+# the result. Structured output declares one tool, and with it tool use.
+_REPLY = json.dumps({
+    "type": "object",
+    "properties": {"content": {"type": "string"}},
+    "required": ["content"],
+}, separators=(",", ":"))
+
+
+class Translated(NamedTuple):
+    system: str
+    prompt: str
+    # The functions the model may call this turn; empty for a plain chat.
+    names: Tuple[str, ...] = ()
+    # parallel_tool_calls: false — at most one call per turn.
+    single: bool = False
+
+
+def _offer(payload: dict) -> Tuple[str, Tuple[str, ...], bool]:
+    """The functions a request offers -> (system prompt addendum, callable names,
+    one call at most); ("", (), False) when it offers none, or forbids calling them.
+
+    The client's parameter schemas go into the prompt as they are, never into a
+    validated schema: they are of any size and dialect, and a validator rejecting
+    one would fail the whole request where a real backend would simply pass a
+    slightly wrong argument along.
+    """
+    if payload.get("functions") or payload.get("function_call"):
+        raise Unsupported(_LEGACY)
+    tools, choice = payload.get("tools"), payload.get("tool_choice")
+    if not tools or choice == "none":
+        return "", (), False
+    if not isinstance(tools, list):
+        raise Unsupported("'tools' must be a list")
+    functions = []
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            kind = tool.get("type") if isinstance(tool, dict) else type(tool).__name__
+            raise Unsupported(f"tool of type '{kind}' is not supported: this backend calls functions only")
+        fn = tool.get("function")
+        if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
+            raise Unsupported("every tool needs a function name")
+        functions.append({
+            "name": fn["name"],
+            "description": fn.get("description") or "",
+            "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+        })
+    names = tuple(f["name"] for f in functions)
+    if len(set(names)) != len(names):
+        raise Unsupported("tool function names must be unique")
+
+    # A call can't be forced, only asked for: the model calls of its own accord.
+    # What the transport does enforce is which calls go back to the client.
+    notes = []
+    if isinstance(choice, dict):
+        forced = (choice.get("function") or {}).get("name") if choice.get("type") == "function" else None
+        if forced not in names:
+            raise Unsupported("tool_choice must name a function listed in 'tools'")
+        names = (forced,)
+        notes.append(f"This turn, call `{forced}`.")
+    elif choice == "required":
+        notes.append("This turn, call at least one function.")
+    elif choice not in (None, "auto"):
+        raise Unsupported(f"unsupported tool_choice {choice!r}")
+    single = payload.get("parallel_tool_calls") is False
+    if single:
+        notes.append("Call one function at a time.")
+
+    listing = "\n".join(json.dumps(f, ensure_ascii=False) for f in functions)
+    addendum = "\n\n".join([_FUNCTIONS, *notes, f"<functions>\n{listing}\n</functions>"])
+    return addendum, names, single
+
+
+def _attrs(**values) -> str:
+    return "".join(f" {k}={json.dumps(v, ensure_ascii=False)}" for k, v in values.items())
+
+
+def _calls(tool_calls, called: dict) -> str:
+    """An assistant turn's `tool_calls` as transcript lines, remembering each
+    call's function name by id for the results that answer it."""
+    if not isinstance(tool_calls, list):
+        raise Unsupported("'tool_calls' must be a list")
+    lines = []
+    for call in tool_calls:
+        fn = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(fn, dict) or not isinstance(fn.get("name"), str):
+            raise Unsupported("every tool call needs a function name")
+        ref = str(call.get("id") or "")
+        called[ref] = fn["name"]
+        args = fn.get("arguments")
+        if not isinstance(args, str):
+            args = json.dumps(args if args is not None else {}, ensure_ascii=False)
+        lines.append(f"<function_call{_attrs(id=ref, name=fn['name'])}>{args}</function_call>")
+    return "\n".join(lines)
+
+
+def translate(payload: dict) -> Translated:
+    """An OpenAI chat body -> what `claude -p` is handed.
 
     Leading system/developer messages become the system prompt. A conversation
     that is a single user message is sent verbatim. Anything longer — history, or
     a system note partway through it (SillyTavern's author's notes) — is rendered
     as a role-tagged transcript, because `-p` takes exactly one prompt: there is
-    no way to hand the CLI earlier assistant turns as turns.
+    no way to hand the CLI earlier assistant turns as turns. Function calls and
+    their results are rendered into the same transcript.
     """
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         raise Unsupported("'messages' must be a non-empty list")
-    if (payload.get("tools") or payload.get("functions")) and payload.get("tool_choice") != "none":
-        raise Unsupported("tool calling is not supported by this backend")
+    addendum, names, single = _offer(payload)
 
-    system, turns = [], []
+    system, turns, called = [], [], {}
     for m in messages:
         if not isinstance(m, dict):
             raise Unsupported("every message must be an object")
         role = m.get("role")
-        if role in ("tool", "function") or m.get("tool_calls") or m.get("function_call"):
-            raise Unsupported("tool calls in the conversation are not supported by this backend")
-        if role not in ("system", "developer", "user", "assistant"):
+        if role == "function" or m.get("function_call"):
+            raise Unsupported(_LEGACY)
+        if role not in ("system", "developer", "user", "assistant", "tool"):
             raise Unsupported(f"unsupported message role '{role}'")
         text = _text(m.get("content"))
         if role in ("system", "developer") and not turns:
             system.append(text)
+        elif role == "assistant" and m.get("tool_calls"):
+            turns.append(("assistant", "", "\n".join(filter(None, [text, _calls(m["tool_calls"], called)]))))
+        elif role == "tool":
+            ref = str(m.get("tool_call_id") or "")
+            turns.append(("function_result", _attrs(id=ref, name=called.get(ref, "")), text))
         else:
-            turns.append(("system" if role == "developer" else role, text))
+            turns.append(("system" if role == "developer" else role, "", text))
     if not turns:
         raise Unsupported("the conversation has no user message")
 
     system_prompt = "\n\n".join(s for s in system if s.strip()) or DEFAULT_SYSTEM
+    if addendum:
+        system_prompt = f"{system_prompt}\n\n{addendum}"
     if len(turns) == 1 and turns[0][0] == "user":
-        return system_prompt, turns[0][1]
-    transcript = "\n".join(f"<{role}>\n{text}\n</{role}>" for role, text in turns)
-    prompt = (
-        f"<conversation>\n{transcript}\n</conversation>\n\n"
+        return Translated(system_prompt, turns[0][2], names, single)
+    transcript = "\n".join(f"<{tag}{attrs}>\n{text}\n</{tag}>" for tag, attrs, text in turns)
+    ask = (
+        "Take the assistant's next step in the conversation above: call the functions "
+        "it needs, or write its message, without role tags."
+        if names else
         "Write the assistant's next message in the conversation above. "
         "Reply with the message text only, without role tags."
     )
-    return system_prompt, prompt
+    return Translated(system_prompt, f"<conversation>\n{transcript}\n</conversation>\n\n{ask}", names, single)
 
 
 def _workdir() -> str:
@@ -147,21 +287,105 @@ def _workdir() -> str:
     return _workdir_path
 
 
-def _argv(model: str, system_file: str, payload: dict) -> List[str]:
+def _argv(model: str, system_file: str, payload: dict, functions: bool = False) -> List[str]:
     # The system prompt goes through a file and the prompt through stdin: Linux
     # caps a single argv string at 128 KiB, which a character card or a long chat
     # history clears easily, and argv is visible to anyone running `ps`.
     argv = [
-        *COMMAND, "-p", "--output-format", "json", "--model", model,
-        "--system-prompt-file", system_file, *_LOCKDOWN,
+        *COMMAND, "-p", "--model", model, "--system-prompt-file", system_file, *_LOCKDOWN,
     ]
+    if functions:
+        # Event by event, so a call can be caught the moment the model makes it.
+        argv += ["--output-format", "stream-json", "--verbose", "--json-schema", _REPLY]
+    else:
+        argv += ["--output-format", "json"]
     effort = payload.get("reasoning_effort")
     if effort in EFFORTS:
         argv += ["--effort", effort]
     return argv
 
 
-async def _run(argv: List[str], prompt: str, timeout, request: httpx.Request) -> Tuple[int, bytes, bytes]:
+class _Watch:
+    """Catches the model calling one of the client's functions in a stream-json run.
+
+    The model invokes the functions as tools of its own. The CLI has no such tools,
+    so it would answer "no such tool" and the model would carry on without the
+    call — but by then the call is complete, arguments and all, in the event
+    stream. So the watch collects it there and ends the run before the model ever
+    reads that error; the call goes back to the client as `tool_calls`.
+    """
+
+    def __init__(self, names: Tuple[str, ...]):
+        self.names = names
+        self.calls: List[dict] = []
+        self.text: List[str] = []
+        self.message: dict = {}
+        self._id = None
+
+    def __call__(self, line: bytes) -> bool:
+        """Feed one stdout line; True once the run has what it needs."""
+        try:
+            event = json.loads(line)
+        except ValueError:
+            return False
+        if not isinstance(event, dict):
+            return False
+        if event.get("type") != "assistant":
+            # The CLI answers a message's tool calls only once the message is
+            # complete, so its reply means every call that message carried is in.
+            return bool(self.calls) and event.get("type") == "user"
+        message = event.get("message") or {}
+        if message.get("id") != self._id:
+            # The CLI prints a message block by block; text is kept per message.
+            self._id, self.text = message.get("id"), []
+        for block in message.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                self.text.append(str(block.get("text") or ""))
+            elif block.get("type") == "tool_use" and block.get("name") in self.names:
+                self.calls.append(block)
+                self.message = message
+        return False
+
+
+# A stream-json line carries a whole message; asyncio's default 64 KiB line
+# limit would fail any long answer.
+_LINE_LIMIT = 64 * 1024 * 1024
+
+
+async def _communicate(proc, data: bytes, watch: Optional[_Watch]) -> Tuple[bytes, bytes]:
+    """`proc.communicate(data)` — except with a watch, stdout is read line by line
+    and reading stops the moment the watch has what it needs. The caller then
+    kills the process, which is still running."""
+    if watch is None:
+        return await proc.communicate(data)
+    stderr = asyncio.ensure_future(proc.stderr.read())
+    try:
+        try:
+            proc.stdin.write(data)
+            await proc.stdin.drain()
+            proc.stdin.close()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # it exited before reading the prompt; its output says why
+        lines = []
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            lines.append(line)
+            if watch(line):
+                return b"".join(lines), b""
+        await proc.wait()
+        return b"".join(lines), await stderr
+    finally:
+        if not stderr.done():
+            stderr.cancel()
+
+
+async def _run(
+    argv: List[str], prompt: str, timeout, request: httpx.Request, watch: Optional[_Watch] = None,
+) -> Tuple[int, bytes, bytes]:
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -169,20 +393,21 @@ async def _run(argv: List[str], prompt: str, timeout, request: httpx.Request) ->
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=_workdir(),
+            limit=_LINE_LIMIT,
         )
     except OSError as e:
         # Missing or non-executable binary: this backend cannot answer at all,
         # which to failover is exactly a connection failure.
         raise httpx.ConnectError(f"cannot start the claude CLI: {e}", request=request) from e
     try:
-        out, err = await asyncio.wait_for(proc.communicate(prompt.encode("utf-8")), timeout)
+        out, err = await asyncio.wait_for(_communicate(proc, prompt.encode("utf-8"), watch), timeout)
     except asyncio.TimeoutError:
         raise httpx.ReadTimeout(
             f"the claude CLI gave no answer within {timeout:.0f}s", request=request
         ) from None
     finally:
-        # Timeout, operator kill or client disconnect: the slot is about to be
-        # released, so the process that was using it must not outlive it.
+        # Timeout, a caught call, operator kill or client disconnect: the slot is
+        # about to be released, so the process that was using it must not outlive it.
         if proc.returncode is None:
             proc.kill()
             await proc.wait()
@@ -221,26 +446,19 @@ def _status(result: dict) -> int:
     return status
 
 
-def _completion(result: dict, model: str) -> dict:
-    usage = result.get("usage") or {}
+def _envelope(ident: str, model: str, message: dict, finish: str, usage: dict) -> dict:
     # Cached prompt tokens are still prompt tokens; the CLI reports them apart.
     prompt_tokens = sum(
         int(usage.get(k) or 0)
         for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
     )
     completion_tokens = int(usage.get("output_tokens") or 0)
-    by_model = result.get("modelUsage") or {}
     return {
-        "id": f"chatcmpl-{result.get('session_id') or uuid.uuid4().hex}",
+        "id": f"chatcmpl-{ident}",
         "object": "chat.completion",
         "created": int(time.time()),
-        # The concrete model behind the alias, when the CLI reports it.
-        "model": max(by_model, key=lambda k: (by_model[k] or {}).get("outputTokens", 0)) if by_model else model,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": result.get("result") or ""},
-            "finish_reason": "length" if result.get("stop_reason") == "max_tokens" else "stop",
-        }],
+        "model": model,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish}],
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -249,18 +467,59 @@ def _completion(result: dict, model: str) -> dict:
     }
 
 
+def _completion(result: dict, model: str, structured: bool = False) -> dict:
+    """A finished run's `result` -> an OpenAI completion."""
+    text = result.get("result") or ""
+    reply = result.get("structured_output") if structured else None
+    if isinstance(reply, dict) and isinstance(reply.get("content"), str):
+        text = reply["content"]
+    # Anything else — no structured reply at all — is answered in prose: still an answer.
+    by_model = result.get("modelUsage") or {}
+    return _envelope(
+        result.get("session_id") or uuid.uuid4().hex,
+        # The concrete model behind the alias, when the CLI reports it.
+        max(by_model, key=lambda k: (by_model[k] or {}).get("outputTokens", 0)) if by_model else model,
+        {"role": "assistant", "content": text},
+        "length" if result.get("stop_reason") == "max_tokens" else "stop",
+        result.get("usage") or {},
+    )
+
+
+def _caught(watch: _Watch, model: str, single: bool) -> dict:
+    """Calls the watch caught -> an OpenAI completion that asks the client to run them.
+
+    Usage is the message's as the CLI printed it mid-stream, before the message
+    ended: the prompt side is exact, the output side can undercount a little.
+    """
+    calls = [
+        {
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {
+                "name": block["name"],
+                "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+            },
+        }
+        for block in (watch.calls[:1] if single else watch.calls)
+    ]
+    message = {"role": "assistant", "content": "\n".join(watch.text).strip() or None, "tool_calls": calls}
+    return _envelope(
+        uuid.uuid4().hex, watch.message.get("model") or model, message, "tool_calls", watch.message.get("usage") or {},
+    )
+
+
 def _sse(completion: dict) -> bytes:
     """A finished completion as an OpenAI chat stream: the whole text in one
     delta, then the finish reason, then usage (what `include_usage` asks for)."""
     head = {k: completion[k] for k in ("id", "created", "model")}
     head["object"] = "chat.completion.chunk"
     choice = completion["choices"][0]
+    message = choice["message"]
+    delta = {"role": "assistant", "content": message["content"]}
+    if message.get("tool_calls"):
+        delta["tool_calls"] = [{"index": i, **call} for i, call in enumerate(message["tool_calls"])]
     chunks = [
-        {**head, "choices": [{
-            "index": 0,
-            "delta": {"role": "assistant", "content": choice["message"]["content"]},
-            "finish_reason": None,
-        }]},
+        {**head, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
         {**head, "choices": [{"index": 0, "delta": {}, "finish_reason": choice["finish_reason"]}]},
         {**head, "choices": [], "usage": completion["usage"]},
     ]
@@ -272,6 +531,12 @@ def _sse(completion: dict) -> bytes:
 def _response(status: int, body: bytes, content_type: str) -> httpx.Response:
     # A stream, not `content=`: the proxy reads every body with aiter_raw().
     return httpx.Response(status, stream=httpx.ByteStream(body), headers={"content-type": content_type})
+
+
+def _answer(completion: dict, payload: dict) -> httpx.Response:
+    if payload.get("stream"):
+        return _response(200, _sse(completion), "text/event-stream")
+    return _response(200, json.dumps(completion, ensure_ascii=False).encode("utf-8"), "application/json")
 
 
 def _error(status: int, message: str, kind: str) -> httpx.Response:
@@ -291,7 +556,7 @@ class Transport(httpx.AsyncBaseTransport):
             payload = json.loads(await request.aread())
             if not isinstance(payload, dict):
                 raise ValueError(payload)
-            system, prompt = translate(payload)
+            translated = translate(payload)
         except Unsupported as e:
             return _error(400, str(e), "invalid_request_error")
         except ValueError:
@@ -304,10 +569,16 @@ class Transport(httpx.AsyncBaseTransport):
         fd, system_file = tempfile.mkstemp(prefix="system-", suffix=".txt", dir=_workdir())
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(system)
-            code, out, err = await _run(_argv(model, system_file, payload), prompt, timeout, request)
+                f.write(translated.system)
+            functions = bool(translated.names)
+            watch = _Watch(translated.names) if functions else None
+            argv = _argv(model, system_file, payload, functions)
+            code, out, err = await _run(argv, translated.prompt, timeout, request, watch)
         finally:
             os.unlink(system_file)
+
+        if watch is not None and watch.calls:
+            return _answer(_caught(watch, model, translated.single), payload)
 
         result = _result(out)
         if result is None:
@@ -319,10 +590,7 @@ class Transport(httpx.AsyncBaseTransport):
             message = str(result.get("result") or result.get("subtype") or "the claude CLI reported an error")
             return _error(_status(result), message, "upstream_error")
 
-        completion = _completion(result, model)
-        if payload.get("stream"):
-            return _response(200, _sse(completion), "text/event-stream")
-        return _response(200, json.dumps(completion, ensure_ascii=False).encode("utf-8"), "application/json")
+        return _answer(_completion(result, model, functions), payload)
 
 
 def client() -> httpx.AsyncClient:

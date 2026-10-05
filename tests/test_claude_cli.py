@@ -40,6 +40,24 @@ FAKE = textwrap.dedent('''
     if mode == "garbage":
         sys.stderr.write("something went very wrong\\n")
         sys.exit(3)
+    # A model calling functions as tools, the way `--output-format stream-json`
+    # prints it: block by block, then the CLI's "no such tool" reply. The real CLI
+    # would go on from there; this one sleeps, so a run that is not cut short hangs.
+    calls = json.loads(os.environ.get("FAKE_CLAUDE_CALLS") or "[]")
+    if calls:
+        message = {"id": "msg_1", "model": "claude-opus-test-1", "usage": {"input_tokens": 7, "output_tokens": 3}}
+        def emit(event):
+            print(json.dumps(event), flush=True)
+        emit({"type": "system", "subtype": "init", "tools": ["StructuredOutput"]})
+        emit({"type": "assistant", "message": {**message, "content": [{"type": "text", "text": "Checking."}]}})
+        for i, (name, args) in enumerate(calls):
+            block = {"type": "tool_use", "id": "toolu_%d" % i, "name": name, "input": args}
+            emit({"type": "assistant", "message": {**message, "content": [block]}})
+        emit({"type": "user", "message": {"content": [{"type": "tool_result", "is_error": True, "content": "No such tool"}]}})
+        with open(os.environ["FAKE_CLAUDE_PID"], "w") as f:
+            f.write(str(os.getpid()))
+        if mode != "carry-on":
+            time.sleep(60)
     result = {
         "type": "result", "subtype": "success", "is_error": False,
         "result": "echo:" + seen["prompt"], "session_id": "s1", "stop_reason": "end_turn",
@@ -47,6 +65,10 @@ FAKE = textwrap.dedent('''
                   "cache_read_input_tokens": 2, "output_tokens": 4},
         "modelUsage": {"claude-opus-test-1": {"outputTokens": 4}},
     }
+    # What --json-schema makes the real CLI print: the reply both as text and parsed.
+    structured = os.environ.get("FAKE_CLAUDE_STRUCTURED")
+    if structured:
+        result.update(result=structured, structured_output=json.loads(structured), stop_reason="tool_use")
     if mode.startswith("error"):
         status = int(mode[5:]) if mode[5:] else None
         result.update(is_error=True, api_error_status=status, result="it broke", usage={})
@@ -300,11 +322,15 @@ def test_a_missing_binary_is_a_connection_failure(client, cli, monkeypatch):
 
 @pytest.mark.parametrize("extra", [
     {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:,"}}]}]},
-    {"tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}]},
+    {"functions": [{"name": "f", "parameters": {}}]},
+    {"messages": [{"role": "user", "content": "x"}, {"role": "function", "name": "f", "content": "r"}]},
+    {"tools": [{"type": "web_search"}]},
+    {"tools": [{"type": "function", "function": {"name": "f"}}] * 2},
+    {"tools": [{"type": "function", "function": {"name": "f"}}],
+     "tool_choice": {"type": "function", "function": {"name": "g"}}},
     {"messages": [
         {"role": "user", "content": "x"},
         {"role": "assistant", "content": None, "tool_calls": [{"id": "1", "type": "function"}]},
-        {"role": "tool", "tool_call_id": "1", "content": "r"},
     ]},
 ])
 def test_requests_it_cannot_serve_are_refused_not_degraded(client, cli, extra):
@@ -314,9 +340,143 @@ def test_requests_it_cannot_serve_are_refused_not_degraded(client, cli, extra):
     assert cli.calls() == []
 
 
-def test_tools_are_fine_when_the_client_says_not_to_call_them(client, cli):
-    body = chat("claude-sonnet", tools=[{"type": "function", "function": {"name": "f"}}], tool_choice="none")
+# ── Function calling ────────────────────────────────────────────────────────
+
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "get_weather",
+        "description": "Current weather for a city.",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+    }},
+    {"type": "function", "function": {"name": "search_web", "parameters": {"type": "object"}}},
+]
+
+WEATHER = [["get_weather", {"city": "Curitiba"}]]
+
+
+def ask(client, **extra):
+    return client.post("/v1/chat/completions", json=chat("claude-sonnet", tools=TOOLS, **extra), headers=AUTH)
+
+
+def test_functions_reach_the_model_as_text_never_as_tools(client, cli):
+    messages = [{"role": "system", "content": "be brief"}, {"role": "user", "content": "weather?"}]
+    assert ask(client, messages=messages).status_code == 200
+    call = cli.calls()[0]
+    argv = call["argv"]
+    # The CLI's own tool list stays empty; the functions are prompt text.
+    assert argv[argv.index("--tools") + 1] == ""
+    assert argv[argv.index("--output-format") + 1] == "stream-json" and "--verbose" in argv
+    assert argv[argv.index("--json-schema") + 1] == claude_cli._REPLY
+    assert call["system"].startswith("be brief\n\n# Functions\n")
+    assert '{"name": "get_weather", "description": "Current weather for a city.", "parameters": ' in call["system"]
+    assert call["prompt"] == "weather?"
+
+
+def test_a_call_is_caught_and_goes_back_as_tool_calls(client, cli, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_CALLS", json.dumps(WEATHER))
+    r = ask(client)
+    assert r.status_code == 200
+    body = r.json()
+    choice = body["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] == "Checking."
+    (call,) = choice["message"]["tool_calls"]
+    assert call["id"].startswith("call_") and call["type"] == "function"
+    assert call["function"] == {"name": "get_weather", "arguments": '{"city": "Curitiba"}'}
+    assert body["model"] == "claude-opus-test-1"
+    assert body["usage"] == {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+    # Cut short the moment the call was complete: the CLI never got to carry on.
+    assert not alive(int(cli.pid_file.read_text()))
+    assert idle() == {"claude": 0, "backup": 0}
+
+
+def test_calls_made_together_go_back_together(client, cli, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_CALLS", json.dumps(WEATHER + [["search_web", {"query": "rain"}]]))
+    calls = ask(client).json()["choices"][0]["message"]["tool_calls"]
+    assert [c["function"]["name"] for c in calls] == ["get_weather", "search_web"]
+    assert calls[0]["id"] != calls[1]["id"]
+
+
+def test_parallel_tool_calls_false_sends_back_one(client, cli, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_CALLS", json.dumps(WEATHER + [["search_web", {"query": "rain"}]]))
+    calls = ask(client, parallel_tool_calls=False).json()["choices"][0]["message"]["tool_calls"]
+    assert [c["function"]["name"] for c in calls] == ["get_weather"]
+    assert "Call one function at a time." in cli.calls()[0]["system"]
+
+
+def test_a_forced_tool_choice_catches_only_that_function(client, cli, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_CALLS", json.dumps([["search_web", {}], ["get_weather", {"city": "Rio"}]]))
+    forced = {"type": "function", "function": {"name": "get_weather"}}
+    (call,) = ask(client, tool_choice=forced).json()["choices"][0]["message"]["tool_calls"]
+    assert call["function"] == {"name": "get_weather", "arguments": '{"city": "Rio"}'}
+    assert "This turn, call `get_weather`." in cli.calls()[0]["system"]
+
+
+def test_a_call_to_a_function_not_offered_is_left_to_the_cli(client, cli, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_CALLS", json.dumps([["rm_rf", {}]]))
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "carry-on")
+    monkeypatch.setenv("FAKE_CLAUDE_STRUCTURED", json.dumps({"content": "I can't do that."}))
+    choice = ask(client).json()["choices"][0]
+    assert choice["message"] == {"role": "assistant", "content": "I can't do that."}
+    assert choice["finish_reason"] == "stop"
+
+
+def test_a_streamed_call_arrives_as_a_tool_calls_delta(client, cli, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_CALLS", json.dumps(WEATHER))
+    body = chat("claude-sonnet", tools=TOOLS, stream=True)
+    with client.stream("POST", "/v1/chat/completions", json=body, headers=AUTH) as r:
+        text = "".join(r.iter_text())
+    data = [line[5:].strip() for line in text.splitlines() if line.startswith("data:")]
+    chunks = [json.loads(d) for d in data[:-1]]
+    delta = chunks[0]["choices"][0]["delta"]
+    assert delta["content"] == "Checking."
+    (call,) = delta["tool_calls"]
+    assert call["index"] == 0 and call["function"]["name"] == "get_weather"
+    assert chunks[1]["choices"][0]["finish_reason"] == "tool_calls"
+    assert idle() == {"claude": 0, "backup": 0}
+
+
+def test_an_answer_is_the_content_of_the_structured_reply(client, cli, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_STRUCTURED", json.dumps({"content": "Sunny."}))
+    choice = ask(client).json()["choices"][0]
+    assert choice["message"] == {"role": "assistant", "content": "Sunny."}
+    assert choice["finish_reason"] == "stop"
+
+
+def test_an_answer_without_the_structured_reply_is_still_an_answer(client, cli):
+    assert ask(client).json()["choices"][0]["message"] == {"role": "assistant", "content": "echo:hello"}
+
+
+def test_calls_and_results_in_the_history_become_part_of_the_transcript(client, cli):
+    messages = [
+        {"role": "user", "content": "weather in Curitiba?"},
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "get_weather", "arguments": '{"city": "Curitiba"}'},
+        }]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "18C, rain"},
+    ]
+    body = chat("claude-sonnet", tools=TOOLS, messages=messages)
     assert client.post("/v1/chat/completions", json=body, headers=AUTH).status_code == 200
+    prompt = cli.calls()[0]["prompt"]
+    assert (
+        '<assistant>\n<function_call id="call_1" name="get_weather">{"city": "Curitiba"}</function_call>\n'
+        '</assistant>\n<function_result id="call_1" name="get_weather">\n18C, rain\n</function_result>'
+    ) in prompt
+    assert "call the functions it needs" in prompt
+
+
+def test_tool_choice_required_asks_for_a_call(client, cli):
+    assert ask(client, tool_choice="required").status_code == 200
+    assert "This turn, call at least one function." in cli.calls()[0]["system"]
+
+
+def test_tool_choice_none_is_a_plain_chat(client, cli):
+    assert ask(client, tool_choice="none").status_code == 200
+    call = cli.calls()[0]
+    assert call["argv"][call["argv"].index("--output-format") + 1] == "json"
+    assert "--json-schema" not in call["argv"]
+    assert "# Functions" not in call["system"]
 
 
 # ── No process outlives its slot ────────────────────────────────────────────

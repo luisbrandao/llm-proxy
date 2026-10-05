@@ -265,14 +265,26 @@ connection failure.
 
 What it serves, and what it refuses:
 
-- **Text chat completions only.** Leading system messages become the system prompt; a
+- **Text chat completions.** Leading system messages become the system prompt; a
   single user message is sent as-is; longer conversations are sent as a role-tagged
   transcript (`claude -p` takes one prompt). `reasoning_effort` maps to `--effort`.
-- **Streaming is synthesized** — the answer arrives as one SSE chunk when it is done.
-- **Tools, images and audio are refused with a 400**, not silently dropped.
+- **Function calling is emulated.** The request's `tools` are listed in the system
+  prompt and the model calls them as tools; the proxy catches each call in the CLI's
+  event stream, stops the run, and returns it as `tool_calls` for the client to run.
+  The results come back in the next request's transcript. `tool_choice`
+  (`none`/`auto`/`required`/a named function) and `parallel_tool_calls: false` are
+  honored, the last two by asking — a call cannot be forced, only which calls go back
+  is enforced. Every request re-sends the conversation and the function list, so a
+  client with many tools (Open WebUI's native mode sends ~40) spends quota on them on
+  every turn; legacy `functions` is refused with a 400.
+- **Streaming is synthesized** — the answer (or the calls) arrives as one SSE chunk
+  when it is done.
+- **Images and audio are refused with a 400**, not silently dropped.
 - **The agent is disarmed.** Every built-in tool, MCP server, settings file and slash
   command is switched off and the process runs in an empty directory, because the
-  container also holds `config.yaml` with every other backend's API key.
+  container also holds `config.yaml` with every other backend's API key. Emulated
+  function calling changes nothing here: the model only *asks* for a call, and the
+  client is what runs it.
 - Other OpenAI parameters (`temperature`, `max_tokens`, …) have no CLI equivalent and
   are ignored.
 

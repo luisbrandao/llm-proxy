@@ -114,8 +114,9 @@ providers:
   # container — draws from the Claude subscription the CLI is logged in as, not
   # an API key. No base_url / api_key; log the CLI in once with
   #   docker exec -it llm-proxy claude auth login --claudeai
-  # Text-only chat completions (streams arrive as one chunk). Keep it behind the
-  # key — the subscription is personal — and slots low: each request is a process.
+  # Text chat completions with emulated function calling (streams arrive as one
+  # chunk). Keep it behind the key — the subscription is personal — and slots
+  # low: each request is a process.
   - name: claude
     kind: claude-cli
     require_permission: true
