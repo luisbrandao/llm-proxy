@@ -960,7 +960,10 @@ async def _route(
     # Context guardrail: a conversation the client says cannot fit (`num_ctx`)
     # is shrunk once here, before any target is chosen, so every failover
     # attempt forwards the same trimmed body. Fits → `payload` is untouched.
-    trimmed = trim.trim_request(payload, body_str, raw_model, entry.id)
+    # In a thread: tokenizing an agent's whole history takes tens of ms (more on
+    # the first, which loads the tokenizer), and the single event loop is
+    # relaying every other stream meanwhile. The tokenizer runs without the GIL.
+    trimmed = await asyncio.to_thread(trim.trim_request, payload, body_str, raw_model, entry.id)
     if trimmed is not None:
         payload = trimmed.payload
         entry.mark_trimmed(trimmed.as_dict())

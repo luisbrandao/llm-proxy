@@ -39,6 +39,19 @@ RUN set -eu; \
 ENV CLAUDE_CONFIG_DIR=/claude \
     DISABLE_AUTOUPDATER=1
 
+# The tokenizer the context guardrail counts with (app/trim.py, `trim.tokenizer`;
+# config.DEFAULT_TOKENIZER is this path). Qwen's: every local model here is
+# Qwen3.5 or later, one shared vocabulary, and on other families it still lands
+# far closer than a characters-per-token guess. Pinned to a revision and
+# sha256-checked, like the CLI above; 13 MB on disk, loaded (~120 MB) only once a
+# request comes near its num_ctx.
+ARG QWEN_TOKENIZER_REV=1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
+ARG QWEN_TOKENIZER_SHA256=0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3
+RUN mkdir -p /app/tokenizers \
+    && curl -fsSL -o /app/tokenizers/qwen3.8.json \
+       "https://huggingface.co/Qwen/Qwen3.8-27B/resolve/${QWEN_TOKENIZER_REV}/tokenizer.json" \
+    && echo "${QWEN_TOKENIZER_SHA256}  /app/tokenizers/qwen3.8.json" | sha256sum -c -
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

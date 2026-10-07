@@ -4,3 +4,4 @@ httpx>=0.27.0
 prometheus-client>=0.20.0
 pyyaml>=6.0
 ruamel.yaml>=0.16
+tokenizers>=0.20

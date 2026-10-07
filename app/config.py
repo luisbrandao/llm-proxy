@@ -177,15 +177,24 @@ class Routing:
     )
 
 
+# Where the Dockerfile puts the tokenizer the context guardrail counts with.
+DEFAULT_TOKENIZER = "/app/tokenizers/qwen3.8.json"
+
+
 @dataclass
 class Trim:
     """The context-window guardrail (see app/trim.py). Global, not per backend:
     it keys off the `num_ctx` the *client* sends, which is the client's
     statement of the model's context size whatever backend serves it."""
     enabled: bool = True
-    # Token estimate = serialized chars / this. 3 is conservative on purpose:
-    # over-counting trims a little early, under-counting forwards the very
-    # request this guards against. Raise towards 4 for mostly-English chats.
+    # A Hugging Face `tokenizer.json` to count tokens with. The image bakes in
+    # Qwen's (every local model is Qwen3.5+, one shared vocabulary); a relative
+    # path is taken from the config file's directory. Empty, or a file that will
+    # not load, falls back to `chars_per_token`.
+    tokenizer: str = field(default_factory=lambda: DEFAULT_TOKENIZER)
+    # The fallback estimate = serialized chars / this. 3 over-counts on purpose:
+    # trimming a little early beats forwarding the very request this guards
+    # against.
     chars_per_token: float = 3.0
     # Tokens kept free below num_ctx for the reply and anything the backend
     # injects. The budget is `num_ctx - response_headroom`.
@@ -196,6 +205,16 @@ class Trim:
     # The newest N messages are never excerpted; the current answer usually
     # depends on them verbatim.
     protect_recent: int = 10
+
+
+def _tokenizer_path(value) -> str:
+    """`trim.tokenizer` as a path the loader can open: blank/null means none, a
+    relative path is resolved against the config file's directory (in the
+    deploy, the mounted /app/conf, so a tokenizer can be dropped next to it)."""
+    path = str(value or "").strip()
+    if path and not os.path.isabs(path):
+        path = os.path.join(os.path.dirname(os.path.abspath(CONFIG_PATH)), path)
+    return path
 
 
 def _read_config() -> bytes:
@@ -279,6 +298,7 @@ def _load(text: bytes):
     tr = raw.get("trim") or {}
     trim = Trim(
         enabled=bool(tr.get("enabled", True)),
+        tokenizer=_tokenizer_path(tr.get("tokenizer", DEFAULT_TOKENIZER)),
         chars_per_token=max(0.5, float(tr.get("chars_per_token", 3.0))),
         response_headroom=max(0, int(tr.get("response_headroom", 4000))),
         max_tool_result_tokens=max(0, int(tr.get("max_tool_result_tokens", 4000))),

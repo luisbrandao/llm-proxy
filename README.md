@@ -192,11 +192,23 @@ fits — or has no `num_ctx` — is forwarded untouched, byte for byte. Then, in
 3. **Always send the newest turn**, even when it alone is over budget: there is nothing
    smaller to send, and the backend's own error is the right answer. The log says so.
 
-Sizes are estimated as serialized JSON characters divided by `chars_per_token` — no
-tokenizer, no network. The default of 3 is deliberately conservative: over-counting trims
-a little early; under-counting forwards exactly the request this exists to stop. Raise it
-towards 4 for mostly-English chats if it trims too eagerly. Non-text content parts
-(images) count a flat ~1000 tokens each rather than their base64 length.
+Sizes are counted with a real tokenizer: `trim.tokenizer`, a Hugging Face
+`tokenizer.json`, by default Qwen's, which the image bakes in at
+`/app/tokenizers/qwen3.8.json` (every local model is Qwen3.5 or later, and they share a
+vocabulary). Each message is counted the way the chat template prints it — the text of
+its content, reasoning and tool-call arguments as-is, not JSON-escaped, plus a few tokens
+of template markup per message, call and argument, plus the tool schemas. Sampling fields
+are not counted. Against Qwen3.8's real template that lands within ~1% on agent
+transcripts, erring high. The tokenizer loads on the first request that needs it (~0.4 s,
+~120 MB), and a 600-message session takes ~80 ms to count, off the event loop.
+
+A relative `tokenizer` path is resolved against the config file's directory, so another
+`tokenizer.json` can be dropped next to `config.yaml`. Empty, or a file that will not
+load (one WARNING, then silence), falls back to the old estimate: serialized JSON
+characters divided by `chars_per_token`. That one errs both ways on agent traffic —
+1.45× over on source code, 0.8× *under* on an `ls -l` listing, where Qwen spends a token
+per digit — so it is only the fallback. Non-text content parts (images) count a flat
+~1000 tokens each either way, rather than their base64 length.
 
 Every trim shows up in three places with the same numbers: a `CONTEXT TRIM request #N …`
 `WARNING` with the estimate, the budget, messages dropped and tool results excerpted; the
@@ -373,7 +385,8 @@ routing:
 # Context guardrail: shrink a chat that cannot fit the `num_ctx` it declares.
 trim:
   enabled: true
-  chars_per_token: 3.0        # token estimate = JSON chars / this (conservative)
+  tokenizer: /app/tokenizers/qwen3.8.json  # tokenizer.json to count with; "" = estimate
+  chars_per_token: 3.0        # fallback estimate = JSON chars / this (conservative)
   response_headroom: 4000     # tokens kept free below num_ctx for the reply
   max_tool_result_tokens: 4000  # old tool results above this are excerpted first
   protect_recent: 10          # the newest N messages are never excerpted
@@ -441,7 +454,7 @@ model and via auto-group resolves as the logical model (it's earlier in the orde
   an entry.
 - **`routing:`** — `queue_timeout`, `failover`, `auto_group`, `down_backoff`,
   `failover_statuses`, `queue_affinity`, `affinity_max_skips` (see above).
-- **`trim:`** — the context guardrail: `enabled`, `chars_per_token`, `response_headroom`,
+- **`trim:`** — the context guardrail: `enabled`, `tokenizer`, `chars_per_token`, `response_headroom`,
   `max_tool_result_tokens`, `protect_recent` (see [Context guardrail](#context-guardrail)).
 
 ### Environment variables

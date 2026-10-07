@@ -10,6 +10,7 @@ Two things need care here, both consequences of how the app is built:
   between cases or they leak into each other — `reset_state` does that, and it is
   autouse so no test can forget.
 """
+import dataclasses
 import os
 import sys
 import textwrap
@@ -36,7 +37,7 @@ if not FIXTURE_CONFIG.exists():
 os.environ.setdefault("CONFIG_PATH", str(FIXTURE_CONFIG))
 
 from app import config as conf  # noqa: E402
-from app import inflight, registry, slots  # noqa: E402
+from app import inflight, registry, slots, trim  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +61,17 @@ def reset_state():
     inflight._active.clear()
     inflight._recent.clear()
     inflight._bodies.clear()
+    trim._loaded = ("", None)
+
+
+@pytest.fixture(autouse=True)
+def no_baked_tokenizer(monkeypatch):
+    """The context guardrail counts with `chars_per_token` unless a test installs
+    a tokenizer itself. The image's baked tokenizer exists inside the image and
+    nowhere else, and a suite whose numbers depend on where it runs proves
+    nothing. Covers both the config default and the TRIM loaded at import."""
+    monkeypatch.setattr(conf, "DEFAULT_TOKENIZER", "")
+    monkeypatch.setattr(conf, "TRIM", dataclasses.replace(conf.TRIM, tokenizer=""))
 
 
 @pytest.fixture

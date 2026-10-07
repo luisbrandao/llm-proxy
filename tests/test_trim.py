@@ -5,8 +5,11 @@ it; a fitting body comes back *untouched* (None, not a copy); system messages
 survive; the oldest turns go first; an assistant tool call and its results are
 dropped or kept together; old oversized tool results are excerpted before any
 turn is dropped while recent ones are protected; the newest turn is always sent.
+And with a tokenizer installed, that the count is of what the chat template
+prints — raw text plus markup — rather than of the JSON it travels in.
 """
 import json
+from pathlib import Path
 
 import pytest
 
@@ -275,6 +278,110 @@ def test_image_parts_are_counted_flat_not_by_base64_length(cfg):
         ],
     }
     assert run(p) is None  # 1000 flat + a few dozen tokens — fits comfortably
+
+
+# ── Counting with a tokenizer ────────────────────────────────────────────────
+
+@pytest.fixture
+def byte_tokenizer(tmp_path):
+    """A real `tokenizer.json` in which every UTF-8 byte is one token, so the
+    expected counts can be worked out by hand."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    alphabet = sorted(pre_tokenizers.ByteLevel.alphabet())
+    tok = Tokenizer(models.BPE(vocab={c: i for i, c in enumerate(alphabet)}, merges=[]))
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
+    tok.decoder = decoders.ByteLevel()
+    path = tmp_path / "bytes.json"
+    tok.save(str(path))
+    return str(path)
+
+
+def test_a_tokenizer_counts_what_the_template_prints(cfg, byte_tokenizer, caplog):
+    cfg(tokenizer=byte_tokenizer)
+    turns = [msg("user" if i % 2 == 0 else "assistant", "x" * 300) for i in range(40)]
+    p = {"model": "m", "num_ctx": 2000, "temperature": 0.7,
+         "messages": [msg("system", "S" * 300)] + turns}
+    res = trim.trim_request(p, body(p), "m")
+    each = 300 + trim.MSG_MARKUP_TOKENS
+    assert res.before == trim.PROMPT_MARKUP_TOKENS + 41 * each  # temperature costs nothing
+    # 2000 - 64 - the system message leaves room for exactly five more.
+    assert len(res.payload["messages"]) == 6
+    assert res.after == trim.PROMPT_MARKUP_TOKENS + 6 * each
+    assert "by bytes.json" in caplog.text
+
+
+def test_quotes_and_newlines_cost_their_text_not_their_json_escape(cfg, byte_tokenizer):
+    cfg(tokenizer=byte_tokenizer)
+    raw = '"\n' * 3000  # 6000 bytes of text, twice that once JSON-escaped
+    call = {"id": "c1", "type": "function",
+            "function": {"name": "write_file", "arguments": json.dumps({"content": raw})}}
+    messages = [
+        msg("assistant", "", tool_calls=[call], reasoning_content="t" * 100),
+        msg("tool", raw, tool_call_id="c1"),
+    ]
+    costs = trim._meter(conf.TRIM).costs(messages)
+    m = trim.MSG_MARKUP_TOKENS
+    assert costs[0] == (m + trim.CALL_MARKUP_TOKENS + trim.ARG_MARKUP_TOKENS
+                        + len("write_file") + len("content") + 6000 + 100)
+    assert costs[1] == m + 6000
+
+
+def test_tool_schemas_count_and_sampling_fields_do_not(cfg, byte_tokenizer):
+    cfg(tokenizer=byte_tokenizer)
+    meter = trim._meter(conf.TRIM)
+    schema = {"type": "function",
+              "function": {"name": "f", "description": "d" * 500, "parameters": {}}}
+    assert meter.fixed({"messages": [], "temperature": 0.7, "stop": ["x" * 5000]}) \
+        == trim.PROMPT_MARKUP_TOKENS
+    assert meter.fixed({"messages": [], "tools": [schema]}) == (
+        trim.PROMPT_MARKUP_TOKENS + trim.TOOLS_PREAMBLE_TOKENS + len(json.dumps(schema)))
+
+
+def test_excerpts_are_cut_to_the_cap_in_tokens(cfg, byte_tokenizer):
+    cfg(tokenizer=byte_tokenizer, protect_recent=2, max_tool_result_tokens=100)
+    p = tool_convo(num_ctx=1200, result_len=3000)
+    out = run(p)
+    assert len(out["messages"]) == len(p["messages"]), "capping alone should have sufficed"
+    for m in (m for m in out["messages"] if m["role"] == "tool"):
+        c = m["content"]
+        # 70 tokens of head, 30 of tail — here, bytes — around the marker.
+        assert c[:70] in ("r" * 70, "z" * 70) and c[70] == "\n"
+        assert c[-30:] in ("r" * 30, "z" * 30) and c[-31] == "\n"
+        assert "cut 2900 characters" in c
+    assert paired(out["messages"])
+
+
+def test_a_tokenizer_that_will_not_load_falls_back_to_chars_and_warns_once(cfg, tmp_path, caplog):
+    cfg(tokenizer=str(tmp_path / "missing.json"))
+    p = convo(20, num_ctx=2000)
+    missing = trim.trim_request(p, body(p), "m")
+    trim.trim_request(p, body(p), "m")
+    cfg()  # no tokenizer at all
+    plain = trim.trim_request(p, body(p), "m")
+    assert missing.as_dict() == plain.as_dict()
+    assert caplog.text.count("cannot load tokenizer") == 1
+
+
+def test_tokenizer_path_is_resolved_against_the_config_directory(load_config):
+    head = """\
+        providers:
+          - name: only
+            base_url: "http://only.invalid/v1"
+        trim:
+        """
+    path = load_config(head + "  tokenizer: tokenizers/q.json\n")
+    assert conf.TRIM.tokenizer == str(path.parent / "tokenizers" / "q.json")
+    load_config(head + "  tokenizer: /abs/q.json\n")
+    assert conf.TRIM.tokenizer == "/abs/q.json"
+    load_config(head + '  tokenizer: ""\n')
+    assert conf.TRIM.tokenizer == ""
+
+
+def test_the_default_tokenizer_is_the_file_the_image_bakes(monkeypatch):
+    monkeypatch.undo()  # conftest blanks the default to keep the suite hermetic
+    dockerfile = (Path(__file__).resolve().parent.parent / "Dockerfile").read_text()
+    assert conf.DEFAULT_TOKENIZER.startswith("/app/")
+    assert conf.DEFAULT_TOKENIZER in dockerfile
 
 
 def test_trim_section_is_parsed_and_hot_reloaded(load_config):

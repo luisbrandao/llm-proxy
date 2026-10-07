@@ -1,0 +1,1263 @@
+Request:
+POST https://nano-gpt.com/api/v1/chat/completions
+  -H 'content-type: application/json'
+  -H 'authorization: Bearer ***'
+  -H 'accept: */*'
+  -H 'accept-encoding: gzip, deflate'
+  -H 'user-agent: Python/3.11 aiohttp/3.13.5'
+  -H 'http-referer: https://github.com/luisbrandao/llm-proxy'
+  -H 'x-title: llm-proxy'
+  -d '{
+  "stream": true,
+  "model": "deepseek/deepseek-v4-pro-0813:thinking",
+  "stream_options": {
+    "include_usage": true
+  },
+  "num_batch": 256,
+  "num_ctx": 128000,
+  "max_tokens": 32768,
+  "tool_approval_mode": "full",
+  "messages": [
+    {
+      "role": "system",
+      "content": "\n\n##### Pyodide Environment\n\n- This Python environment runs via Pyodide in the browser. **Do not install packages** — `pip install`, `subprocess`, and `micropip.install()` are not available.\n- If a required library is unavailable, use an alternative approach with available modules. Do not attempt to install anything.\n\n##### Persistent File System\n\n- User-uploaded files are available at `/mnt/uploads/`. When the user asks you to work with their files, read from this directory.\n- You can also write output files to `/mnt/uploads/` so the user can access and download them from the file browser.\n- The file system persists across code executions within the same session.\n- Use `import os; os.listdir('/mnt/uploads')` to discover available files."
+    },
+    {
+      "role": "user",
+      "content": "Escreve um poeminha curto (4 a 6 linhas) sobre outono."
+    },
+    {
+      "role": "assistant",
+      "content": "As folhas dançam devagar,  \ndouradas, caem sem se apressar.  \nO vento canta em tom sereno,  \no chão se veste de amarelo.  \nO outono chega de mansinho,  \ntrazendo o frio e um doce ninho.",
+      "reasoning_details": [
+        {
+          "type": "reasoning.text",
+          "text": "The user wants a short poem (4-6 lines) about autumn in Portuguese. This is a simple creative writing request, no tools needed.",
+          "format": "unknown",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": "Podes escrever um haicai sobre o outono?"
+    },
+    {
+      "role": "assistant",
+      "content": "Claro! Aqui vai um haicai (5-7-5 sílabas):\n\n**Folha cai ao chão —** *(5)*  \n**o vento leva o verão —** *(7)*  \n**outono chegou.** *(5)*\n\nE mais um, se quiseres:\n\n**Outono dourado,** *(5)*  \n**as folhas voam no ar —** *(7)*  \n**o frio a chegar.** *(5)*",
+      "reasoning_details": [
+        {
+          "type": "reasoning.text",
+          "text": "The user wants a haiku about autumn in Portuguese. A traditional haiku is 3 lines with a 5-7-5 syllable structure (in Japanese). In Portuguese, haikus often follow 5-7-5 syllables too. Let me write one.\n\nLet me craft a haiku with 5-7-5 syllables in Portuguese.\n\n\"Folha seca cai\" - fo-lha se-ca cai = 5? \"Folha\" = 2, \"seca\" = 2, \"cai\" = 1 → 5. Good.\n\nSecond line: \"o vento frio sussurra\" - o ven-to fri-o sus-sur-ra = 1+2+2+3 = 8. Let me count: \"o\" (1) \"vento\" (2) \"frio\" (2) \"sussurra\" (3) = 8. Too many.\n\nLet me try: \"no chão de ouro e saudade\" - no chão de ou-ro e sau-da-de = 1+1+1+2+1+3 = 9. Too many.\n\nSecond line needs 7 syllables. \"o vento sopra no chão\" - o (1) ven-to (2) so-pra (2) no (1) chão (1) = 7. Good.\n\nThird line 5 syllables: \"outono chegou\" - ou-to-no che-gou = 3+2 = 5. Good.\n\nSo:\n\"Folha seca cai\" (5)\n\"o vento sopra no chão\" (7)\n\"outono chegou\" (5)\n\nHmm, but maybe I want something more evocative. Let me refine.\n\nActually let me make it nicer:\n\n\"Folhas douradas\" - fo-lhas dou-ra-das = 2+3 = 5. Good.\n\n\"dançam ao sabor do vento\" - dan-çam ao sa-bor do ven-to = 2+1+2+1+2 = 8. Too many.\n\n\"caem no ar sem pressa\" - ca-em no ar sem pres-sa = 2+1+1+1+2 = 7. Good.\n\nThen third: \"o outono chega\" - o ou-to-no che-ga = 1+3+2 = 6. Too many.\n\n\"chega o outono\" = 5? che-ga o ou-to-no = 2+1+3 = 6. No.\n\n\"outono sereno\" = ou-to-no se-re-no = 3+3 = 6. No.\n\nLet me carefully construct a proper 5-7-5.\n\nLine 1 (5): \"Folha seca cai\" ✓ (2+2+1)\nLine 2 (7): \"o vento sopra no chão\" ✓ (1+2+2+1+1)\nLine 3 (5): \"outono chegou\" ✓ (3+2)\n\nThat works syllabically. But \"Folha seca cai / o vento sopra no chão / outono chegou\" — it's okay but \"outono chegou\" feels abrupt. Let me improve.\n\nAlternative:\nLine 1: \"Cai a folha ao chão\" - cai a fo-lha ao chão = 1+1+2+1+1 = 6. No.\n\"Folha cai ao chão\" = fo-lha cai ao chão = 2+1+1+1 = 5. Good. ✓\n\nLine 2 (7): \"o vento leva o verão\" - o ven-to le-va o ve-rão = 1+2+2+1+2 = 8. No.\n\"vento leva o verão\" = ven-to le-va o ve-rão = 2+2+1+2 = 7. ✓ Good.\n\nLine 3 (5): \"outono chegou\" = 5. ✓\n\n\"Folha cai ao chão / vento leva o verão / outono chegou\"\n\nThis is nice and thematically coherent: leaf falls, wind takes summer, autumn arrived. \n\nLet me verify syllable counts in Portuguese:\n- \"Folha cai ao chão\": fo-lha (2) cai (1) ao (1) chão (1) = 5 ✓\n- \"vento leva o verão\": ven-to (2) le-va (2) o (1) ve-rão (2) = 7 ✓\n- \"outono chegou\": ou-to-no (3) che-gou (2) = 5 ✓\n\nGood. But maybe I could offer a slightly more evocative one too. Let me just give one clean haiku with the syllable counts noted, maybe briefly.\n\nActually, let me consider a more seasonal/evocative one:\n\n\"Folhas de ouro caem\" - fo-lhas de ou-ro ca-em = 2+1+2+2 = 7. That's 7, could be line 2.\n\nLine 1 (5): \"Outono doura\" - ou-to-no dou-ra = 3+2 = 5 ✓\nLine 2 (7): \"folhas de ouro caem\" = 7 ✓\nLine 3 (5): \"o vento em silêncio\" - o ven-to em si-lên-cio = 1+2+1+3 = 7. No.\n\nLet me not overcomplicate. I'll present one solid haiku and mention the 5-7-5.\n\nI'll go with:\n\nFolha cai ao chão —  \no vento leva o verão —  \noutono chegou.\n\nThat's clean. Maybe offer a second variation for flavor.",
+          "format": "unknown",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": "Olha online e me diz como o clima vai estar amanha em, curitiba.\n"
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_00_McLQfJOZpX901J5bk0ve1190",
+          "type": "function",
+          "function": {
+            "name": "search_web",
+            "arguments": "{\"query\": \"previs\\u00e3o do tempo amanh\\u00e3 Curitiba\"}"
+          }
+        }
+      ],
+      "reasoning_details": [
+        {
+          "type": "reasoning.text",
+          "text": "The user wants to know the weather tomorrow in Curitiba, Brazil. I should search the web for this current information.",
+          "format": "unknown",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_00_McLQfJOZpX901J5bk0ve1190",
+      "content": "[{\"title\": \"Clima e Previsão do Tempo para 15 Dias em Vinhedo (SP)\", \"link\": \"https://www.climatempo.com.br/previsao-do-tempo/15-dias/cidade/575/vinhedo-sp\", \"snippet\": \"Veja a previsão do tempo em Vinhedo (SP) para os próximos 15 dias. Dados sobre chuva, temperatura e mudanças no clima em …\"}, {\"title\": \"‎Climatempo - Previsão do tempo App - App Store\", \"link\": \"https://apps.apple.com/cn/app/climatempo-previs%C3%A3o-do-tempo/id407856257\", \"snippet\": \"O aplicativo de previsão do tempo de maior confiança do Brasil, está de cara nova e repleto de novidades! NOVIDADES: • Para favoritar mais de uma cidade e benefícios, faça o ...\"}, {\"title\": \"Clima e Previsão do Tempo para Amanhã em Curitiba (PR)\", \"link\": \"https://www.climatempo.com.br/previsao-do-tempo/amanha/cidade/271/curitiba-pr\", \"snippet\": \"A previsão para hoje e amanhã indica queda de temperatura amanhã, com máxima passando de 14°C para 11°C. A chuva diminui amanhã, enquanto vento e umidade ...\"}, {\"title\": \"Previsão do tempo Vinhedo SP. 14 dias - Meteored Brasil\", \"link\": \"https://www.tempo.com/vinhedo.htm\", \"snippet\": \"Previsão do Tempo em Vinhedo - SP, os próximos 14 dias, com as últimas previsões meteorológicos. Informações sobre …\"}, {\"title\": \"Previsão do Tempo - Curitiba/PR - SIMEPAR\", \"link\": \"https://www.simepar.br/simepar/forecast_by_counties/4106902\", \"snippet\": \"Sobre o Simepar. O Sistema de Tecnologia e Monitoramento Ambiental do Paraná - SIMEPAR - é uma entidade de direito privado e interesse público, sem fins ...\"}, {\"title\": \"Previsão do Tempo_歌词_Marcos Valle的歌曲_下载-汽水音乐\", \"link\": \"https://www.douyin.com/qishui/song/6724658720611026946\", \"snippet\": \"汽水音乐为您提供Marcos VallePrevisão do Tempo歌曲、Previsão do Tempo下载、Previsão do Tempo歌词,可以帮你 发现更多好音乐。 Previsão do Tempo Marcos Valle 专辑:Jet-Samba流派:爵士...\"}, {\"title\": \"Climatempo: Clima e Previsão do Tempo sempre atualizados\", \"link\": \"https://www.climatempo.com.br/\", \"snippet\": \"Por exemplo, quando dizemos “Hoje está chovendo em São Paulo” ou “Amanhã a previsão é de sol e temperaturas amenas” …\"}, {\"title\": \"Máquina do Tempo - Adryan Gomez - 单曲- 网易云音乐\", \"link\": \"https://music.163.com/song?id=2086099826\", \"snippet\": \"2023年10月7日 - 歌曲名《Máquina do Tempo》,由 Adryan Gomez演唱,收录于《Som Inefável》专辑中。《Máquina do Tempo》下载,《Máquina do Tempo》在线试听,更多...\"}, {\"title\": \"Clima e Previsão do Tempo para 15 Dias em Curitiba (PR)\", \"link\": \"https://www.climatempo.com.br/previsao-do-tempo/15-dias/cidade/271/curitiba-pr\", \"snippet\": \"Céu nublado com possibilidade de garoa de dia e à noite. Noite com muitas nuvens. Madrugada. Nublado com chuva. Manhã. Nublado com chuva. Tarde.\"}, {\"title\": \"Previsão do Tempo em Vinhedo-SP — Hoje, Amanhã e 7 Dias\", \"link\": \"https://previsaodotempo.org/previsao-do-tempo/sudeste/sp/vinhedo/\", \"snippet\": \"A previsão do tempo para Vinhedo, em São Paulo, aponta 14°Cneste momento, com pancadas fracas. A temperatura do dia varia …\"}]"
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_00_7oqUE6fBDX6vJemCXOY81696",
+          "type": "function",
+          "function": {
+            "name": "fetch_url",
+            "arguments": "{\"url\": \"https://www.climatempo.com.br/previsao-do-tempo/amanha/cidade/271/curitiba-pr\"}"
+          }
+        }
+      ],
+      "reasoning_details": [
+        {
+          "type": "reasoning.text",
+          "text": "I need to get more detailed info from the Climatempo page for tomorrow in Curitiba.",
+          "format": "unknown",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_00_7oqUE6fBDX6vJemCXOY81696",
+      "content": "\n\nClima e Previsão do Tempo para Amanhã em Curitiba (PR)\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\t\tUsamos cookies para personalizar a sua experiência. Ao utilizar nossos sites e serviços, você concorda com o uso de cookies por nossa parte conforme estabelecido na nossa Política de privacidade.\n\t\nOK\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nClimatempo\n\n\n\n\n\n\n\n\n\n\n×\n\n\n\n\n\n\n\n\nÚltimas buscas\n\n\t\t\tApagar histórico\n\t\t\n\n\n\t\tVocê não tem nenhuma busca recente.\n\t\n\n\n\n\nUsar minha localização atual\n\n\n\n\n\n\n\n\n\n\nFaça seu login\n\n\n\n\n                    -\n                    \n\n\n\n\n\n\n\nMinha conta\n\n\nSair\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nOlá, Visitante\nfazer login\n\n\n\n\n\n\n\n\n\n\n×\n\n\n\n\n\n\n\nÚltimas buscas\n\n\t\t\t\t\t\tApagar histórico\n\t\t\t\t\t\n\n\n\t\t\t\t\tVocê não tem nenhuma busca recente.\n\t\t\t\t\n\n\n\n\nUsar minha localização atual\n\n\n\n\n\n\nMinhas localizações favoritas\n\n\n\n\n\n\n\nPrevisão do Tempo\n\n\n\n\n\nClima\n\n\n\n\n\nNotícias\n\n\n\n\n\nAgroclima\n\n\n\n\n\nMapas\n\n\n\n\n\nConteúdos\n\n\n\n\n\nProdutos\n\n\n\n\n\n\n\n\n\n\n\n\n\t\t\t\t\t\t\tVoltar\n\t\t\t\t\t\t\n\n\n\n\n\n\t\t\t\t\t\t\t\t\tAgora\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tHoje\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tAmanhã\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tFim de Semana\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\t15 dias\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tPraias\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tAeroportos\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tBrasil\n\t\t\t\t\t\t\t\t\n\n\n\n\n\n\n\n\n\t\t\t\t\t\t\tVoltar\n\t\t\t\t\t\t\n\n\n\n\n\n\t\t\t\t\t\t\t\t\tClimatologia\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tDiferença entre clima e tempo\n\t\t\t\t\t\t\t\t\n\n\n\n\n\n\n\n\n\t\t\t\t\t\t\tVoltar\n\t\t\t\t\t\t\n\n\n\n\n\n\t\t\t\t\t\t\t\t\tÚltimas notícias\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tAgroclima\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tAlimentação\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tSaúde\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tAlertas\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tSustentabilidade\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tAgricultura\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tNegócios\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tModa\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tEnergia\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tInfraestrutura\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tGoverno\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tMudanças Climáticas\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tSul\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tSudeste\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tCentro-Oeste\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tNordeste\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tNorte\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tFrio\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tTemporal\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tCalor\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tCiclone\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tEl Niño\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tLa Niña\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tTurismo\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tRadar RS\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tCarnaval\n\t\t\t\t\t\t\t\t\n\n\n\n\n\n\n\n\n\t\t\t\t\t\t\tVoltar\n\t\t\t\t\t\t\n\n\n\n\n\n\t\t\t\t\t\t\t\t\tPágina inicial\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tNotícias Agrícolas\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tAgrotalk\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tPrevisão Agrícola\n\t\t\t\t\t\t\t\t\n\n\n\n\n\n\n\n\n\t\t\t\t\t\t\tVoltar\n\t\t\t\t\t\t\n\n\n\n\n\n\t\t\t\t\t\t\t\t\tTemperatura\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tChuva\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tAcumulado de chuva\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tPressão\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tUmidade relativa\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tVento\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tRisco de Incêndio\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tSatélite\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tChuva Agora\n\t\t\t\t\t\t\t\t\n\n\n\n\n\n\n\n\n\t\t\t\t\t\t\tVoltar\n\t\t\t\t\t\t\n\n\n\n\n\n\t\t\t\t\t\t\t\t\tVídeos\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tChuva\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tGráficos\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tVento\n\t\t\t\t\t\t\t\t\n\n\n\n\n\n\n\n\n\t\t\t\t\t\t\tVoltar\n\t\t\t\t\t\t\n\n\n\n\n\n\t\t\t\t\t\t\t\t\tMídia\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tSMAC\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tAPI\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tLevantamento de dados\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tRelclima\n\t\t\t\t\t\t\t\t\n\n\n\n\t\t\t\t\t\t\t\t\tWeather Index\n\t\t\t\t\t\t\t\t\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nSão Paulo, SP\n\n\n\n\n\n\n\n\n\n\n\n×\n\n\n\n×\n\n\n\nÚltimas buscas\n\n\t\t\tApagar histórico\n\t\t\n\n\n\t\tVocê não tem nenhuma busca recente.\n\t\n\n\n\n\nUsar minha localização atual\n\n\n\n\n\n\n\n\n\n\nAgora\n\n\nHoje\n\n\nAmanhã\n\n\nFim de semana\n\n\n15 dias\n\n\nHistórico de dados\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nClima e Previsão do Tempo\n\n\n\n/\n\n\nCidade\n\n\n\n/\n\n\nPrevisão do tempo amanhã\n\n\n\n/\n\nCuritiba - PR\n\n\n\n\n\n\n\n\nAgora\n\n\nHoje\n\n\nAmanhã\n\n\nFim de semana\n\n\n15 dias\n\n\nHistórico de dados\n\n\n\n\n\n\n\n\n\n\n\n\n\n    Previsão do Tempo para Amanhã\n           em \n 07/09\nCuritiba (PR)\nCuritiba - PR\n\n\n\n\n\n\n\n\n\nAmanhã será\nmais frio que hoje\n\nSol com muitas nuvens durante o dia e períodos de céu nublado. Noite com muitas nuvens.\n\n\n\n\nMadrugada\n\n\n\nManhã\n\n\n\nTarde\n\n\n\nNoite\n\n\n\n\n\n\n\n6°\n10°\n\n\n\n\n\n\n\n\nTemperatura\n\n\n\n\n\n\n\n\n          6°\n        \n\n          10°\n        \n\n\n\n\n\nSensação térmica\n\n\n\n          4°\n        \n\n          6°\n        \n\n\n\n\n\nChuva\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n            0.0mm\n          \n\n\n\n\n\n\nUmidade do ar\n\n\n\n\n77%\n94%\n\n\n\n\n\nVento\n\n\n\n\nE - 11km/h\n\n\n\n\n\nRajada de vento\n\n\nE - 36km/h\n\n\n\n\n\nSol\n\n\n\n                      06:24h às 18:06h\n                  \n\n\n\n\n\nArco-íris\n\n\n\n          Sem probabilid.\n        \n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nPrevisão hora a hora em Curitiba\n\n\n\nGráfico\n\n\n\nLista\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nTemperatura\n\n\n\n\n\nChuva\n\n\n\n\n\nVento\n\n\n\n\n\nUmidade\n\n\n\n\n\n\n\nTemperatura\n\n\n\nChuva\n\n\n\nVento\n\n\n\nUmidade\n\n\n\n\n\n\n\n\n\n\n\n\n\n00:00\n\n7°C\n\n\n\n\n89%\n\n\n\n0mm\n\n\n\n\n              ESE - 12km/h            \n\n\n\n01:00\n\n7°C\n\n\n\n\n89%\n\n\n\n0mm\n\n\n\n\n              ESE - 11km/h            \n\n\n\n02:00\n\n6°C\n\n\n\n\n90%\n\n\n\n0mm\n\n\n\n\n              ESE - 11km/h            \n\n\n\n03:00\n\n6°C\n\n\n\n\n90%\n\n\n\n0mm\n\n\n\n\n              ESE - 11km/h            \n\n\n\n04:00\n\n6°C\n\n\n\n\n91%\n\n\n\n0mm\n\n\n\n\n              E - 10km/h            \n\n\n\n05:00\n\n6°C\n\n\n\n\n91%\n\n\n\n0mm\n\n\n\n\n              E - 10km/h            \n\n\n\n06:00\n\n6°C\n\n\n\n\n91%\n\n\n\n0mm\n\n\n\n\n              E - 10km/h            \n\n\n\n07:00\n\n6°C\n\n\n\n\n91%\n\n\n\n0mm\n\n\n\n\n              E - 10km/h            \n\n\n\n08:00\n\n6°C\n\n\n\n\n90%\n\n\n\n0mm\n\n\n\n\n              E - 10km/h            \n\n\n\n09:00\n\n6°C\n\n\n\n\n89%\n\n\n\n0mm\n\n\n\n\n              E - 11km/h            \n\n\n\n10:00\n\n7°C\n\n\n\n\n85%\n\n\n\n0mm\n\n\n\n\n              E - 11km/h            \n\n\n\n11:00\n\n8°C\n\n\n\n\n81%\n\n\n\n0mm\n\n\n\n\n              E - 11km/h            \n\n\n\n12:00\n\n9°C\n\n\n\n\n77%\n\n\n\n0mm\n\n\n\n\n              E - 12km/h            \n\n\n\n13:00\n\n9°C\n\n\n\n\n77%\n\n\n\n0mm\n\n\n\n\n              E - 11km/h            \n\n\n\n14:00\n\n10°C\n\n\n\n\n77%\n\n\n\n0mm\n\n\n\n\n              E - 11km/h            \n\n\n\n15:00\n\n10°C\n\n\n\n\n77%\n\n\n\n0mm\n\n\n\n\n              E - 11km/h            \n\n\n\n16:00\n\n10°C\n\n\n\n\n78%\n\n\n\n0mm\n\n\n\n\n              E - 10km/h            \n\n\n\n17:00\n\n9°C\n\n\n\n\n80%\n\n\n\n0mm\n\n\n\n\n              E - 10km/h            \n\n\n\n18:00\n\n9°C\n\n\n\n\n82%\n\n\n\n0mm\n\n\n\n\n              E - 9km/h            \n\n\n\n19:00\n\n9°C\n\n\n\n\n85%\n\n\n\n0mm\n\n\n\n\n              E - 9km/h            \n\n\n\n20:00\n\n8°C\n\n\n\n\n88%\n\n\n\n0mm\n\n\n\n\n              E - 8km/h            \n\n\n\n21:00\n\n8°C\n\n\n\n\n91%\n\n\n\n0mm\n\n\n\n\n              E - 8km/h            \n\n\n\n22:00\n\n8°C\n\n\n\n\n92%\n\n\n\n0mm\n\n\n\n\n              E - 8km/h            \n\n\n\n23:00\n\n8°C\n\n\n\n\n94%\n\n\n\n0mm\n\n\n\n\n              E - 7km/h            \n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nComparativo\n\nComparativo entre a previsão de hoje e amanhã\n\n\n\n\n\n\n\nDado\nHoje\nAmanhã\n\n\n\n\n\n\n\nTemperatura Máxima\nTemperatura Máx.\n\n\n14°\n10°\n\n\n\n\n\nTemperatura Mínima\nTemperatura Mín.\n\n\n7°\n6°\n\n\n\n\n\nChuva (mm)\nChuva (mm)\n\n\n2mm\n0mm\n\n\n\n\n\nVento (km/h)\nVento (km/h)\n\n\n8\n11\n\n\n\n\n\nUmidade Máxima\nUmidade Máxima\n\n\n98%\n94%\n\n\n\n\n\t\t\tA previsão para hoje e amanhã indica queda de temperatura amanhã, com máxima passando de 14°C para 10°C. A chuva diminui amanhã, enquanto vento e umidade permanecem praticamente iguais.\n\t\t\n\n\n\n\n\n\n\n\n\n\nÍndices\n\n\n\n\n\n\n\n\nChurrasco\n\n\n\n\n\n\nTá valendo\n\n\nMesmo que as condições de tempo não sejam ideais, dá pra aproveitar o churrasco.\n\n\n\n\n\n\n\nMosquitos\n\n\n\n\n\n\n\n\nBaixo\n\n\nBaixa probabilidade de presença de mosquitos. Evite focos de água parada nas áreas externas.\n\n\n\n\n\n\n\nFrizz\n\n\n\n\n\n\nModerado\n\n\nUmidade moderada. O frizz pode aparecer. \n\n\n\n\n\n\n\n\n\n\nRessecamento da Pele\n\n\n\n\n\n\nNenhum alerta\n\n\nUmidade adequada no ar. Pouca chance de ressecamento e desconforto na pele exposta.\n\n\n\n\n\n\n\nGripe e Resfriado\n\n\n\n\n\n\nAlto\n\n\nFrio intenso ou tempo instável elevam o risco de infecções. Cuide-se e descanse bem.\n\n\n\n\n\n\n\nÍndice UV\n\n\n\n\n\n\nBaixo\n\n\nRadiação baixa e exposição segura. Ideal para curtir o dia com conforto e tranquilidade.\n\n\n\n\n\n\n\n\n\n\nVitamina D\n\n\n\n\n\n\n\n\nBaixa absorção\n\n\nPouca radiação solar disponível. O corpo pode ter mais dificuldade para sintetizar vitamina D.\n\n\n\n\n\n\n\nQualidade do Ar\n\n\n\n\n\n\nBom\n\n\nAr limpo e qualidade elevada para todos. Ideal para atividades ao ar livre e caminhadas.\n\n\n\n\n\n\n\n\n\nVeja também\n\n\n\n\n\n\n\n\n\n\n\n\t\t\tChuva Acumulada\n\t\t\t\n\n\n\n\nExplorar mapa\n\n\n\n\t\t\tRisco de Incêndio\n\t\t\t\n\n\n\n\nExplorar mapa\n\n\n\n\n\n\n\n\nConsulte a previsão do tempo para\n\t\t\t\t\t\t\tCuritiba - PR\n\t\t\t\t\t\t\te qualquer lugar do Brasil\n\n\n\n\n\nConteúdo em Vídeo\n\n\n\n\n\n\n\n\n\n\n\n\n\n\t\t\tExplore os mapas\n\t\t\n\n\n\nMapas\nExplore sua região no mapa\n\n\nPrevisão do tempo\n\n\nTemperatura\n\t\t\t\t\n\nChuva\n\t\t\t\t\n\nPressão\n\t\t\t\t\n\nUmidade Relativa\n\t\t\t\t\n\nAcumulado de Chuva\n\t\t\t\t\n\nVento\n\t\t\t\t\n\nRisco de Incêndio\n\t\t\t\t\n\n\n\nTempo agora\n\n\nSatélite\n\t\t\t\t\n\nChuva Agora\n\t\t\t\t\n\n\n\n\n\n\n\n\n\n\n\n\nClima, previsão do tempo amanhã e notícias em Curitiba - PR\n\nFAQ - Perguntas frequentes sobre chuva e temperatura\n\n\n\n\n\nQual a previsão do tempo para amanhã em Curitiba - PR?\n\n\n\n\nA previsão do tempo para amanhã é de temperaturas entre 6° e 10° e 0 em Curitiba - PR.\n\n\n\n\n\n\n\nQual a temperatura para amanhã em Curitiba - PR?\n\n\n\n\nA temperatura máxima é de 10° amanhã em Curitiba - PR.\n\n\n\n\n\n\n\nQual a média mensal de chuva?\n\n\n\n\nPara o mês de setembro, a média mensal de chuva é de 140 mm na cidade Curitiba - PR.Fonte: 30 anos de dados de reanálise ERA5.\n\n\n\n\n\n\n\nComo está o clima em Curitiba - PR em setembro/2026? Quanto já choveu?\n\n\n\n\nAté o dia 6, já choveu 60 mm em Curitiba em setembro/2026, o que representa 43% da média normal para o mês.Fonte: dados combinados de estações meteorológicas e satélite do Centro de Previsão de Tempo e Estudos Climáticos (CPTEC).Para obter mais informações sobre os dados climáticos, clique aqui.\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nProximidades\n\n\n\n\n\n\n\n\n\n\n          Aeroportos\n        \n\n          Cidades\n        \n\n\n\n\n\n\n\n                    Aeroporto de Bacacheri, PR\n                  \n\n\n\nMín/Max\n\n      12°\n  \n      12°\n  \n\n\n\nSens.\n      12°\n  \n\n\n\n\n\n\n\n                    Aeroporto Internacional Afonso Pena, PR\n                  \n\n\n\nMín/Max\n\n      12°\n  \n      12°\n  \n\n\n\nSens.\n      12°\n  \n\n\n\n\n\n\n\n                    Aeroporto de Paranaguá, PR\n                  \n\n\n\nMín/Max\n\n      16°\n  \n      16°\n  \n\n\n\nSens.\n      16°\n  \n\n\n\n\n\n\n\n                    Aeroporto de Joinville, SC\n                  \n\n\n\nMín/Max\n\n      17°\n  \n      17°\n  \n\n\n\nSens.\n      17°\n  \n\n\n\n\n\n\n\n\n\n\n\n                    Pinhais, PR\n                  \n\n\n\nMín/Max\n\n      12°\n  \n      12°\n  \n\n\n\nSens.\n      12°\n  \n\n\n\n\n\n\n\n                    São José dos Pinhais, PR\n                  \n\n\n\nMín/Max\n\n      12°\n  \n      12°\n  \n\n\n\nSens.\n      12°\n  \n\n\n\n\n\n\n\n                    Almirante Tamandaré, PR\n                  \n\n\n\nMín/Max\n\n      13°\n  \n      13°\n  \n\n\n\nSens.\n      11°\n  \n\n\n\n\n\n\n\n                    Piraquara, PR\n                  \n\n\n\nMín/Max\n\n      12°\n  \n      12°\n  \n\n\n\nSens.\n      11°\n  \n\n\n\n\n\n\n\n                    Colombo, PR\n                  \n\n\n\nMín/Max\n\n      12°\n  \n      12°\n  \n\n\n\nSens.\n      11°\n  \n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nÚltimas notícias\n\n\n\n\n\n\n\n\n\nFrio\nNova virada no tempo muda o cenário no Centro-Sul nos próximos dias\n\n\n\n\n\nCalor\nClimatização inteligente: como criar uma rotina mais confortável em casa\n\n\n\nFim De Semana\nPrevisão Fim de Semana (05 e 06/09): Temporais e queda de temperatura em parte do país\n\n\n\nFrio\nFim de semana prolongado com frio intenso. Risco de geada e de precipitação invernal no Sul.\n\n\n\n\n\n    Ver mais notícias\n  \n\n\n\n\n\n\n\n\t\t\t\tRecomendados para você\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nÍndices\n\n\n\n\n\n\n\n\nChurrasco\n\n\n\n\n\n\nTá valendo\n\n\nMesmo que as condições de tempo não sejam ideais, dá pra aproveitar o churrasco.\n\n\n\n\n\n\n\nMosquitos\n\n\n\n\n\n\n\n\nBaixo\n\n\nBaixa probabilidade de presença de mosquitos. Evite focos de água parada nas áreas externas.\n\n\n\n\n\n\n\nFrizz\n\n\n\n\n\n\nModerado\n\n\nUmidade moderada. O frizz pode aparecer. \n\n\n\n\n\n\n\n\n\n\nRessecamento da Pele\n\n\n\n\n\n\nNenhum alerta\n\n\nUmidade adequada no ar. Pouca chance de ressecamento e desconforto na pele exposta.\n\n\n\n\n\n\n\nGripe e Resfriado\n\n\n\n\n\n\nAlto\n\n\nFrio intenso ou tempo instável elevam o risco de infecções. Cuide-se e descanse bem.\n\n\n\n\n\n\n\nÍndice UV\n\n\n\n\n\n\nBaixo\n\n\nRadiação baixa e exposição segura. Ideal para curtir o dia com conforto e tranquilidade.\n\n\n\n\n\n\n\n\n\n\nVitamina D\n\n\n\n\n\n\n\n\nBaixa absorção\n\n\nPouca radiação solar disponível. O corpo pode ter mais dificuldade para sintetizar vitamina D.\n\n\n\n\n\n\n\nQualidade do Ar\n\n\n\n\n\n\nBom\n\n\nAr limpo e qualidade elevada para todos. Ideal para atividades ao ar livre e caminhadas.\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nBaixe os apps\nClimatempo\n\n\n\n\n\n\n\n\n\nSiga-nos\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nPrevisão\nBrasil\nAgora\nHoje\nAmanhã\nFim de semana\n15 dias\nPraias\nAeroportos\nHub de Cidades\nHoje\nAmanhã\n15 dias\nFim de semana\nClima\nHistóricos de clima - Dataclima\nRelclima\nPodcasts\nDiferença entre clima e tempo\nChuva\nChuva Agora\nRadar RJ\nOutros radares\nChuva prevista\nChuva acumulada\n\n\n\n\nMapas\nTemperatura\nChuva\nAcumulado de chuva\nPressão\nUmidade relativa\nVento\nRisco de Incêndio\nSatélite\nChuva Agora\nGráficos\nPrevisão de chuva\nPrevisão de temperatura\nPrevisão de umidade\nVento hora a hora\nÍndice UV\nTábua de marés\nClimatologia\n\n\n\n\nNotícias\nÚltimas notícias\nAgroclima\nAlimentação\nSaúde\nAlertas\nSustentabilidade\nAgroclima - Boletim Semanal de previsão do tempo\nNegócios\nModa\nEnergia\nInfraestrutura\nGoverno\nMudanças Climáticas\nSul\nSudeste\nCentro-Oeste\nNordeste\nNorte\nFrio\nTemporal\nCalor\nCiclone\nEl Niño\nLa Niña\nTurismo\nRadar RS\nCarnaval\nPodcasts\nO Clima Entre Nós\nAgrotalk\nEstúdioAgro\nVídeos\n\n\n\n\nCanais\nSustentabilidade\nAgroclima\nAgrotalk\nRádio\nProdutos\nSMAC\nAgroclima PRO\nAPI\nLevantamento de dados\nOcean Report\nRelclima\nWeather Index\n\n\n\n\nConfira também\nParticipe\nTempo no seu site\n\n\n\n\nContato\nCompliance\nAnuncie\nFale conosco\nPolítica de privacidade\nChange privacy settings\nFAQ\nTermos de uso\nAPI de previsão de tempo\n\n\n\nCopyright 2026 - Climatempo. Todos os direitos reservados.\n\n\n\n\n\nPrevisão em vídeo\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n+ mais vídeos\n\n\n\n\n\nX\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n+ mais notícias\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nAviso de Chuva\n\n\n\n\n\n\n\nMuito forte - acima de 50 mm\n\n\n              A previsão indica chuva volumosa para o dia na cidade Curitiba, com valores iguais ou superiores a 50 mm.\n            \n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nAviso de Umidade\n\n\n            Valor menor ou igual a 30%\n          \n\n            A previsão indica baixa umidade relativa do ar para o dia na cidade Curitiba, com valores iguais ou inferiores a 30%.\n          \n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nAviso de Vento\n\n\n            Valor igual ou superior a 50 km/h\n          \n\n            A previsão indica períodos de ventos fortes para o dia na cidade Curitiba, com valores iguais ou superiores a 50 km/h.\n          \n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nAviso de Temperatura\n\n\n            Valor menor ou igual a 10°C\n          \n\n            A previsão indica temperatura muito baixa para o dia na cidade Curitiba, com valores iguais ou inferiores a 10°C.\n          \n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nAviso de Temperatura\n\n\n            Valor igual ou superior a 35°C\n          \n\n            A previsão indica temperatura muito alta para o dia na cidade Curitiba, com valores iguais ou superiores a 35°C.\n          \n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\nNíveis de chuva\n\n\n\n\n\n\n\nSem chuva\n0 mm\n\n\n\n\n\n\n\nFraca\n1 - 10 mm\n\n\n\n\n\n\n\nModerada\n11 - 29 mm\n\n\n\n\n\n\n\nForte\n30 - 49mm\n\n\n\n\n\n\n\nMuito forte\na partir de 50mm\n\n\n\n\n\n\n\n\n\n\n\n\nComo permitir acesso a sua localização?\n\nPara acessar previsões mais precisas, ative a permissão de localização no seu navegador.\n\n\n\n\n\n\nBusca recente\n\nVocê não possui buscas recentes\n\n\n\nCidades favoritas\n\nVocê não possui cidades favoritas\n\n\n\n\nUsar minha localização atual\n\n\n\n\n\n\n\n\n\n\n"
+    },
+    {
+      "role": "assistant",
+      "content": "Amanhã em Curitiba (07/09), segundo o Climatempo, o dia será **mais frio que hoje**:\n\n- **Temperatura:** mínima de **6°C** e máxima de **10°C** (sensação térmica entre 4°C e 6°C)\n- **Céu:** sol com muitas nuvens durante o dia, períodos nublados e noite com muitas nuvens\n- **Chuva:** sem previsão de chuva (0 mm)\n- **Umidade:** entre 77% e 94%\n- **Vento:** leste, em torno de 11 km/h, com rajadas de até 36 km/h\n\nOu seja, um dia frio e sem chuva — leve um casaco! 🧥",
+      "reasoning_details": [
+        {
+          "type": "reasoning.text",
+          "text": "I got the weather info from Climatempo for Curitiba. The forecast for tomorrow (07/09) shows:\n\n- Amanhã será mais frio que hoje\n- Sol com muitas nuvens durante o dia e períodos de céu nublado. Noite com muitas nuvens.\n- Temperatura: mínima 6°C, máxima 10°C\n- Sensação térmica: 4°C a 6°C\n- Chuva: 0mm (sem chuva)\n- Umidade: 77% a 94%\n- Vento: E - 11km/h, rajadas até 36km/h\n\nI should respond in Portuguese.",
+          "format": "unknown",
+          "index": 0
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": "Escreve um poema sobre esse clima frio de Curitiba."
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_current_timestamp",
+        "description": "Get the current Unix timestamp in seconds.",
+        "parameters": {
+          "properties": {},
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "calculate_timestamp",
+        "description": "Get the current Unix timestamp, optionally adjusted by days, weeks, months, or years.\nUse this to calculate timestamps for date filtering in search functions.\nExamples: \"last week\" = weeks_ago=1, \"3 days ago\" = days_ago=3, \"a year ago\" = years_ago=1",
+        "parameters": {
+          "properties": {
+            "days_ago": {
+              "default": 0,
+              "description": "Number of days to subtract from current time (default: 0)",
+              "type": "integer"
+            },
+            "weeks_ago": {
+              "default": 0,
+              "description": "Number of weeks to subtract from current time (default: 0)",
+              "type": "integer"
+            },
+            "months_ago": {
+              "default": 0,
+              "description": "Number of months to subtract from current time (default: 0)",
+              "type": "integer"
+            },
+            "years_ago": {
+              "default": 0,
+              "description": "Number of years to subtract from current time (default: 0)",
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_knowledge_bases",
+        "description": "List the user's accessible knowledge bases so a relevant internal source\ncan be chosen.",
+        "parameters": {
+          "properties": {
+            "count": {
+              "default": 10,
+              "description": "Maximum number of KBs to return (default: 10)",
+              "type": "integer"
+            },
+            "skip": {
+              "default": 0,
+              "description": "Number of results to skip for pagination (default: 0)",
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_knowledge_bases",
+        "description": "Search the user's accessible knowledge bases by name and description to find\na relevant internal source.",
+        "parameters": {
+          "properties": {
+            "query": {
+              "description": "The search query to find matching knowledge bases",
+              "type": "string"
+            },
+            "count": {
+              "default": 5,
+              "description": "Maximum number of results to return (default: 5)",
+              "type": "integer"
+            },
+            "skip": {
+              "default": 0,
+              "description": "Number of results to skip for pagination (default: 0)",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "query_knowledge_bases",
+        "description": "Search knowledge bases by semantic similarity to query.\nFinds KBs whose name/description match the meaning of your query.\nHelpful for discovering which knowledge base to query next.",
+        "parameters": {
+          "properties": {
+            "query": {
+              "description": "Natural language query describing what you're looking for",
+              "type": "string"
+            },
+            "count": {
+              "default": 5,
+              "description": "Maximum results (default: 5)",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "grep_knowledge_files",
+        "description": "Search for exact text across knowledge files. Returns matching lines with line numbers.\nUnlike query_knowledge_files (semantic/vector search), this performs exact string matching.\nAutomatically detects regex patterns (e.g. \"error|warn\", \"version \\d+\").\nHelpful for literal strings, identifiers, error messages, or regex-style searches.",
+        "parameters": {
+          "properties": {
+            "pattern": {
+              "description": "The text pattern to search for (regex auto-detected)",
+              "type": "string"
+            },
+            "file_id": {
+              "description": "Optional file ID to search within a single file only",
+              "type": "string"
+            },
+            "case_insensitive": {
+              "default": false,
+              "description": "If true, ignore case when matching (default: false)",
+              "type": "boolean"
+            },
+            "count_only": {
+              "default": false,
+              "description": "If true, return only match counts per file (default: false)",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "pattern"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_knowledge_files",
+        "description": "Search files by filename across knowledge bases the user has access to.\nWhen the model has attached knowledge, searches only within attached KBs and files.\nHelpful when looking for a specific document or file name.",
+        "parameters": {
+          "properties": {
+            "query": {
+              "description": "The search query to find matching files by filename",
+              "type": "string"
+            },
+            "knowledge_id": {
+              "description": "Optional KB id to limit search to a specific knowledge base",
+              "type": "string"
+            },
+            "count": {
+              "default": 5,
+              "description": "Maximum number of results to return (default: 5)",
+              "type": "integer"
+            },
+            "skip": {
+              "default": 0,
+              "description": "Number of results to skip for pagination (default: 0)",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "query_knowledge_files",
+        "description": "Search knowledge base files using semantic/vector search. Searches across collections (KBs),\nindividual files, and notes that the user has access to.\nHelpful for internal documentation, uploaded knowledge, and attached model knowledge.",
+        "parameters": {
+          "properties": {
+            "query": {
+              "description": "The search query to find semantically relevant content",
+              "type": "string"
+            },
+            "knowledge_ids": {
+              "description": "Optional list of KB ids to limit search to specific knowledge bases",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "count": {
+              "default": 5,
+              "description": "Maximum number of results to return (default: 5)",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "view_knowledge_file",
+        "description": "Get the content of a file from a knowledge base. Supports pagination for large files.",
+        "parameters": {
+          "properties": {
+            "file_id": {
+              "description": "The ID of the file to retrieve",
+              "type": "string"
+            },
+            "offset": {
+              "default": 0,
+              "description": "Character offset to start reading from (default: 0)",
+              "type": "integer"
+            },
+            "max_chars": {
+              "default": 10000,
+              "description": "Maximum characters to return (a server-side hard cap applies)",
+              "type": "integer"
+            },
+            "line_numbers": {
+              "default": false,
+              "description": "If true, prefix each line with its 1-indexed line number",
+              "type": "boolean"
+            },
+            "start_line": {
+              "description": "Optional 1-indexed start line (overrides offset/max_chars when set)",
+              "type": "integer"
+            },
+            "end_line": {
+              "description": "Optional 1-indexed end line (inclusive)",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "file_id"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_chats",
+        "description": "Search the user's previous chat conversations by title and message content.\nHelpful for finding details from earlier conversations.",
+        "parameters": {
+          "properties": {
+            "query": {
+              "description": "The search query to find matching chats",
+              "type": "string"
+            },
+            "count": {
+              "default": 5,
+              "description": "Maximum number of results to return (default: 5)",
+              "type": "integer"
+            },
+            "start_timestamp": {
+              "description": "Only include chats updated after this Unix timestamp (seconds)",
+              "type": "integer"
+            },
+            "end_timestamp": {
+              "description": "Only include chats updated before this Unix timestamp (seconds)",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "view_chat",
+        "description": "Get the full conversation history of a chat by its ID after a relevant\nprevious chat has been identified.",
+        "parameters": {
+          "properties": {
+            "chat_id": {
+              "description": "The ID of the chat to retrieve",
+              "type": "string"
+            }
+          },
+          "required": [
+            "chat_id"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "delegate_task",
+        "description": "Delegate focused work to a parallel sub-agent using the current model and tools.",
+        "parameters": {
+          "properties": {
+            "task": {
+              "description": "The specific task for the sub-agent to complete",
+              "type": "string"
+            },
+            "context": {
+              "default": "",
+              "description": "Relevant context, decisions, or file paths for the task",
+              "type": "string"
+            }
+          },
+          "required": [
+            "task"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "timer",
+        "description": "Set a one-shot timer for this chat.",
+        "parameters": {
+          "properties": {
+            "prompt": {
+              "description": "The prompt to send back into this chat when the timer fires",
+              "type": "string"
+            },
+            "at": {
+              "description": "Relative time like 10s, 5m, 1h, 2d, or a timezone-aware RFC 3339 timestamp",
+              "type": "string"
+            },
+            "cancel_on": {
+              "description": "Optional events that cancel the timer before it fires",
+              "items": {
+                "enum": [
+                  "chat.read",
+                  "chat.user_message"
+                ],
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "prompt",
+            "at"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_memories",
+        "description": "Search or browse saved memories by content, path, type, or memory ID.",
+        "parameters": {
+          "properties": {
+            "query": {
+              "default": "",
+              "description": "Optional query to search memory content and path",
+              "type": "string"
+            },
+            "count": {
+              "default": 5,
+              "description": "Number of memories to return (default 5)",
+              "type": "integer"
+            },
+            "type": {
+              "default": "all",
+              "description": "\"user\", \"context\", or \"all\"",
+              "type": "string"
+            },
+            "path": {
+              "description": "Optional memory path to search around",
+              "type": "string"
+            },
+            "memory_id": {
+              "description": "Optional exact memory ID to read",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_memory_paths",
+        "description": "List saved memory paths to find existing memory groups before writing or moving memories.",
+        "parameters": {
+          "properties": {
+            "query": {
+              "default": "",
+              "description": "Optional query to filter memory paths or contents",
+              "type": "string"
+            },
+            "count": {
+              "default": 100,
+              "description": "Maximum number of paths to return",
+              "type": "integer"
+            },
+            "type": {
+              "default": "all",
+              "description": "\"user\", \"context\", or \"all\"",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "read_memory_path",
+        "description": "Read saved memories at a memory path, including nearby parent and child paths.",
+        "parameters": {
+          "properties": {
+            "path": {
+              "description": "Memory path to read",
+              "type": "string"
+            },
+            "count": {
+              "default": 50,
+              "description": "Maximum number of memories to return",
+              "type": "integer"
+            },
+            "type": {
+              "default": "all",
+              "description": "\"user\", \"context\", or \"all\"",
+              "type": "string"
+            },
+            "include_children": {
+              "default": true,
+              "description": "Include memories under child paths",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_memories",
+        "description": "List all stored memories for the user, including IDs and timestamps.",
+        "parameters": {
+          "properties": {},
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "update_memory",
+        "description": "Apply a batch of memory changes after learning enduring information.\n\nUse type \"user\" for facts, preferences, or instructions about the user.\nUse type \"context\" for other durable context that may help future chats.\nDo not save one-off activity, meals, routine daily events, temporary mood, or other short-lived details\nunless the user explicitly asks you to remember them.\nPath is optional. Use it as a stable memory address to group related memories.\nPrefer an existing path from list_memory_paths when one fits.\nLeave path empty when no useful grouping is clear.\n\nOperation shapes:\n- {\"action\": \"add\", \"content\": \"...\", \"type\": \"user\"|\"context\", \"path\": \"...\"}\n- {\"action\": \"replace\", \"id\": \"...\", \"content\": \"...\", \"type\": \"user\"|\"context\", \"path\": \"...\"}\n- {\"action\": \"move\", \"id\": \"...\", \"path\": \"...\"}\n- {\"action\": \"remove\", \"id\": \"...\"}",
+        "parameters": {
+          "properties": {
+            "operations": {
+              "description": "Memory operations to apply in one request",
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "operations"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "add_memory",
+        "description": "Save enduring information that can improve future chats.\n\nSave stable preferences, goals, projects, relationships, habits, and standing instructions.\nDo not save one-off activity, meals, routine daily events, temporary mood, or other short-lived details\nunless the user explicitly asks you to remember them.",
+        "parameters": {
+          "properties": {
+            "content": {
+              "description": "The memory content to store",
+              "type": "string"
+            },
+            "type": {
+              "default": "user",
+              "description": "Use \"user\" for facts/preferences about the user, or \"context\" for other durable context",
+              "type": "string"
+            },
+            "path": {
+              "description": "Optional stable memory address for grouping related memories",
+              "type": "string"
+            }
+          },
+          "required": [
+            "content"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "replace_memory_content",
+        "description": "Update an existing saved memory by its ID when its content needs correction.",
+        "parameters": {
+          "properties": {
+            "memory_id": {
+              "description": "The ID of the memory to update",
+              "type": "string"
+            },
+            "content": {
+              "description": "The new content for the memory",
+              "type": "string"
+            },
+            "type": {
+              "description": "Optional \"user\" or \"context\" type for the updated memory",
+              "type": "string"
+            },
+            "path": {
+              "description": "Optional stable memory address for grouping related memories",
+              "type": "string"
+            }
+          },
+          "required": [
+            "memory_id",
+            "content"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "delete_memory",
+        "description": "Delete a saved memory by its ID.",
+        "parameters": {
+          "properties": {
+            "memory_id": {
+              "description": "The ID of the memory to delete",
+              "type": "string"
+            }
+          },
+          "required": [
+            "memory_id"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_web",
+        "description": "Search the public web for information. Best for current events, external references,\nor topics not covered in internal documents.",
+        "parameters": {
+          "properties": {
+            "query": {
+              "description": "The search query to look up",
+              "type": "string"
+            },
+            "count": {
+              "description": "Number of results to return (default: admin-configured value)",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "fetch_url",
+        "description": "Fetch and extract the main text content from a web page URL.",
+        "parameters": {
+          "properties": {
+            "url": {
+              "description": "The URL to fetch content from",
+              "type": "string"
+            }
+          },
+          "required": [
+            "url"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "execute_code",
+        "description": "Execute Python code in a sandboxed environment and return the output.\nUse this to perform calculations, data analysis, generate visualizations,\nor run any Python code that would help answer the user's question.",
+        "parameters": {
+          "properties": {
+            "code": {
+              "description": "The Python code to execute",
+              "type": "string"
+            }
+          },
+          "required": [
+            "code"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_notes",
+        "description": "Search the user's saved notes by title and content.",
+        "parameters": {
+          "properties": {
+            "query": {
+              "description": "The search query to find matching notes",
+              "type": "string"
+            },
+            "count": {
+              "default": 5,
+              "description": "Maximum number of results to return (default: 5)",
+              "type": "integer"
+            },
+            "start_timestamp": {
+              "description": "Only include notes updated after this Unix timestamp (seconds)",
+              "type": "integer"
+            },
+            "end_timestamp": {
+              "description": "Only include notes updated before this Unix timestamp (seconds)",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "view_note",
+        "description": "Get the full content of a note by its ID.",
+        "parameters": {
+          "properties": {
+            "note_id": {
+              "description": "The ID of the note to retrieve",
+              "type": "string"
+            }
+          },
+          "required": [
+            "note_id"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "write_note",
+        "description": "Create a new note with the given title and content.",
+        "parameters": {
+          "properties": {
+            "title": {
+              "description": "The title of the new note",
+              "type": "string"
+            },
+            "content": {
+              "description": "The markdown content for the note",
+              "type": "string"
+            }
+          },
+          "required": [
+            "title",
+            "content"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "replace_note_content",
+        "description": "Update an existing note by replacing the whole markdown content or applying range operations.",
+        "parameters": {
+          "properties": {
+            "note_id": {
+              "description": "The ID of the note to update",
+              "type": "string"
+            },
+            "content": {
+              "description": "The new markdown content for a whole-note update",
+              "type": "string"
+            },
+            "operations": {
+              "description": "Optional note operations:",
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "title": {
+              "description": "Optional new title for the note",
+              "type": "string"
+            }
+          },
+          "required": [
+            "note_id"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "create_tasks",
+        "description": "Create a visible task checklist for multi-step work so progress can be shown in chat.",
+        "parameters": {
+          "properties": {
+            "tasks": {
+              "description": "List of task items. Each item: content (string, required), status (pending|in_progress|completed|cancelled, default pending), id (optional, auto-generated).",
+              "items": {
+                "properties": {
+                  "id": {
+                    "description": "Unique identifier for the task. Auto-generated if omitted.",
+                    "type": "string"
+                  },
+                  "content": {
+                    "description": "Task description.",
+                    "type": "string"
+                  },
+                  "status": {
+                    "default": "pending",
+                    "description": "Task status.",
+                    "enum": [
+                      "pending",
+                      "in_progress",
+                      "completed",
+                      "cancelled"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "content"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "tasks"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "update_task",
+        "description": "Mark a single visible task item as completed, in_progress, pending, or cancelled.",
+        "parameters": {
+          "properties": {
+            "id": {
+              "description": "The task ID to update",
+              "type": "string"
+            },
+            "status": {
+              "default": "completed",
+              "description": "New status: completed, in_progress, pending, or cancelled (default: completed)",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "create_automation",
+        "description": "Create a scheduled automation that runs a prompt on a recurring or one-time schedule.\nUse this when the user wants to schedule a task to run automatically.\nThe automation will use the current chat model.\n\nThe rrule parameter must be a valid iCalendar RRULE string. Common examples:\n- Every day at 9am: \"DTSTART:20250101T090000\\nRRULE:FREQ=DAILY\"\n- Every Monday at 8am: \"DTSTART:20250106T080000\\nRRULE:FREQ=WEEKLY;BYDAY=MO\"\n- Every hour: \"RRULE:FREQ=HOURLY;INTERVAL=1\"\n- Every 30 minutes: \"RRULE:FREQ=MINUTELY;INTERVAL=30\"\n- Once at a specific time: \"DTSTART:20250415T140000\\nRRULE:FREQ=DAILY;COUNT=1\"\n- First day of every month: \"DTSTART:20250101T090000\\nRRULE:FREQ=MONTHLY;BYMONTHDAY=1\"\n\nThe DTSTART time should reflect the desired execution time. Use COUNT=1 for one-time automations.",
+        "parameters": {
+          "properties": {
+            "name": {
+              "description": "A short descriptive name for the automation",
+              "type": "string"
+            },
+            "prompt": {
+              "description": "The prompt/instructions to execute on each run",
+              "type": "string"
+            },
+            "rrule": {
+              "description": "An iCalendar RRULE string defining the schedule",
+              "type": "string"
+            },
+            "folder_id": {
+              "description": "Optional owner-owned folder ID for generated chats",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "prompt",
+            "rrule"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "update_automation",
+        "description": "Update an existing automation. Only the provided fields are changed; omitted fields stay the same.",
+        "parameters": {
+          "properties": {
+            "automation_id": {
+              "description": "The ID of the automation to update",
+              "type": "string"
+            },
+            "name": {
+              "description": "New name for the automation (optional)",
+              "type": "string"
+            },
+            "prompt": {
+              "description": "New prompt/instructions (optional)",
+              "type": "string"
+            },
+            "rrule": {
+              "description": "New iCalendar RRULE schedule string (optional). See create_automation for format examples.",
+              "type": "string"
+            },
+            "model_id": {
+              "description": "New model ID to use (optional)",
+              "type": "string"
+            },
+            "folder_id": {
+              "description": "New owner-owned folder ID (optional); pass an empty string to clear",
+              "type": "string"
+            }
+          },
+          "required": [
+            "automation_id"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_automations",
+        "description": "List the user's scheduled automations.",
+        "parameters": {
+          "properties": {
+            "status": {
+              "description": "Filter by status: \"active\", \"paused\", or omit for all",
+              "type": "string"
+            },
+            "folder_id": {
+              "description": "Optional owner-owned folder ID filter; pass an empty string to clear the folder filter",
+              "type": "string"
+            },
+            "count": {
+              "default": 10,
+              "description": "Maximum number of automations to return (default: 10)",
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "toggle_automation",
+        "description": "Pause or resume a scheduled automation. If active, it will be paused. If paused, it will be resumed.",
+        "parameters": {
+          "properties": {
+            "automation_id": {
+              "description": "The ID of the automation to toggle",
+              "type": "string"
+            }
+          },
+          "required": [
+            "automation_id"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "delete_automation",
+        "description": "Delete a scheduled automation and all its run history.",
+        "parameters": {
+          "properties": {
+            "automation_id": {
+              "description": "The ID of the automation to delete",
+              "type": "string"
+            }
+          },
+          "required": [
+            "automation_id"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_calendar_events",
+        "description": "Search calendar events, reminders, and scheduled items by text and/or date range.\nHelpful for finding upcoming events, reminders, or schedule items.",
+        "parameters": {
+          "properties": {
+            "query": {
+              "description": "Search text to match against event title, description, or location (optional)",
+              "type": "string"
+            },
+            "start": {
+              "description": "Only return events starting at or after this datetime, e.g. \"2026-04-20 00:00\" (optional)",
+              "type": "string"
+            },
+            "end": {
+              "description": "Only return events starting before this datetime, e.g. \"2026-04-27 00:00\" (optional)",
+              "type": "string"
+            },
+            "count": {
+              "default": 10,
+              "description": "Maximum number of events to return (default: 10)",
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "create_calendar_event",
+        "description": "Create a calendar event, reminder, or alarm. Use this when the user wants to\nschedule an event, set a reminder, create an alarm, or says things like\n\"remind me\", \"don't let me forget\", \"notify me at\", or \"add to my calendar\".\nFor simple reminders, omit end/location/all_day and set reminder_minutes to 0.",
+        "parameters": {
+          "properties": {
+            "title": {
+              "description": "Event or reminder title (e.g. \"Team standup\", \"Take medicine\", \"Call mom\")",
+              "type": "string"
+            },
+            "start": {
+              "description": "Start datetime in the user's local time (e.g. \"2026-04-20 09:00\")",
+              "type": "string"
+            },
+            "end": {
+              "description": "End datetime in the user's local time (optional — omit for reminders or point-in-time events)",
+              "type": "string"
+            },
+            "description": {
+              "description": "Event description or notes (optional)",
+              "type": "string"
+            },
+            "calendar_id": {
+              "description": "Target calendar ID (optional, uses default calendar if omitted)",
+              "type": "string"
+            },
+            "all_day": {
+              "default": false,
+              "description": "Whether this is an all-day event (default: false)",
+              "type": "boolean"
+            },
+            "location": {
+              "description": "Event location (optional)",
+              "type": "string"
+            },
+            "reminder_minutes": {
+              "description": "Minutes before the event to send a notification (optional, default: 10). Use 0 for \"at time of event\", -1 for no notification.",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "title",
+            "start"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "update_calendar_event",
+        "description": "Update an existing calendar event. Only provided fields are changed;\nomitted fields stay the same.",
+        "parameters": {
+          "properties": {
+            "event_id": {
+              "description": "The ID of the event to update",
+              "type": "string"
+            },
+            "title": {
+              "description": "New event title (optional)",
+              "type": "string"
+            },
+            "description": {
+              "description": "New event description (optional)",
+              "type": "string"
+            },
+            "start": {
+              "description": "New start datetime string in your local time, e.g. \"2026-04-20 09:00\" (optional)",
+              "type": "string"
+            },
+            "end": {
+              "description": "New end datetime string in your local time (optional)",
+              "type": "string"
+            },
+            "all_day": {
+              "description": "Whether this is an all-day event (optional)",
+              "type": "boolean"
+            },
+            "location": {
+              "description": "New event location (optional)",
+              "type": "string"
+            },
+            "is_cancelled": {
+              "description": "Set to true to cancel the event (optional)",
+              "type": "boolean"
+            },
+            "reminder_minutes": {
+              "description": "Minutes before the event to send a reminder notification (optional). Use 0 for \"at time of event\", -1 for no reminder. Accepts any positive integer for custom timing (e.g. 120 for 2 hours before).",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "event_id"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "delete_calendar_event",
+        "description": "Delete a calendar event permanently.",
+        "parameters": {
+          "properties": {
+            "event_id": {
+              "description": "The ID of the event to delete",
+              "type": "string"
+            }
+          },
+          "required": [
+            "event_id"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "notify",
+        "description": "Send a notification to the user's configured notification target.",
+        "parameters": {
+          "properties": {
+            "message": {
+              "description": "Notification body.",
+              "type": "string"
+            },
+            "target": {
+              "default": "",
+              "description": "Optional target id or name. Empty uses the default target.",
+              "type": "string"
+            },
+            "title": {
+              "default": "",
+              "description": "Optional notification title.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "message"
+          ],
+          "type": "object"
+        }
+      }
+    }
+  ]
+}'

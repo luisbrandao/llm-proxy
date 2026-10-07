@@ -176,9 +176,12 @@ routing:
 # llm_proxy_trims_total{model}.
 trim:
   enabled: true
-  # Token estimate = serialized JSON chars / chars_per_token. 3 over-counts on
-  # purpose — trimming a little early beats forwarding a 512 KB conversation to
-  # a paid backend. Raise towards 4 for mostly-English chats if it is too eager.
+  # The tokenizer.json tokens are counted with. The image bakes Qwen's in here
+  # (every local model is Qwen3.5+); a relative path is taken from this file's
+  # directory. "" — or a file that will not load — falls back to chars_per_token.
+  tokenizer: /app/tokenizers/qwen3.8.json
+  # The fallback estimate = serialized JSON chars / chars_per_token. 3 over-counts
+  # source code but under-counts digit-heavy output; it is only the fallback.
   chars_per_token: 3.0
   response_headroom: 4000       # tokens kept free below num_ctx for the reply
   max_tool_result_tokens: 4000  # tool results above this (and old) are excerpted; 0 = never
