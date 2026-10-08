@@ -451,10 +451,14 @@ def _status(result: dict) -> int:
 
 def _envelope(ident: str, model: str, message: dict, finish: str, usage: dict) -> dict:
     # Cached prompt tokens are still prompt tokens; the CLI reports them apart.
-    prompt_tokens = sum(
-        int(usage.get(k) or 0)
-        for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
-    )
+    # They are kept apart too, in the OpenAI `prompt_tokens_details` spelling the
+    # proxy's usage parser reads, so the Costs tab's cache figures cover this
+    # backend as well. No `cost`: the CLI's `total_cost_usd` is a list-price
+    # estimate of usage drawn from a subscription seat, not a charge, and
+    # reporting it as one would make the ledger lie.
+    cache_read = int(usage.get("cache_read_input_tokens") or 0)
+    cache_write = int(usage.get("cache_creation_input_tokens") or 0)
+    prompt_tokens = int(usage.get("input_tokens") or 0) + cache_read + cache_write
     completion_tokens = int(usage.get("output_tokens") or 0)
     return {
         "id": f"chatcmpl-{ident}",
@@ -466,6 +470,10 @@ def _envelope(ident: str, model: str, message: dict, finish: str, usage: dict) -
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
+            "prompt_tokens_details": {
+                "cached_tokens": cache_read,
+                "cache_write_tokens": cache_write,
+            },
         },
     }
 

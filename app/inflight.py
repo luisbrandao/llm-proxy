@@ -51,6 +51,7 @@ from typing import Optional
 
 from app import clientinfo
 from app import config as conf
+from app.usage import Usage
 
 _ids = count(1)
 # id -> live Entry. Dicts keep insertion order, so the live set is arrival-ordered.
@@ -75,6 +76,7 @@ class Entry:
         "native_model", "candidates", "attempt", "slot_at", "chunks",
         "task", "stream_task", "cancelled", "status", "in_tokens", "out_tokens",
         "skipped", "estimated", "upstream_secs", "trimmed",
+        "cached", "cache_write", "reasoning", "cost", "currency",
     )
 
     def __init__(self, model, stream, op, method, path, req_bytes, client_ip, svc):
@@ -118,6 +120,14 @@ class Entry:
         # True while out_tokens is our own live count rather than the upstream's
         # reported usage, so the console can render it as approximate.
         self.estimated = False
+        # The rest of what the backend's usage block said, once it arrives (see
+        # app/usage.py): prompt-cache reads and writes, thinking tokens, and the
+        # price — None until reported, and None for a backend that never does.
+        self.cached = 0
+        self.cache_write = 0
+        self.reasoning = 0
+        self.cost = None
+        self.currency = None
         # How long the upstream exchange took, as measured by the handler and
         # handed to `record` — the very number the request log divides by for
         # `speed_tps`. None until the response is complete; until then the
@@ -176,7 +186,7 @@ class Entry:
         self.out_tokens = (self.out_tokens or 0) + 1
         self.estimated = True
 
-    def record(self, status: int, in_tokens: int = 0, out_tokens: int = 0,
+    def record(self, status: int, usage: Optional[Usage] = None,
                duration: Optional[float] = None) -> None:
         """Note the outcome, from whichever handler saw the upstream response.
 
@@ -187,7 +197,8 @@ class Entry:
         Reported usage supersedes the live estimate — but only when it says
         something. A backend that never sends usage reports 0 here, and zeroing a
         count we watched tick up would be strictly worse information, so a 0 keeps
-        the estimate (and its flag).
+        the estimate (and its flag). The cost and cache figures have no live
+        estimate to protect and are taken as reported.
 
         `duration` is the handler's own measurement of the upstream exchange, the
         value the request log divides by. Taking it here rather than reading a
@@ -197,11 +208,18 @@ class Entry:
         self.status = status
         if duration is not None:
             self.upstream_secs = duration
-        if in_tokens:
-            self.in_tokens = in_tokens
-        if out_tokens:
-            self.out_tokens = out_tokens
+        if usage is None:
+            return
+        if usage.prompt:
+            self.in_tokens = usage.prompt
+        if usage.completion:
+            self.out_tokens = usage.completion
             self.estimated = False
+        self.cached = usage.cached
+        self.cache_write = usage.cache_write
+        self.reasoning = usage.reasoning
+        self.cost = usage.cost
+        self.currency = usage.currency
 
     def set_request(self, body_str: str) -> None:
         """Attach the prompt this request sent, truncated to INFLIGHT_BODY_LIMIT."""
@@ -357,6 +375,13 @@ class Entry:
             "in_tokens": self.in_tokens,
             "out_tokens": self.out_tokens,
             "estimated": self.estimated,
+            # From the backend's usage block (app/usage.py). `cost` is None until
+            # reported — and stays None for a backend that never reports one.
+            "cached": self.cached,
+            "cache_write": self.cache_write,
+            "reasoning": self.reasoning,
+            "cost": self.cost,
+            "currency": self.currency,
             # Tokens/s over upstream time (see `tps`); None while there is
             # nothing to divide, which the console renders as a dash.
             "tps": self.tps(now),

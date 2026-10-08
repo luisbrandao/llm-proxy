@@ -184,8 +184,14 @@ def test_a_chat_completion_runs_the_cli(client, cli):
     assert body["choices"][0]["message"] == {"role": "assistant", "content": "echo:hello"}
     assert body["choices"][0]["finish_reason"] == "stop"
     assert body["model"] == "claude-opus-test-1"
-    # Cached prompt tokens count as prompt tokens.
-    assert body["usage"] == {"prompt_tokens": 15, "completion_tokens": 4, "total_tokens": 19}
+    # Cached prompt tokens count as prompt tokens — and are also reported apart,
+    # in the OpenAI spelling, so the cache figures reach the Costs tab. Never a
+    # `cost`: the seat is a subscription, not a meter.
+    assert body["usage"] == {
+        "prompt_tokens": 15, "completion_tokens": 4, "total_tokens": 19,
+        "prompt_tokens_details": {"cached_tokens": 2, "cache_write_tokens": 3},
+    }
+    assert "cost" not in body["usage"]
     (call,) = cli.calls()
     assert call["argv"][call["argv"].index("--model") + 1] == "opus"
     assert call["prompt"] == "hello"
@@ -384,7 +390,10 @@ def test_a_call_is_caught_and_goes_back_as_tool_calls(client, cli, monkeypatch):
     assert call["id"].startswith("call_") and call["type"] == "function"
     assert call["function"] == {"name": "get_weather", "arguments": '{"city": "Curitiba"}'}
     assert body["model"] == "claude-opus-test-1"
-    assert body["usage"] == {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+    assert body["usage"] == {
+        "prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10,
+        "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+    }
     # Cut short the moment the call was complete: the CLI never got to carry on.
     assert not alive(int(cli.pid_file.read_text()))
     assert idle() == {"claude": 0, "backup": 0}

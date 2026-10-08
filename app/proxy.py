@@ -14,16 +14,20 @@ from fastapi.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from app import config as conf
-from app import auth, claude_cli, clientinfo, inflight, registry, router, slots, trim, upstream
+from app import auth, claude_cli, clientinfo, inflight, ledger, registry, router, slots, trim, upstream
 from app.config import Provider
 from app.metrics import (
+    COST_TOTAL,
     ERRORS_TOTAL,
     FAILOVERS_TOTAL,
     REQUEST_DURATION,
     REQUESTS_TOTAL,
+    TOKENS_CACHED_TOTAL,
     TOKENS_INPUT_TOTAL,
     TOKENS_OUTPUT_TOTAL,
 )
+from app.usage import Usage, format_cost
+from app.usage import parse as parse_usage
 
 logger = logging.getLogger("llm-proxy")
 # Pure-logfmt, prefix-free per-request events (configured in app.main).
@@ -179,16 +183,26 @@ def _op_kind(path: str, model: str):
 
 async def _emit_request_log(
     request: Request, provider: str, model: str, status: int,
-    in_tokens: int, out_tokens: int, duration: float, stream: bool,
+    usage: Usage, duration: float, stream: bool,
     asked: Optional[str] = None, trimmed: Optional[dict] = None,
     served: Optional[str] = None,
 ) -> None:
-    """Emit the single, always-on, parseable line summarizing one request.
+    """Emit the single, always-on, parseable line summarizing one request, and
+    append the same record to the cost ledger.
 
     Carries who called (ip/host/service), what ran (provider/model), the
-    outcome (status, token counts, speed) and whether it streamed. Runs after
-    the response is delivered (background task / stream finally) so the
+    outcome (status, token counts, speed, price) and whether it streamed. Runs
+    after the response is delivered (background task / stream finally) so the
     reverse-DNS lookup never adds latency to the client.
+
+    `usage` is everything the backend's usage block said (app/usage.py). Past
+    `in=`/`out=`, the fields are emitted only when the backend reported them:
+    `cached=` / `cache_write=` (prompt-cache reads and writes), `reasoning=`
+    (thinking tokens), and `cost=` — the price in `usage.cost`, which OpenRouter
+    and NanoGPT send and most others do not. `cost=0` is a real statement (a free
+    model) and is kept; an absent field means the backend did not say. The ledger
+    row (app/ledger.py) holds the same numbers, so the Costs tab and a Loki query
+    over `cost=` agree.
 
     `model` is the **native** id that went on the wire, and stays that way for
     compatibility with existing dashboards and recording rules. `asked` is the
@@ -251,24 +265,37 @@ async def _emit_request_log(
             "op": op,
             "status": status,
             "stream": "true" if stream else "false",
-            "in": in_tokens,
-            "out": out_tokens,
+            "in": usage.prompt,
+            "out": usage.completion,
+            # Reported-only fields: dropped by _logfmt when the backend said nothing.
+            "cached": usage.cached or None,
+            "cache_write": usage.cache_write or None,
+            "reasoning": usage.reasoning or None,
+            "cost": format_cost(usage.cost),
             # H:MM:SS, rounded UP to the whole second so a sub-second request
             # reads 0:00:01, never a misleading 0:00:00.
             "dur": str(timedelta(seconds=math.ceil(duration))),
-            "speed_tps": None if op else f"{out_tokens / duration if duration > 0 else 0:.2f}",
-            "in_tps": f"{in_tokens / duration if duration > 0 else 0:.2f}" if op else None,
+            "speed_tps": None if op else f"{usage.completion / duration if duration > 0 else 0:.2f}",
+            "in_tps": f"{usage.prompt / duration if duration > 0 else 0:.2f}" if op else None,
             "trimmed": trimmed["dropped"] if trimmed else None,
             "trim_capped": trimmed["capped"] if trimmed else None,
         })
+    svc = clientinfo.service_from_ua(ua)
     fields.update({
         "client_ip": ip,
         "client_host": host,
-        "svc": clientinfo.service_from_ua(ua),
+        "svc": svc,
         "ua": ua,
         "err": _err_kind(status),
     })
     event_logger.info(_logfmt(fields))
+    if model != "unknown":
+        # The durable copy the console can read back (Loki holds the line above).
+        await ledger.record(
+            provider=provider, model=model, asked=asked, served=served, status=status,
+            stream=stream, op=op, duration=duration, usage=usage, svc=svc,
+            client=host or ip,
+        )
 
 
 def _log_upstream_error(provider: str, model: str, status: int, body: str) -> None:
@@ -289,10 +316,16 @@ def _log_upstream_error(provider: str, model: str, status: int, body: str) -> No
     logger.warning(f"Upstream error {status} from '{provider}' ({qualifier}):\n{snippet}")
 
 
-def _record_metrics(provider: str, model: str, in_tokens: int, out_tokens: int, duration: float) -> None:
+def _record_metrics(provider: str, model: str, usage: Usage, duration: float) -> None:
     REQUESTS_TOTAL.labels(provider=provider, model=model).inc()
-    TOKENS_INPUT_TOTAL.labels(provider=provider, model=model).inc(in_tokens)
-    TOKENS_OUTPUT_TOTAL.labels(provider=provider, model=model).inc(out_tokens)
+    TOKENS_INPUT_TOTAL.labels(provider=provider, model=model).inc(usage.prompt)
+    TOKENS_OUTPUT_TOTAL.labels(provider=provider, model=model).inc(usage.completion)
+    if usage.cached:
+        TOKENS_CACHED_TOTAL.labels(provider=provider, model=model).inc(usage.cached)
+    # USD only: the counter has one unit, and every backend that prices a request
+    # today reports dollars. Another currency still reaches the ledger, labelled.
+    if usage.cost is not None and usage.cost >= 0 and (usage.currency or "USD") == "USD":
+        COST_TOTAL.labels(provider=provider, model=model).inc(usage.cost)
     REQUEST_DURATION.labels(provider=provider, model=model).observe(duration)
 
 
@@ -387,17 +420,14 @@ async def _handle_non_stream(
     resp_bytes = _decompress(raw, content_encoding)
     resp_body = resp_bytes.decode("utf-8", errors="replace")
 
-    in_tokens = 0
-    out_tokens = 0
+    usage = Usage()
     served = None
     try:
         data = json.loads(resp_body)
-        usage = data.get("usage", {})
-        in_tokens = usage.get("prompt_tokens", 0)
-        out_tokens = usage.get("completion_tokens", 0)
-        if isinstance(data.get("model"), str):
+        usage = parse_usage(data) or usage
+        if isinstance(data, dict) and isinstance(data.get("model"), str):
             served = data["model"]
-    except (json.JSONDecodeError, AttributeError):
+    except ValueError:
         pass
 
     if is_error:
@@ -415,10 +445,10 @@ async def _handle_non_stream(
         if is_error:
             ERRORS_TOTAL.labels(provider=pname, model=model, status_code=str(status_code)).inc()
         else:
-            _record_metrics(pname, model, in_tokens, out_tokens, duration)
+            _record_metrics(pname, model, usage, duration)
 
     if entry is not None:
-        entry.record(status_code, in_tokens, out_tokens, duration)
+        entry.record(status_code, usage, duration)
         entry.add_response(resp_body)
 
     return Response(
@@ -427,7 +457,7 @@ async def _handle_non_stream(
         headers=_relay_headers(resp_headers),
         background=BackgroundTask(
             _emit_request_log, request, pname, model, status_code,
-            in_tokens, out_tokens, duration, False, asked, trimmed, served,
+            usage, duration, False, asked, trimmed, served,
         ),
     )
 
@@ -499,7 +529,7 @@ async def _handle_stream(
             status_code=status_code,
             headers=_relay_headers(resp_headers),
             background=BackgroundTask(
-                _emit_request_log, request, pname, model, status_code, 0, 0, 0.0,
+                _emit_request_log, request, pname, model, status_code, Usage(), 0.0,
                 True, asked, trimmed,
             ),
         )
@@ -509,8 +539,7 @@ async def _handle_stream(
         # cancels the generator rather than the disconnect listener above it.
         if entry is not None:
             entry.bind_stream()
-        in_tokens = 0
-        out_tokens = 0
+        usage = Usage()
         buffer = ""
         delta_contents = [] if conf.LOG_OUTPUT else None
         reasoning_contents = [] if conf.LOG_OUTPUT else None
@@ -537,10 +566,9 @@ async def _handle_stream(
                     try:
                         data = json.loads(payload)
                         resp_model = data.get("model", resp_model)
-                        usage = data.get("usage")
-                        if usage:
-                            in_tokens = usage.get("prompt_tokens", in_tokens)
-                            out_tokens = usage.get("completion_tokens", out_tokens)
+                        if data.get("usage"):
+                            # Usually the final chunk; last one wins either way.
+                            usage = parse_usage(data) or usage
                             final_chunk = data
                         choices = data.get("choices") or []
                         delta = choices[0].get("delta") or {} if choices else {}
@@ -584,7 +612,7 @@ async def _handle_stream(
             # the history row carries the outcome and not just "it ended".
             duration = time.time() - start
             if entry is not None:
-                entry.record(status_code, in_tokens, out_tokens, duration)
+                entry.record(status_code, usage, duration)
                 entry.finish()
             # Closes the response and returns its connection to the shared
             # pool. The client is process-wide — never aclose() it here.
@@ -595,9 +623,9 @@ async def _handle_stream(
                 if error:
                     ERRORS_TOTAL.labels(provider=pname, model=model, status_code=str(status_code)).inc()
                 else:
-                    _record_metrics(pname, model, in_tokens, out_tokens, duration)
+                    _record_metrics(pname, model, usage, duration)
             await _emit_request_log(
-                request, pname, model, status_code, in_tokens, out_tokens, duration,
+                request, pname, model, status_code, usage, duration,
                 True, asked, trimmed, resp_model,
             )
             if delta_contents is not None:
@@ -609,7 +637,7 @@ async def _handle_stream(
                 else:
                     log_data = {
                         "model": resp_model,
-                        "usage": {"prompt_tokens": in_tokens, "completion_tokens": out_tokens},
+                        "usage": {"prompt_tokens": usage.prompt, "completion_tokens": usage.completion},
                     }
                 log_data["_assembled_content"] = full_text
                 if reasoning_text:

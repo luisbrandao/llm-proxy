@@ -4,13 +4,13 @@ import os
 import sys
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app import auth, configwrite, inflight, logbuffer, registry, slots, upstream, version
+from app import auth, configwrite, inflight, ledger, logbuffer, registry, slots, upstream, version
 from app import config as conf
 from app.metrics import metrics_response
 from app.proxy import proxy_request
@@ -192,6 +192,9 @@ async def lifespan(app: FastAPI):
         "llm-proxy %s starting — %d providers, %d logical models, %d aliases",
         version.summary(), len(conf.PROVIDERS), len(conf.LOGICAL_MODELS), len(conf.ALIASES),
     )
+    # Open the cost ledger now, so a bad path is one WARNING at boot rather than
+    # a surprise on the first request, and the retention prune runs before traffic.
+    ledger.startup()
     reload_task = (
         asyncio.create_task(_config_reload_loop())
         if conf.CONFIG_RELOAD_INTERVAL > 0
@@ -204,6 +207,7 @@ async def lifespan(app: FastAPI):
             reload_task.cancel()
         # Close the shared upstream connection pools (see app/upstream.py).
         await upstream.aclose()
+        ledger.close()
 
 
 app = FastAPI(title="LLM Proxy", lifespan=lifespan)
@@ -504,6 +508,40 @@ async def admin_inflight_body(request_id: int, request: Request):
     return {"id": request_id, "limit": conf.INFLIGHT_BODY_LIMIT, **rec}
 
 
+
+
+@admin.get("/costs")
+async def admin_costs(
+    request: Request, days: int = 30, day: str = "", model: str = "",
+    provider: str = "", limit: int = 200,
+):
+    """What each model cost, per day and per request — the Costs tab.
+
+    Read from the cost ledger (app/ledger.py), the one per-request record that
+    survives a restart. `days` is the window (default 30; `0` = everything the
+    ledger keeps), `day` narrows the totals, the model table and the request
+    list to one local date while the per-day series keeps the whole window so
+    the chart stays navigable, and `model` (the name the client sent) and
+    `provider` filter everything. `limit` caps the request list (newest first).
+
+    A ledger that cannot be read is a 503 with the reason, never a traceback:
+    the proxy itself is fine, only the tab is dark.
+    """
+    if day:
+        try:
+            date.fromisoformat(day)
+        except ValueError:
+            return _bad("day must be YYYY-MM-DD")
+    try:
+        return await ledger.summary(
+            days=max(0, days), day=day or None, model=model or None,
+            provider=provider or None, limit=max(1, min(limit, 2000)),
+        )
+    except Exception as e:  # noqa: BLE001 - a broken ledger file darkens one tab, not the proxy
+        logger.warning("Cost ledger read failed: %s: %s", type(e).__name__, e)
+        return JSONResponse(
+            {"error": f"cost ledger unavailable: {type(e).__name__}: {e}"}, status_code=503
+        )
 
 
 def _fronted_natives() -> dict:

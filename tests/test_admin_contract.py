@@ -8,10 +8,13 @@ The field lists below were taken from the console itself — every `p.<field>` a
 `t.<field>` it dereferences. Adding a field is fine; removing or renaming one
 must break a test here, not a tab.
 """
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 
-from app import registry
+from app import ledger, registry
+from app.usage import Usage
 
 CONFIG = """\
 models:
@@ -158,3 +161,55 @@ def test_a_target_on_a_removed_provider_stays_visible_and_flagged(client, load_c
     body = client.get("/admin/routing", headers=AUTH).json()
     orphan = next(m for m in body["logical_models"] if m["name"] == "orphan")
     assert orphan["targets"][0]["known_provider"] is False
+
+
+# Every field the Costs tab reads from /admin/costs: the envelope, the shared
+# aggregate shape (totals, by_day, by_model, by_provider and each model's
+# provider split all carry it), and the request rows.
+COSTS_FIELDS = {
+    "enabled", "path", "retention_days", "rows", "oldest", "today", "range", "filters",
+    "totals", "by_day", "by_model", "by_provider", "requests", "limit", "models",
+    "providers", "currencies",
+}
+COSTS_AGG_FIELDS = {
+    "requests", "errors", "priced", "cost", "prompt", "completion", "cached", "cache_write",
+    "reasoning",
+}
+COSTS_ROW_FIELDS = {
+    "at", "day", "provider", "model", "asked", "served", "status", "stream", "op", "duration",
+    "prompt", "completion", "cached", "cache_write", "reasoning", "cost", "currency", "svc",
+    "client",
+}
+
+
+def test_costs_fields(client):
+    asyncio.run(ledger.record(
+        provider="alpha", model="vendor/Alpha-Grouped", asked="grouped", served=None,
+        status=200, stream=True, op=None, duration=2.0,
+        usage=Usage(prompt=10, completion=5, cached=4, cost=0.01, currency="USD"),
+        svc="svc", client="host",
+    ))
+    body = client.get("/admin/costs?days=7", headers=AUTH).json()
+    assert COSTS_FIELDS <= set(body), f"missing: {COSTS_FIELDS - set(body)}"
+    assert {"days", "since", "day"} <= set(body["range"]) and {"model", "provider"} <= set(body["filters"])
+    assert COSTS_AGG_FIELDS <= set(body["totals"])
+    for group in ("by_day", "by_model", "by_provider"):
+        assert body[group], f"{group} is empty"
+        for row in body[group]:
+            assert COSTS_AGG_FIELDS <= set(row), f"{group} missing: {COSTS_AGG_FIELDS - set(row)}"
+    assert "day" in body["by_day"][0] and "provider" in body["by_provider"][0]
+    model = body["by_model"][0]
+    assert "model" in model and model["providers"]
+    assert {"provider", "model"} | COSTS_AGG_FIELDS <= set(model["providers"][0])
+    for row in body["requests"]:
+        assert COSTS_ROW_FIELDS <= set(row), f"missing: {COSTS_ROW_FIELDS - set(row)}"
+
+
+def test_costs_rejects_a_malformed_day(client):
+    r = client.get("/admin/costs?day=yesterday", headers=AUTH)
+    assert r.status_code == 422 and "day" in r.json()["error"]
+
+
+def test_costs_never_leaks_an_api_key(client):
+    text = client.get("/admin/costs", headers=AUTH).text
+    assert "sk-not-for-export" not in text and '"api_key"' not in text

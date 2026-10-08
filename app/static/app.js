@@ -2,8 +2,8 @@
 
 /* LLM Proxy console — vanilla JS, no build step.
  * Talks to the proxy's own endpoints: GET/POST /logging, GET /v1/models,
- * and the auth-gated GET /admin/logs, GET /admin/upstream-models,
- * GET/POST /admin/routing. The bearer key (if any) is kept in localStorage and
+ * and the auth-gated GET /admin/logs, GET /admin/inflight, GET /admin/costs,
+ * GET /admin/upstream-models, GET/POST /admin/routing, GET/PUT /admin/config. The bearer key (if any) is kept in localStorage and
  * sent as Authorization: Bearer <key> on every call. */
 
 const KEY_STORE = "llmproxy.key";
@@ -67,6 +67,7 @@ function activateTab(name) {
   $$(".panel").forEach((p) => p.classList.toggle("active", p.id === "tab-" + name));
   if (name === "logging") startLogPolling(); else stopLogPolling();
   if (name === "inflight") startFlightPolling(); else stopFlightPolling();
+  if (name === "costs") loadCosts();
   if (name === "models") loadCatalog();
   if (name === "routing") loadRouting();
   if (name === "config") loadConfig();
@@ -482,7 +483,7 @@ function flightSig(r) {
   return [
     r.state, r.status, r.age, r.queued_for, r.running_for, r.duration, r.chunks,
     r.provider, r.attempt, r.skipped, JSON.stringify(r.trimmed || null),
-    r.in_tokens, r.out_tokens, r.estimated, r.tps,
+    r.in_tokens, r.out_tokens, r.estimated, r.tps, r.cost, r.cached,
     r.client_host, r.has_body, killSent.has(r.id),
     JSON.stringify(bodyOpen.get(r.id) || null),
   ].join("\u0001");
@@ -536,6 +537,12 @@ function fillFlightRow(row, r) {
       + t.after + " tokens" + (t.after > t.budget ? " (still over: the newest turn alone does not fit)" : "");
     line1.appendChild(tr);
   }
+  if (r.cached) {
+    const c = el("span", "fltag", "cache hit " + fmtCompact(r.cached));
+    c.title = fmtNum(r.cached) + " of " + fmtNum(r.in_tokens) + " prompt tokens were served from the "
+      + "backend's prompt cache" + (r.cache_write ? "; " + fmtNum(r.cache_write) + " written to it" : "");
+    line1.appendChild(c);
+  }
   if (r.status != null && r.status >= 400) {
     line1.appendChild(el("span", "fltag bad", "HTTP " + r.status));
   }
@@ -585,6 +592,12 @@ function fillFlightRow(row, r) {
   tpsCell.title = (r.op ? "input" : "output") + " tokens per second of upstream time"
     + " — queue wait excluded" + (r.live ? "; average so far" : "")
     + " (the request log's " + (r.op ? "in_tps" : "speed_tps") + ")";
+  // What the backend said it charged (usage.cost), known only once it answers;
+  // a backend that never prices a response reads — for good. See the Costs tab.
+  const costCellEl = timeCell("cost", r.cost == null ? "—" : fmtCost(r.cost, r.currency));
+  costCellEl.title = r.cost == null
+    ? (r.live ? "known once the backend answers" : "the backend reported no price")
+    : "reported by the backend as " + r.cost + " " + (r.currency || "USD");
   if (r.live) {
     times.appendChild(timeCell("age", dur(r.age)));
     times.appendChild(timeCell("queued", dur(r.queued_for)));
@@ -592,12 +605,14 @@ function fillFlightRow(row, r) {
     times.appendChild(timeCell("tok in", tokIn));
     times.appendChild(timeCell("tok out", tokOut));
     times.appendChild(tpsCell);
+    times.appendChild(costCellEl);
   } else {
     times.appendChild(timeCell("took", dur(r.duration)));
     times.appendChild(timeCell("queued", dur(r.queued_for)));
     times.appendChild(timeCell("tok in", tokIn));
     times.appendChild(timeCell("tok out", tokOut));
     times.appendChild(tpsCell);
+    times.appendChild(costCellEl);
   }
   times.appendChild(timeCell("chunks", r.stream ? String(r.chunks == null ? "—" : r.chunks) : "—"));
   times.appendChild(timeCell("body", bytes(r.req_bytes)));
@@ -1632,6 +1647,518 @@ function renderAliases(aliases) {
   }
 }
 
+/* ── Costs ─────────────────────────────────────────────────── */
+/* Reads /admin/costs — the cost ledger (app/ledger.py): one row per completed
+ * request, kept across restarts — and renders the totals, a per-day column
+ * chart, the per-model table with each model's split across backends, and the
+ * newest requests in range. One filter row scopes everything below it: a range
+ * preset, a model, a backend, and a day picked by clicking a column. Only the
+ * backends that price their responses (usage.cost — OpenRouter, NanoGPT) put
+ * dollars here; the rest show up with tokens and no price, never a made-up one. */
+const COST_RANGES = [["Today", 1], ["7d", 7], ["30d", 30], ["90d", 90], ["All", 0]];
+const COST_MEASURES = [["cost", "cost"], ["requests", "requests"], ["tokens", "tokens"]];
+const costState = { days: 30, day: null, model: "", provider: "", measure: "cost" };
+let costData = null;
+let costChartWrap = null;
+let costResizeTimer = null;
+
+async function loadCosts() {
+  const q = new URLSearchParams({ days: String(costState.days), limit: "200" });
+  if (costState.day) q.set("day", costState.day);
+  if (costState.model) q.set("model", costState.model);
+  if (costState.provider) q.set("provider", costState.provider);
+  const body = $("#cost-body");
+  // Hold the previous render at reduced opacity while the new slice loads.
+  body.classList.add("refetching");
+  let res;
+  try { res = await api("/admin/costs?" + q.toString()); }
+  catch { body.classList.remove("refetching"); body.innerHTML = '<div class="notice">Cannot reach the proxy.</div>'; return; }
+  body.classList.remove("refetching");
+  if (res.status === 403) {
+    costData = null;
+    body.innerHTML = '<div class="notice">Unauthorized — set a valid bearer key to view costs.</div>';
+    $("#cost-info").textContent = "";
+    return;
+  }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    body.innerHTML = `<div class="notice">${escapeHtml(err.error || "Failed to load costs (" + res.status + ")")}</div>`;
+    return;
+  }
+  costData = await res.json();
+  renderCosts();
+}
+
+/* Money: enough digits that a sub-cent request does not read as $0, no more. */
+function fmtCost(x, currency) {
+  if (x == null) return "—";
+  const sym = !currency || currency === "USD" ? "$" : currency + " ";
+  if (x === 0) return sym + "0";
+  const abs = Math.abs(x);
+  if (abs >= 1) return sym + x.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (abs >= 0.01) return sym + x.toFixed(3);
+  return sym + Number(x.toPrecision(2)).toString();
+}
+function fmtNum(n) { return n == null ? "—" : Number(n).toLocaleString(); }
+function fmtCompact(n) {
+  if (n == null) return "—";
+  const abs = Math.abs(n);
+  if (abs >= 1e9) return (n / 1e9).toFixed(abs >= 1e10 ? 0 : 1) + "B";
+  if (abs >= 1e6) return (n / 1e6).toFixed(abs >= 1e7 ? 0 : 1) + "M";
+  if (abs >= 1e4) return (n / 1e3).toFixed(0) + "K";
+  if (abs >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  return String(n);
+}
+function pct(part, whole) {
+  if (!whole) return "—";
+  const r = 100 * part / whole;
+  return (r > 0 && r < 10 ? r.toFixed(1) : r.toFixed(0)) + "%";
+}
+// Calendar arithmetic in UTC so a DST change cannot skip or double a day.
+const parseDay = (s) => { const [y, m, d] = s.split("-").map(Number); return Date.UTC(y, m - 1, d); };
+const dayKey = (t) => new Date(t).toISOString().slice(0, 10);
+const DAY_MS = 86400000;
+const measureOf = (r, measure) =>
+  measure === "requests" ? r.requests : measure === "tokens" ? r.prompt + r.completion : r.cost;
+function fmtMeasure(v, measure) {
+  return measure === "cost" ? fmtCost(v) : fmtCompact(v);
+}
+
+function renderCosts() {
+  const d = costData;
+  if (!d) return;
+  renderCostToolbar(d);
+  const body = $("#cost-body");
+  body.innerHTML = "";
+  costChartWrap = null;
+  if (!d.enabled) {
+    body.appendChild(el("div", "notice",
+      "The cost ledger is disabled (LEDGER_PATH is empty). Point it at a file to record what each request cost."));
+    return;
+  }
+  body.appendChild(costTiles(d));
+  body.appendChild(costChartCard(d));
+  const grid = el("div", "cgrid");
+  grid.append(costModelCard(d), costDayCard(d));
+  body.appendChild(grid);
+  body.appendChild(costRequestsCard(d));
+  // Drawn last: the chart needs its container's width, which exists only now.
+  drawCostChart(d);
+}
+
+function renderCostToolbar(d) {
+  const ranges = $("#cost-ranges");
+  ranges.innerHTML = "";
+  for (const [label, days] of COST_RANGES) {
+    const b = el("button", "btn" + (costState.days === days ? " active" : ""), label);
+    b.onclick = () => {
+      costState.days = days;
+      // A picked day outside the new window would filter everything to nothing.
+      if (costState.day && days > 0 && parseDay(costState.day) < parseDay(d.today) - (days - 1) * DAY_MS) {
+        costState.day = null;
+      }
+      loadCosts();
+    };
+    ranges.appendChild(b);
+  }
+  fillSelect($("#cost-model"), d.models || [], costState.model, "all models");
+  fillSelect($("#cost-provider"), d.providers || [], costState.provider, "all backends");
+
+  const active = $("#cost-active");
+  active.innerHTML = "";
+  if (costState.day) {
+    const chip = el("span", "cchip");
+    chip.appendChild(document.createTextNode("day " + costState.day));
+    const x = el("button", null, "✕");
+    x.title = "show every day in the range again";
+    x.onclick = () => { costState.day = null; loadCosts(); };
+    chip.appendChild(x);
+    active.appendChild(chip);
+  }
+
+  const info = $("#cost-info");
+  if (!d.enabled) { info.textContent = "ledger disabled"; return; }
+  const file = (d.path || "").split("/").pop();
+  info.textContent = `${file} · ${fmtNum(d.rows)} rows${d.oldest ? " since " + d.oldest : ""}`
+    + (d.retention_days ? ` · keeps ${d.retention_days} days` : " · keeps everything");
+  info.title = d.path;
+}
+
+function fillSelect(sel, options, current, allLabel) {
+  sel.innerHTML = "";
+  const all = el("option", null, allLabel);
+  all.value = "";
+  sel.appendChild(all);
+  // Keep a filtered value selectable even when nothing in the window carries it.
+  const list = current && !options.includes(current) ? [current, ...options] : options;
+  for (const name of list) {
+    const o = el("option", null, name);
+    o.value = name;
+    if (name === current) o.selected = true;
+    sel.appendChild(o);
+  }
+  sel.disabled = !list.length;
+}
+
+/* ── Costs: the KPI row ───────────────────────────────────── */
+function costTiles(d) {
+  const t = d.totals;
+  const wrap = el("div", "ctiles");
+  const cur = (d.currencies || [])[0];
+  const priceNote = t.priced === 0
+    ? "no backend in range reports a price"
+    : t.priced === t.requests
+      ? `all ${fmtNum(t.requests)} requests priced`
+      : `${fmtNum(t.priced)} of ${fmtNum(t.requests)} requests priced`;
+  wrap.appendChild(tile("Cost", fmtCost(t.cost, cur), priceNote, true,
+    "the sum of what the backends themselves reported in usage.cost — a floor on spend, "
+    + "since backends that report no price add nothing"));
+  const failed = t.errors ? el("span", "bad", `${fmtNum(t.errors)} failed`) : "no failures";
+  wrap.appendChild(tile("Requests", fmtNum(t.requests), failed, false,
+    "completed requests in range, failures included"));
+  wrap.appendChild(tile("Tokens in", fmtCompact(t.prompt),
+    t.cached ? `${pct(t.cached, t.prompt)} served from cache` : "nothing from cache", false,
+    `${fmtNum(t.prompt)} prompt tokens, ${fmtNum(t.cached)} of them read from a prompt cache`));
+  wrap.appendChild(tile("Tokens out", fmtCompact(t.completion),
+    t.reasoning ? `${pct(t.reasoning, t.completion)} reasoning` : "no reasoning reported", false,
+    `${fmtNum(t.completion)} completion tokens, ${fmtNum(t.reasoning)} of them thinking`));
+  wrap.appendChild(tile("Cache reads", fmtCompact(t.cached),
+    t.cache_write ? `${fmtCompact(t.cache_write)} written` : "no cache writes reported", false,
+    "prompt tokens the backend served from its cache (cheaper), and tokens it wrote into it"));
+  wrap.appendChild(tile("Per request", t.priced ? fmtCost(t.cost / t.priced, cur) : "—",
+    t.priced ? "average over priced requests" : "nothing priced", false,
+    "mean cost of the requests that carried a price"));
+  if ((d.currencies || []).length > 1 || (cur && cur !== "USD")) {
+    const note = el("div", "cnote",
+      "Prices in more than one currency, or not in USD: " + d.currencies.join(", ") + " — the sums above mix them.");
+    wrap.appendChild(note);
+  }
+  return wrap;
+}
+
+function tile(label, value, sub, hero, title) {
+  const t = el("div", "ctile" + (hero ? " hero" : ""));
+  t.appendChild(el("div", "ctlabel", label));
+  t.appendChild(el("div", "ctvalue", value));
+  const s = el("div", "ctsub");
+  if (typeof sub === "string") s.textContent = sub; else s.appendChild(sub);
+  t.appendChild(s);
+  if (title) t.title = title;
+  return t;
+}
+
+/* ── Costs: the per-day chart ─────────────────────────────── */
+function costChartCard(d) {
+  const card = el("div", "ccard");
+  const head = el("div", "cchead");
+  head.appendChild(el("span", "cctitle", "By day"));
+  const seg = el("span", "cseg");
+  for (const [key, label] of COST_MEASURES) {
+    const b = el("button", "btn tiny" + (costState.measure === key ? " primary" : ""), label);
+    b.onclick = () => { costState.measure = key; renderCosts(); };
+    seg.appendChild(b);
+  }
+  head.appendChild(seg);
+  head.appendChild(el("span", "muted", "click a column to see that day alone · click again to release it"));
+  card.appendChild(head);
+  costChartWrap = el("div", "cchart");
+  card.appendChild(costChartWrap);
+  return card;
+}
+
+// Every day of the window gets a slot, so a quiet day reads as a gap in the
+// data and not as a gap in the axis.
+function costSeries(d) {
+  const byDay = new Map((d.by_day || []).map((r) => [r.day, r]));
+  const end = parseDay(d.today);
+  const first = d.by_day && d.by_day.length ? d.by_day[0].day : d.today;
+  const start = parseDay(d.range.since || first);
+  const out = [];
+  for (let t = Math.min(start, end); t <= end; t += DAY_MS) {
+    const key = dayKey(t);
+    out.push(byDay.get(key) || {
+      day: key, requests: 0, errors: 0, priced: 0, cost: 0, prompt: 0, completion: 0,
+      cached: 0, cache_write: 0, reasoning: 0,
+    });
+  }
+  return out;
+}
+
+function niceStep(max, n) {
+  const raw = max / n;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const norm = raw / mag;
+  return (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10) * mag;
+}
+function fmtTick(v, measure, step) {
+  if (measure !== "cost") return fmtCompact(v);
+  const decimals = Math.max(0, -Math.floor(Math.log10(step)));
+  return "$" + Number(v.toFixed(decimals)).toString();
+}
+const svgEl = (tag, attrs) => {
+  const e = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  return e;
+};
+
+function drawCostChart(d) {
+  const wrap = costChartWrap;
+  if (!wrap || !wrap.isConnected) return;
+  wrap.innerHTML = "";
+  const series = costSeries(d);
+  const measure = costState.measure;
+  const vals = series.map((r) => measureOf(r, measure));
+  const max = Math.max(0, ...vals);
+
+  const W = Math.max(320, wrap.clientWidth - 20 || 800);
+  const H = 190;
+  const m = { top: 10, right: 12, bottom: 24, left: 52 };
+  const pw = W - m.left - m.right, ph = H - m.top - m.bottom;
+  const step = max > 0 ? niceStep(max, 4) : 1;
+  const top = max > 0 ? Math.ceil(max / step) * step : 1;
+  const y = (v) => m.top + ph - (v / top) * ph;
+  const y0 = y(0);
+
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img",
+    "aria-label": `${measure} per day` });
+
+  // Hairline grid, recessive; the baseline a shade stronger.
+  for (let v = step; v <= top + 1e-9 && max > 0; v += step) {
+    svg.appendChild(svgEl("line", { x1: m.left, x2: W - m.right, y1: y(v), y2: y(v), class: "cgridline" }));
+    const t = svgEl("text", { x: m.left - 8, y: y(v) + 3.5, "text-anchor": "end", class: "caxis" });
+    t.textContent = fmtTick(v, measure, step);
+    svg.appendChild(t);
+  }
+  svg.appendChild(svgEl("line", { x1: m.left, x2: W - m.right, y1: y0, y2: y0, class: "cbaseline" }));
+  const zero = svgEl("text", { x: m.left - 8, y: y0 + 3.5, "text-anchor": "end", class: "caxis" });
+  zero.textContent = measure === "cost" ? "$0" : "0";
+  svg.appendChild(zero);
+
+  const n = series.length;
+  const slot = pw / n;
+  // Thin marks: capped at 24px, a 2px surface gap between neighbours, rounded
+  // at the data end and square on the baseline.
+  const barW = Math.min(24, Math.max(1, slot - 2));
+  const labelEvery = Math.max(1, Math.ceil(n / Math.max(1, Math.floor(pw / 58))));
+  const tip = el("div", "ctip");
+  tip.style.display = "none";
+  wrap.appendChild(tip);
+
+  series.forEach((r, i) => {
+    const v = vals[i];
+    const x = m.left + i * slot + (slot - barW) / 2;
+    const sel = costState.day === r.day;
+    let bar = null;
+    if (v > 0) {
+      const h = Math.max(1.5, y0 - y(v));
+      const yv = y0 - h;
+      const rr = Math.min(4, barW / 2, h);
+      const path = rr >= 1
+        ? `M${x},${y0} V${yv + rr} Q${x},${yv} ${x + rr},${yv} H${x + barW - rr} Q${x + barW},${yv} ${x + barW},${yv + rr} V${y0} Z`
+        : `M${x},${y0} V${yv} H${x + barW} V${y0} Z`;
+      bar = svgEl("path", { d: path, class: "cbar" + (sel ? " sel" : costState.day ? " dim" : "") });
+      svg.appendChild(bar);
+    }
+    if (i % labelEvery === 0 || (n <= 14)) {
+      const t = svgEl("text", { x: x + barW / 2, y: H - 7, "text-anchor": "middle", class: "caxis" });
+      t.textContent = r.day.slice(5);
+      svg.appendChild(t);
+    }
+    // The hit target is the whole column, bar or no bar, so a zero day is still
+    // readable on hover and a thin bar does not need to be aimed at.
+    const hit = svgEl("rect", { x: m.left + i * slot, y: m.top, width: Math.max(slot, 1), height: ph,
+      class: "chit", tabindex: "0", role: "button" });
+    hit.setAttribute("aria-label", `${r.day}: ${fmtMeasure(v, measure)} ${measure}`);
+    const show = () => {
+      if (bar) bar.classList.add("hover");
+      tip.textContent = "";
+      const b = el("b", null, fmtMeasure(v, measure));
+      tip.appendChild(b);
+      const line = (label, value) => {
+        const s = el("span");
+        s.append(document.createTextNode(label + " "), el("i", null, value));
+        tip.appendChild(s);
+      };
+      tip.appendChild(el("span", null, r.day + (r.day === d.today ? " (today)" : "")));
+      if (measure !== "cost") line("cost", r.priced ? fmtCost(r.cost) : "—");
+      if (measure !== "requests") line("requests", fmtNum(r.requests) + (r.errors ? ` (${r.errors} failed)` : ""));
+      line("tokens in / out", fmtCompact(r.prompt) + " / " + fmtCompact(r.completion));
+      if (r.cached) line("from cache", pct(r.cached, r.prompt));
+      tip.style.display = "";
+      const rect = wrap.getBoundingClientRect();
+      const scale = rect.width / (W + 20);
+      const cx = 10 + (x + barW / 2) * scale;
+      let left = cx - tip.offsetWidth / 2;
+      left = Math.max(4, Math.min(left, rect.width - tip.offsetWidth - 4));
+      let topPx = 10 + (v > 0 ? y(v) : y0) * scale - tip.offsetHeight - 8;
+      if (topPx < 0) topPx = 10 + y0 * scale + 8;
+      tip.style.left = left + "px";
+      tip.style.top = topPx + "px";
+    };
+    const hide = () => { if (bar) bar.classList.remove("hover"); tip.style.display = "none"; };
+    const pick = () => { costState.day = sel ? null : r.day; loadCosts(); };
+    hit.addEventListener("pointerenter", show);
+    hit.addEventListener("pointerleave", hide);
+    hit.addEventListener("focus", show);
+    hit.addEventListener("blur", hide);
+    hit.addEventListener("click", pick);
+    hit.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); } });
+    svg.appendChild(hit);
+  });
+  wrap.appendChild(svg);
+}
+
+/* ── Costs: the tables ────────────────────────────────────── */
+function ctable(headers) {
+  const wrap = el("div", "ctablewrap");
+  const table = el("table", "ctable");
+  const thead = el("thead");
+  const tr = el("tr");
+  for (const h of headers) {
+    const th = el("th", h.num ? "num" : null, h.label);
+    if (h.title) th.title = h.title;
+    tr.appendChild(th);
+  }
+  thead.appendChild(tr);
+  table.appendChild(thead);
+  const tbody = el("tbody");
+  table.appendChild(tbody);
+  wrap.appendChild(table);
+  return { wrap, tbody };
+}
+function td(text, cls, title) {
+  const c = el("td", cls, text);
+  if (text === "—") c.classList.add("dash");
+  if (title) c.title = title;
+  return c;
+}
+const costCell = (r, cur) => td(r.priced ? fmtCost(r.cost, cur) : "—", "num",
+  r.priced ? `${fmtNum(r.priced)} of ${fmtNum(r.requests)} requests carried a price` : "no price reported");
+
+function costModelCard(d) {
+  const card = el("div", "ccard");
+  const head = el("div", "cchead");
+  head.appendChild(el("span", "cctitle", "By model"));
+  head.appendChild(el("span", "muted", "the name the client sent · click a row to filter"));
+  card.appendChild(head);
+  if (!d.by_model.length) { card.appendChild(el("div", "cempty", "No requests in this range.")); return card; }
+  const cur = (d.currencies || [])[0];
+  const { wrap, tbody } = ctable([
+    { label: "model" }, { label: "req", num: true }, { label: "in", num: true }, { label: "out", num: true },
+    { label: "cached", num: true, title: "share of prompt tokens served from the backend's prompt cache" },
+    { label: "reasoning", num: true, title: "completion tokens spent thinking" },
+    { label: "cost", num: true }, { label: "$/req", num: true, title: "mean cost of the priced requests" },
+  ]);
+  for (const m of d.by_model) {
+    const tr = el("tr", "crow" + (costState.model === m.model ? " active" : ""));
+    const name = el("td");
+    name.appendChild(el("div", "cmodel", m.model));
+    const provs = el("div", "cprovs");
+    for (const p of m.providers || []) {
+      const chip = el("span", "cprov");
+      chip.append(el("b", null, p.provider), document.createTextNode(
+        ` ${fmtNum(p.requests)}${p.priced ? " · " + fmtCost(p.cost, cur) : ""}`));
+      chip.title = `${p.model} on ${p.provider}: ${fmtNum(p.requests)} requests, `
+        + `${fmtCompact(p.prompt)} in / ${fmtCompact(p.completion)} out`
+        + (p.priced ? `, ${fmtCost(p.cost, cur)}` : ", no price reported");
+      provs.appendChild(chip);
+    }
+    name.appendChild(provs);
+    tr.appendChild(name);
+    const req = td(fmtNum(m.requests), "num");
+    if (m.errors) req.appendChild(el("span", "cfail", `${m.errors} failed`));
+    tr.appendChild(req);
+    tr.appendChild(td(fmtCompact(m.prompt), "num", fmtNum(m.prompt) + " prompt tokens"));
+    tr.appendChild(td(fmtCompact(m.completion), "num", fmtNum(m.completion) + " completion tokens"));
+    tr.appendChild(td(m.cached ? pct(m.cached, m.prompt) : "—", "num",
+      `${fmtNum(m.cached)} read from cache · ${fmtNum(m.cache_write)} written`));
+    tr.appendChild(td(m.reasoning ? fmtCompact(m.reasoning) : "—", "num", fmtNum(m.reasoning) + " reasoning tokens"));
+    tr.appendChild(costCell(m, cur));
+    tr.appendChild(td(m.priced ? fmtCost(m.cost / m.priced, cur) : "—", "num"));
+    tr.onclick = () => { costState.model = costState.model === m.model ? "" : m.model; loadCosts(); };
+    tbody.appendChild(tr);
+  }
+  card.appendChild(wrap);
+  return card;
+}
+
+function costDayCard(d) {
+  const card = el("div", "ccard");
+  const head = el("div", "cchead");
+  head.appendChild(el("span", "cctitle", "Days"));
+  head.appendChild(el("span", "muted", "newest first"));
+  card.appendChild(head);
+  if (!d.by_day.length) { card.appendChild(el("div", "cempty", "Nothing recorded in this range.")); return card; }
+  const cur = (d.currencies || [])[0];
+  const { wrap, tbody } = ctable([
+    { label: "day" }, { label: "req", num: true }, { label: "in", num: true }, { label: "out", num: true },
+    { label: "cached", num: true }, { label: "cost", num: true },
+  ]);
+  for (const r of d.by_day.slice().reverse()) {
+    const tr = el("tr", "crow" + (costState.day === r.day ? " active" : ""));
+    tr.appendChild(td(r.day + (r.day === d.today ? " · today" : ""), "ctime"));
+    const req = td(fmtNum(r.requests), "num");
+    if (r.errors) req.appendChild(el("span", "cfail", `${r.errors} failed`));
+    tr.appendChild(req);
+    tr.appendChild(td(fmtCompact(r.prompt), "num", fmtNum(r.prompt)));
+    tr.appendChild(td(fmtCompact(r.completion), "num", fmtNum(r.completion)));
+    tr.appendChild(td(r.cached ? pct(r.cached, r.prompt) : "—", "num", fmtNum(r.cached) + " cached tokens"));
+    tr.appendChild(costCell(r, cur));
+    tr.onclick = () => { costState.day = costState.day === r.day ? null : r.day; loadCosts(); };
+    tbody.appendChild(tr);
+  }
+  card.appendChild(wrap);
+  return card;
+}
+
+function costRequestsCard(d) {
+  const card = el("div", "ccard");
+  const head = el("div", "cchead");
+  head.appendChild(el("span", "cctitle", "Requests"));
+  const shown = d.requests.length, total = d.totals.requests;
+  head.appendChild(el("span", "muted", shown < total
+    ? `newest ${fmtNum(shown)} of ${fmtNum(total)} — narrow the filters to see the rest`
+    : `${fmtNum(shown)} in range, newest first`));
+  card.appendChild(head);
+  if (!shown) { card.appendChild(el("div", "cempty", "No requests in this range.")); return card; }
+  const cur = (d.currencies || [])[0];
+  const oneDay = costState.day || costState.days === 1;
+  const { wrap, tbody } = ctable([
+    { label: "when" }, { label: "model" }, { label: "backend" }, { label: "status" },
+    { label: "in", num: true }, { label: "out", num: true }, { label: "cached", num: true },
+    { label: "cost", num: true }, { label: "took", num: true }, { label: "client" },
+  ]);
+  for (const r of d.requests) {
+    const tr = el("tr");
+    const at = r.at || "";
+    const time = at.slice(11, 19);
+    tr.appendChild(td(oneDay ? time : at.slice(5, 10) + " " + time, "ctime", at));
+    const model = el("td");
+    model.appendChild(el("span", "cmodel", r.asked));
+    if (r.stream) model.appendChild(el("span", "fltag", "stream"));
+    if (r.op) model.appendChild(el("span", "fltag", r.op));
+    tr.appendChild(model);
+    tr.appendChild(td(r.provider, null,
+      `sent as ${r.model}` + (r.served ? ` · backend ran ${r.served}` : "")));
+    const st = el("td");
+    st.appendChild(el("span", "cstatus" + (r.status >= 400 ? " bad" : ""), String(r.status)));
+    tr.appendChild(st);
+    tr.appendChild(td(fmtNum(r.prompt), "num"));
+    const out = td(fmtNum(r.completion), "num");
+    if (r.reasoning) out.title = `${fmtNum(r.reasoning)} of these were reasoning`;
+    tr.appendChild(out);
+    tr.appendChild(td(r.cached ? fmtNum(r.cached) : "—", "num",
+      r.cache_write ? `${fmtNum(r.cache_write)} written to cache` : ""));
+    tr.appendChild(td(r.cost == null ? "—" : fmtCost(r.cost, r.currency || cur), "num",
+      r.cost == null ? "no price reported" : `${r.cost} ${r.currency || ""}`));
+    tr.appendChild(td(dur(r.duration), "num"));
+    tr.appendChild(td([r.svc, r.client].filter(Boolean).join(" · ") || "—", "cwho"));
+    tbody.appendChild(tr);
+  }
+  card.appendChild(wrap);
+  return card;
+}
+
 /* ── Init ──────────────────────────────────────────────────── */
 async function loadBuild() {
   // Which image is actually answering — the quickest way to notice a container
@@ -1663,6 +2190,7 @@ function initKey() {
     loadLogFlags();
     if (active === "logging") resetLogTail();
     if (active === "inflight") pollFlight();
+    if (active === "costs") loadCosts();
     if (active === "models") { loadCatalog(); }
     if (active === "routing") loadRouting();
     if (active === "config") loadConfig();
@@ -1686,6 +2214,14 @@ window.addEventListener("DOMContentLoaded", () => {
   $("#fl-refresh").addEventListener("click", pollFlight);
   $("#fl-live").addEventListener("change", (e) => {
     if (e.target.checked) startFlightPolling();
+  });
+
+  $("#cost-refresh").addEventListener("click", loadCosts);
+  $("#cost-model").addEventListener("change", (e) => { costState.model = e.target.value; loadCosts(); });
+  $("#cost-provider").addEventListener("change", (e) => { costState.provider = e.target.value; loadCosts(); });
+  window.addEventListener("resize", () => {
+    clearTimeout(costResizeTimer);
+    costResizeTimer = setTimeout(() => { if (costData && costChartWrap) drawCostChart(costData); }, 150);
   });
 
   $("#models-refresh").addEventListener("click", loadCatalog);

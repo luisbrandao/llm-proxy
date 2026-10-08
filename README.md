@@ -22,6 +22,10 @@ request a **clean model name** — the proxy decides *which* backend actually se
   backends drop out of the model list and are skipped.
 - **In-flight visibility** — the console's In-flight tab lists every request currently
   running or queued, what each one is waiting on, and how long it has waited.
+- **Cost tracking** — the price each backend reports (`usage.cost`, as OpenRouter and
+  NanoGPT send it) and its prompt-cache hits are recorded per request in a small SQLite
+  ledger that survives restarts; the console's Costs tab breaks it down by model, by
+  day and by request.
 - **Permission gate** — mark paid backends `require_permission: true`; only callers
   with a valid `Authorization: Bearer` key see or use them.
 - **OpenRouter provider routing** — pin which upstream OpenRouter uses (e.g. force
@@ -476,6 +480,8 @@ Set in `docker-compose.yml` — **not** in `config.yaml`:
 | `INFLIGHT_HISTORY` | `200` | Finished requests the In-flight tab keeps below the live ones (in-memory, lost on restart) |
 | `INFLIGHT_BODIES` | `true` | Attach each request's prompt + reply to its In-flight row. **Holds prompt text in memory** (bounded, never written to disk or stdout, admin-gated); `false` keeps the feed metadata-only |
 | `INFLIGHT_BODY_LIMIT` | `16384` | Bytes kept per side (request / reasoning / response) before truncating |
+| `LEDGER_PATH` | `ledger.sqlite` beside the config | The [cost ledger](#cost-tracking): one SQLite row per completed request, read by the Costs tab. The default lands in the config's directory, which in the deploy is the rw mount — so it persists where the config does. `""` disables it; `:memory:` keeps it for the life of the process |
+| `LEDGER_RETENTION_DAYS` | `365` | Ledger rows older than this are pruned at startup and once a day. `0` keeps everything |
 
 > **Single worker required.** Slot/queue accounting is in-process, so run **one**
 > uvicorn worker (the default). Multiple workers would split the accounting and break
@@ -514,11 +520,12 @@ model name (e.g. `deepseek-v4-flash`). Pass `Authorization: Bearer <key>` for ga
 | `/models`, `/v1/models` | `GET` | Aggregated model list (clean names; honors the auth gate) |
 | `/logging` | `GET` | Current `log_input` / `log_output` state |
 | `/logging` | `POST` | Toggle request/response logging at runtime (honors the auth gate) |
-| `/ui/` | `GET` | Web console (Logging / In-flight / Models / Routing). Static, served by the proxy |
+| `/ui/` | `GET` | Web console (Logging / In-flight / Costs / Models / Routing / Config). Static, served by the proxy |
 | `/admin/logs` | `GET` | Recent log lines from an in-memory ring buffer (`?since=<seq>&level=<min>`) |
 | `/admin/inflight` | `GET` | The request feed: live (running + queued) plus recent finished ones, with per-provider slot occupancy |
 | `/admin/inflight/{id}/cancel` | `POST` | Kill one in-flight request. `404` if it already finished |
 | `/admin/inflight/{id}/body` | `GET` | The prompt and reply captured for one row (see `INFLIGHT_BODIES`) |
+| `/admin/costs` | `GET` | Cost and token totals from the [ledger](#cost-tracking): per day, per model (with each model's split across backends), per backend, plus the newest requests. `?days=30&day=YYYY-MM-DD&model=&provider=&limit=200` |
 | `/favicon.ico`, `/robots.txt` | `GET` | Served directly, so browser noise never reaches the proxy path |
 | `/admin/upstream-models` | `GET` | Probes every backend's raw `/v1/models` directly (`?provider=name` for just one) |
 | `/admin/routing` | `GET` | Routing graph: providers (live slots/health), logical models + priorities, aliases |
@@ -538,7 +545,7 @@ and never serialize provider `api_key`s.
 
 A built-in, dependency-free dashboard served by the proxy itself — open
 `http://<host>:9999/ui/` and paste a proxy key (stored in your browser's
-`localStorage`, sent as `Authorization: Bearer`). Five tabs:
+`localStorage`, sent as `Authorization: Bearer`). Six tabs:
 
 - **Logging** — live log tail (level filter, pause, autoscroll) plus the
   `LOG_INPUT` / `LOG_OUTPUT` runtime toggles.
@@ -584,6 +591,29 @@ A built-in, dependency-free dashboard served by the proxy itself — open
   - The toolbar totals running / queued / done and shows each provider's `in_use/slots`,
     amber when full — so a growing queue reads straight against the capacity causing it.
     See [Slots, priority & queueing](#slots-priority--queueing).
+  - A finished row also carries a **`cost`** cell — what the backend said it charged, `—`
+    for a backend that reports no price — and a `cache hit N` badge when part of the
+    prompt was served from the backend's prompt cache.
+- **Costs** — what the proxy's traffic cost, from the [cost ledger](#cost-tracking).
+  One filter row scopes everything on the tab: a range preset (today / 7d / 30d / 90d /
+  all), a model, a backend, and a day picked by clicking a column of the chart.
+  - A **KPI row**: total cost (with how many of the requests actually carried a price —
+    the total is a floor, since a backend that reports nothing adds nothing), requests
+    and failures, tokens in and out, how much of the prompt came from a cache, how much
+    of the output was reasoning, and the mean cost per priced request.
+  - **By day** — a column chart of cost, requests or tokens per day (one column per
+    calendar day of the range, so a quiet day shows as a gap in the data rather than in
+    the axis). Hover or focus a column for that day's numbers; click it to narrow the
+    rest of the tab to that day, click again to release. The **Days** table beside the
+    model table is the same data as rows.
+  - **By model** — each model as the client asked for it, with its requests, tokens,
+    cache-hit share, reasoning tokens, cost and cost per request — and under the name,
+    a chip per backend that served it with that backend's count and spend, which is
+    where the "which route for this model is actually cheaper" question gets answered.
+    Clicking a row filters the tab to that model.
+  - **Requests** — the newest requests in range (capped; narrow the filters to see
+    more), one per row: when, model, backend, status, tokens, cache reads, cost,
+    duration and caller.
 - **Config** — edit `config.yaml` from the browser; every save rewrites the file
   (comments preserved) and takes effect immediately, no restart.
   - **Upstream models** — per backend, either *allow all* (use whatever it live-reports)
@@ -712,6 +742,8 @@ Scrape `http://<host>:8000/metrics`:
 | `llm_proxy_requests_total` | Counter | `provider`, `model` | Completed requests |
 | `llm_proxy_tokens_input_total` | Counter | `provider`, `model` | Cumulative input tokens |
 | `llm_proxy_tokens_output_total` | Counter | `provider`, `model` | Cumulative output tokens |
+| `llm_proxy_tokens_cached_total` | Counter | `provider`, `model` | Prompt tokens the backend reported as served from its prompt cache (a subset of input) |
+| `llm_proxy_cost_total` | Counter | `provider`, `model` | Cumulative cost in USD **as reported by the backend** (`usage.cost`). Backends that report no price add nothing, so this is a floor on spend, not the bill. See [Cost tracking](#cost-tracking) |
 | `llm_proxy_request_duration_seconds` | Histogram | `provider`, `model` | Request latency (0.1–600s) |
 | `llm_proxy_errors_total` | Counter | `provider`, `model`, `status_code` | Failed requests |
 | `llm_proxy_slots_in_use` | Gauge | `provider` | In-flight requests holding a slot |
@@ -750,13 +782,55 @@ sum_over_time(llm_proxy_requests_total:increase5m[$__range])
 Live gauges (`slots_in_use`, `queue_waiting`) and the latency histogram reflect the current
 process and reset too — that is what they are for.
 
+## Cost tracking
+
+Some backends say what a request cost. OpenRouter and NanoGPT both put the price in the
+response's `usage.cost` (USD), next to the token counts, and both also report how much of
+the prompt was served from a **prompt cache** (`prompt_tokens_details.cached_tokens`,
+`cache_read_input_tokens`) and how many completion tokens were **reasoning**. DeepSeek
+reports cache hits (`prompt_cache_hit_tokens`) but no price; Google, Copilot and the local
+Ollama boxes report neither; the Claude CLI backend reports cache reads and writes and
+deliberately no price (it draws from a subscription seat, and the CLI's `total_cost_usd`
+is a list-price estimate, not a charge).
+
+The proxy reads all of those spellings into one usage record per request
+(`app/usage.py`) and fans it out to four places:
+
+1. the **request log** line — `cost=`, `cached=`, `cache_write=`, `reasoning=`, each
+   present only when the backend reported it (`cost=0` is kept: a free model *is* priced,
+   at zero);
+2. the **In-flight** row's `cost` cell and `cache hit` badge;
+3. the metrics `llm_proxy_cost_total` and `llm_proxy_tokens_cached_total`;
+4. the **cost ledger** — one row per completed request in a SQLite file
+   (`LEDGER_PATH`, default `ledger.sqlite` beside the config), which is what the
+   console's **Costs** tab reads: totals, per day, per model with the per-backend split,
+   per backend, and the newest requests, over a chosen range and optional day / model /
+   backend filters (`GET /admin/costs`).
+
+The ledger exists because the questions it answers — *what did this model cost this
+month, which backend served it cheaper, which requests were they* — span restarts, and
+nothing else in the process does: the In-flight history is a bounded in-memory ring and
+the Prometheus counters reset by design. It is **not** a counter snapshot and is never
+fed back into one (see the note below on why that would be wrong); it is an append-only
+record, like the log lines it mirrors, read only by the admin API. Rows older than
+`LEDGER_RETENTION_DAYS` (365) are pruned. Writes run in a worker thread and a ledger that
+cannot be written is a warning, never a failed request. In the deploy the file lives in
+the config directory mount — `monitoring/llmproxy/ledger.sqlite`, gitignored there — so it
+survives container recreates.
+
+A price the backend did not report is **unknown, not zero**: the ledger stores `NULL`,
+the tab shows `—` and counts how many requests were actually priced next to every total,
+so a total over mixed backends reads as the floor it is. For backends that never report a
+price, a per-model price table in the config is the natural next step; it is not there
+yet.
+
 ## Request Logging
 
 Every completed request — success **or** error — emits exactly one structured
 [logfmt](https://brandur.org/logfmt) line on stdout:
 
 ```
-ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=z-ai/glm-5.2 asked=glm-5.2 status=200 stream=true in=5524 out=890 dur=0:00:26 speed_tps=34.91 client_ip=192.168.1.50 client_host=workstation.lan svc=OpenWebUI ua="OpenWebUI/0.5"
+ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=z-ai/glm-5.2 asked=glm-5.2 status=200 stream=true in=5524 out=890 cached=5000 reasoning=120 cost=0.00037 dur=0:00:26 speed_tps=34.91 client_ip=192.168.1.50 client_host=workstation.lan svc=OpenWebUI ua="OpenWebUI/0.5"
 ```
 
 | Field | Meaning |
@@ -768,6 +842,8 @@ ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=
 | `status` | Upstream HTTP status relayed to the client |
 | `stream` | Whether the response was streamed |
 | `in`, `out`, `dur` | Prompt/completion tokens and wall-clock duration as `H:MM:SS` (rounded up to the second, so a fast request reads `0:00:01` not `0:00:00`) |
+| `cached`, `cache_write`, `reasoning` | Present only when the backend reported them: prompt tokens read from its prompt cache (a subset of `in`), prompt tokens written into it, and completion tokens spent thinking (a subset of `out`). See [Cost tracking](#cost-tracking) |
+| `cost` | What the backend said the request cost, in USD, as a plain decimal — present only when it reported one (OpenRouter, NanoGPT). `cost=0` means a free model; no field means the backend did not say. `sum by (asked) (sum_over_time({container="llm-proxy"} \| logfmt \| unwrap cost [$__range]))` charts spend per model in Grafana |
 | `speed_tps` | Output tokens/s. **Omitted for embeddings & rerankers** — they return no completion tokens, so it would always be a misleading `0.00` |
 | `op`, `in_tps` | Present only on no-output ops (**`embedding`**, **`rerank`**): the op kind plus input tokens/s — the throughput that matters when nothing is generated |
 | `client_ip` | Caller address (`X-Forwarded-For`/`X-Real-IP` honored when `TRUST_PROXY_HEADERS`) |
@@ -913,7 +989,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-202 tests, no network, about a second. They exist to pin the properties that
+Around 300 tests, no network, a few seconds. They exist to pin the properties that
 are invisible in review: that every acquired slot is released on every exit path
 (including timeout and cancellation), that two identical config saves leave the
 file byte-identical, that an unknown model 404s instead of being routed to an

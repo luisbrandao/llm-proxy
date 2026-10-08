@@ -26,6 +26,7 @@
   <nav class="tabs">
     <button class="tab active" data-tab="logging">Logging</button>
     <button class="tab" data-tab="inflight">In-flight</button>
+    <button class="tab" data-tab="costs">Costs</button>
     <button class="tab" data-tab="models">Models</button>
     <button class="tab" data-tab="routing">Routing</button>
     <button class="tab" data-tab="config">Config</button>
@@ -66,6 +67,22 @@
         <span id="fl-slots" class="flslots"></span>
       </div>
       <div id="fl-body" class="flbody">
+        <div class="notice">Loading…</div>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────── COSTS ──────────────────────── -->
+    <section id="tab-costs" class="panel">
+      <div class="toolbar">
+        <span id="cost-ranges" class="crange" role="group" aria-label="date range"></span>
+        <label class="field">model <select id="cost-model"></select></label>
+        <label class="field">backend <select id="cost-provider"></select></label>
+        <span id="cost-active" class="cactive"></span>
+        <button id="cost-refresh" class="btn">Refresh</button>
+        <span class="grow"></span>
+        <span id="cost-info" class="muted"></span>
+      </div>
+      <div id="cost-body">
         <div class="notice">Loading…</div>
       </div>
     </section>

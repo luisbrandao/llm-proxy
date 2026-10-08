@@ -413,3 +413,20 @@ INFLIGHT_BODIES = _flag("INFLIGHT_BODIES", "true")
 # Per-side cap in bytes. A 170 KiB prompt is ordinary for an agentic client, so
 # bodies are truncated head-first rather than stored whole.
 INFLIGHT_BODY_LIMIT = int(os.environ.get("INFLIGHT_BODY_LIMIT", "16384"))
+
+
+def _default_ledger_path() -> str:
+    """`ledger.sqlite` beside the config file. In the deploy the config's
+    directory is the one rw bind mount, so this is where a file survives a
+    container recreate without any new volume."""
+    return os.path.join(os.path.dirname(os.path.abspath(CONFIG_PATH)), "ledger.sqlite")
+
+
+# The cost ledger (app/ledger.py): one SQLite row per completed request, so the
+# console's Costs tab can answer "by model / by day" across restarts. Unlike the
+# Prometheus counters this is never re-seeded into anything — it is an
+# append-only record, like the request log. Set to "" to disable, or ":memory:"
+# to keep it for the life of the process only.
+LEDGER_PATH = os.environ["LEDGER_PATH"] if "LEDGER_PATH" in os.environ else _default_ledger_path()
+# Rows older than this many days are pruned at startup and once a day; 0 keeps everything.
+LEDGER_RETENTION_DAYS = int(os.environ.get("LEDGER_RETENTION_DAYS", "365"))

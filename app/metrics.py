@@ -35,6 +35,24 @@ TOKENS_OUTPUT_TOTAL = Counter(
     ["provider", "model"],
 )
 
+TOKENS_CACHED_TOTAL = Counter(
+    "llm_proxy_tokens_cached_total",
+    "Prompt tokens the backend reported as served from its prompt cache "
+    "(a subset of tokens_input_total)",
+    ["provider", "model"],
+)
+
+# What the backends themselves say they charged (`usage.cost`, OpenRouter and
+# NanoGPT), summed in USD. A backend that reports no price adds nothing — so this
+# is a floor on spend, not the bill. The durable per-request record is the cost
+# ledger (app/ledger.py); this counter resets on restart like every other.
+COST_TOTAL = Counter(
+    "llm_proxy_cost_total",
+    "Cumulative cost in USD as reported by the backend in usage.cost; "
+    "backends that report no price contribute nothing",
+    ["provider", "model"],
+)
+
 REQUEST_DURATION = Histogram(
     "llm_proxy_request_duration_seconds",
     "Request duration in seconds",

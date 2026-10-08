@@ -12,6 +12,12 @@ services:
       - LOG_OUTPUT=false
       - PORT=8000
       - PROXY_API_KEYS=sk-1234
+      # The cost ledger (the console's Costs tab): one SQLite row per request.
+      # Defaults to ledger.sqlite beside the config file, which under this
+      # dev file-mount would be inside the container — so point it at the
+      # volume below. Production leaves it at its default, next to the config,
+      # in the directory mount. "" disables it.
+      - LEDGER_PATH=/data/ledger.sqlite
     volumes:
       # rw so config edits from the web console persist into the file.
       #
@@ -28,9 +34,12 @@ services:
       # the container keeps it; log in once with
       #   docker exec -it llm-proxy claude auth login --claudeai
       - claude-cli:/claude
+      # Where LEDGER_PATH above points.
+      - ledger:/data
     ports:
       - "9999:8000"
     restart: unless-stopped
 
 volumes:
   claude-cli:
+  ledger:

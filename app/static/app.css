@@ -345,6 +345,124 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
   .flwho { margin-left: 0; }
 }
 
+/* ── Costs ─────────────────────────────────────────────────── */
+.panel#tab-costs { overflow-y: auto; }
+/* A refetch holds the previous render at reduced opacity: no skeleton, no jump. */
+#cost-body { transition: opacity .15s; }
+#cost-body.refetching { opacity: .55; }
+
+.crange {
+  display: inline-flex; gap: 2px; padding: 2px;
+  background: var(--bg); border: 1px solid var(--line-2); border-radius: 7px;
+}
+.crange .btn {
+  border: none; background: none; padding: 4px 10px; font-size: 12px;
+  color: var(--muted); border-radius: 5px;
+}
+.crange .btn:hover { color: var(--text); background: none; }
+.crange .btn.active { background: var(--bg-3); color: var(--text); }
+.cactive { display: inline-flex; gap: 6px; }
+.cactive .cchip {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11.5px; color: var(--accent); background: rgba(15,159,110,.10);
+  border: 1px solid var(--accent-2); border-radius: 20px; padding: 2px 4px 2px 9px;
+}
+.cactive .cchip button {
+  background: none; border: none; color: var(--accent); cursor: pointer;
+  font-size: 12px; line-height: 1; padding: 1px 5px; border-radius: 50%;
+}
+.cactive .cchip button:hover { background: rgba(255,255,255,.08); color: #fff; }
+
+/* KPI row — the numbers are the chart. Proportional figures on purpose. */
+.ctiles {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px; margin-bottom: 12px;
+}
+.ctile {
+  display: flex; flex-direction: column; gap: 3px; min-width: 0;
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: 9px; padding: 10px 13px;
+}
+.ctile.hero { border-color: var(--accent-2); }
+.ctlabel { font-size: 10.5px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
+.ctvalue { font-size: 22px; font-weight: 600; color: #fff; line-height: 1.15; overflow: hidden; text-overflow: ellipsis; }
+.ctile.hero .ctvalue { font-size: 30px; }
+.ctsub { font-size: 11.5px; color: var(--muted); }
+.ctsub .bad { color: var(--red); }
+
+.ccard {
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: 9px;
+  margin-bottom: 12px; overflow: hidden; min-width: 0;
+}
+.cchead {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 12px; background: var(--bg-3); border-bottom: 1px solid var(--line);
+}
+.cctitle { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
+.cchead .muted { margin-left: auto; }
+.cseg { display: inline-flex; gap: 4px; }
+.cnote { padding: 8px 12px; color: var(--amber); font-size: 12px; border-bottom: 1px solid var(--line); }
+.cempty { padding: 16px; color: var(--muted); text-align: center; font-size: 12.5px; }
+
+/* The per-day column chart: inline SVG, one series, thin marks, hairline grid. */
+.cchart { position: relative; padding: 10px 10px 4px; }
+.cchart svg { display: block; width: 100%; height: auto; }
+.cbar { fill: var(--accent-2); }
+.cbar.sel { fill: var(--accent); }
+.cbar.dim { opacity: .45; }
+.cbar.hover { filter: brightness(1.25); }
+.chit { fill: transparent; cursor: pointer; outline: none; }
+.cgridline { stroke: var(--line); stroke-width: 1; }
+.cbaseline { stroke: var(--line-2); stroke-width: 1; }
+.caxis { fill: var(--muted); font-size: 10px; font-family: var(--mono); }
+.ctip {
+  position: absolute; z-index: 2; pointer-events: none; white-space: nowrap;
+  background: var(--bg-3); border: 1px solid var(--line-2); border-radius: 7px;
+  padding: 7px 10px; font-size: 11.5px; color: var(--muted);
+  box-shadow: 0 6px 20px rgba(0,0,0,.4);
+}
+.ctip b { display: block; font-size: 14px; font-weight: 600; color: #fff; margin-bottom: 2px; }
+.ctip span { display: block; }
+.ctip i { font-style: normal; color: var(--text); font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+.cgrid { display: grid; grid-template-columns: 3fr 2fr; gap: 12px; align-items: start; }
+@media (max-width: 1100px) { .cgrid { grid-template-columns: 1fr; } }
+
+/* Tables: tabular figures in the number columns only. The two side-by-side
+   tables scroll inside a capped height, so a month of days cannot push the
+   request list below the fold; their headers stay put while they scroll. */
+.ctablewrap { overflow-x: auto; }
+.cgrid .ctablewrap { max-height: 460px; overflow-y: auto; }
+.cgrid .ctable th { position: sticky; top: 0; z-index: 1; }
+.ctable { width: 100%; border-collapse: collapse; font-size: 12px; }
+.ctable th {
+  text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
+  color: var(--muted); font-weight: 600; padding: 7px 10px; white-space: nowrap;
+  border-bottom: 1px solid var(--line); background: var(--bg-2);
+}
+.ctable td { padding: 7px 10px; border-bottom: 1px solid rgba(43,48,46,.6); vertical-align: top; }
+.ctable tr:last-child td { border-bottom: none; }
+.ctable .num, .ctable th.num {
+  text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.ctable td.dash { color: var(--muted); }
+.ctable tr.crow { cursor: pointer; }
+.ctable tr.crow:hover td { background: rgba(255,255,255,.025); }
+.ctable tr.active td { background: rgba(15,159,110,.10); }
+.ctable tr.active td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+.cmodel { font-family: var(--mono); font-weight: 600; color: #fff; word-break: break-all; }
+.cprovs { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.cprov {
+  font-size: 10.5px; color: var(--muted); border: 1px solid var(--line-2);
+  border-radius: 5px; padding: 1px 6px; white-space: nowrap;
+}
+.cprov b { color: var(--text); font-weight: 600; }
+.cfail { color: var(--red); font-size: 10.5px; margin-left: 5px; font-family: var(--sans); }
+.cstatus { font-family: var(--mono); font-size: 11.5px; }
+.cstatus.bad { color: #ffb9af; }
+.ctable .fltag { margin-left: 4px; }
+.cwho { font-family: var(--mono); font-size: 11px; color: var(--muted); white-space: nowrap; }
+.ctime { font-family: var(--mono); font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+
 /* ── Models ────────────────────────────────────────────────── */
 .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
 @media (max-width: 880px) { .cols { grid-template-columns: 1fr; } }

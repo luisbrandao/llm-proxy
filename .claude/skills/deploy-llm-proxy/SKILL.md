@@ -203,6 +203,12 @@ Prometheus compensates for it in `rate()`/`increase()`, and long-range totals
 come from the `:increase5m` recording rules. In-flight requests are dropped on
 recreate — a restart mid-generation cuts those clients off.
 
+The one thing that **does** persist is the cost ledger: `ledger.sqlite` (plus its
+`-wal`/`-shm` siblings) in `monitoring/llmproxy/`, the config directory mount.
+It is gitignored in the deploy repo (`monitoring/llmproxy/ledger.sqlite*`) — keep
+it that way, and keep committing the config **by path** on gw: a `git add -A`
+there would put a growing database into git.
+
 ## Rollback
 
 Every previous image is still in the registry, and the compose file records

@@ -18,3 +18,9 @@ metrics_state.json
 
 # Claude Code per-machine overrides (skills under .claude/skills/ are tracked)
 .claude/settings.local.json
+
+# The cost ledger (app/ledger.py). Its default location is beside the config
+# file; the suite points it at :memory:, this is the belt to that suspender.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

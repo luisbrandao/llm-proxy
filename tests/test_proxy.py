@@ -308,6 +308,103 @@ def test_history_row_tokens_per_second_is_the_logged_number(client, upstreams, e
             "running_for", "chunks", "req_bytes"} <= set(row)
 
 
+# ── Cost & cache ────────────────────────────────────────────────────────────
+
+def priced(cost=0.000368968443, cached=6834, reasoning=21, **kw):
+    """A completion shaped like OpenRouter's: the price in `usage.cost`, cache
+    reads and thinking tokens in the detail blocks."""
+    c = completion(prompt=6903, out=57, **kw)
+    c["usage"].update({
+        "cost": cost,
+        "prompt_tokens_details": {"cached_tokens": cached, "cache_write_tokens": 0},
+        "completion_tokens_details": {"reasoning_tokens": reasoning},
+    })
+    return c
+
+
+def test_a_reported_cost_reaches_the_log_the_row_the_ledger_and_the_metric(client, upstreams, events):
+    """One usage block, four readers, one number."""
+    upstreams.set(lambda r: mock_response(200, json=priced()))
+    client.post("/v1/chat/completions", json={"model": "grouped"})
+
+    line = next(l for l in events() if "event=request" in l)
+    assert "cost=0.00036897" in line and "cached=6834" in line and "reasoning=21" in line
+    assert "cache_write=" not in line, "a zero is 'not reported', not a field"
+
+    row = client.get("/admin/inflight").json()["requests"][0]
+    assert row["cost"] == pytest.approx(0.000368968443) and row["currency"] == "USD"
+    assert row["cached"] == 6834 and row["reasoning"] == 21
+
+    costs = client.get("/admin/costs").json()
+    t = costs["totals"]
+    assert (t["requests"], t["priced"], t["cached"]) == (1, 1, 6834)
+    assert t["cost"] == pytest.approx(0.000368968443)
+    model = costs["by_model"][0]
+    assert model["model"] == "grouped"
+    split = model["providers"][0]
+    assert (split["provider"], split["model"]) == ("first", "vendor/First-Native")
+    req = costs["requests"][0]
+    assert (req["asked"], req["model"], req["provider"], req["status"]) == ("grouped", "vendor/First-Native", "first", 200)
+    assert req["cost"] == pytest.approx(0.000368968443)
+
+    metric = re.search(r'llm_proxy_cost_total\{model="vendor/First-Native",provider="first"\} (\S+)',
+                       client.get("/metrics").text)
+    assert float(metric.group(1)) == pytest.approx(0.000368968443)
+    assert idle() == {"first": 0, "second": 0}
+
+
+def test_a_backend_that_reports_no_price_stays_unpriced(client, upstreams, events):
+    client.post("/v1/chat/completions", json={"model": "grouped"})
+    line = next(l for l in events() if "event=request" in l)
+    assert "cost=" not in line and "cached=" not in line
+    row = client.get("/admin/inflight").json()["requests"][0]
+    assert row["cost"] is None and row["cached"] == 0
+    t = client.get("/admin/costs").json()["totals"]
+    assert (t["requests"], t["priced"], t["cost"]) == (1, 0, 0)
+
+
+def test_a_free_model_is_priced_at_zero_not_unpriced(client, upstreams, events):
+    upstreams.set(lambda r: mock_response(200, json=priced(cost=0)))
+    client.post("/v1/chat/completions", json={"model": "grouped"})
+    assert "cost=0 " in next(l for l in events() if "event=request" in l)
+    t = client.get("/admin/costs").json()["totals"]
+    assert (t["priced"], t["cost"]) == (1, 0)
+
+
+PRICED_SSE = (
+    b'data: {"model":"m","choices":[{"delta":{"content":"Hi"}}]}\n\n'
+    b'data: {"model":"m","choices":[],"usage":{"prompt_tokens":6903,"completion_tokens":139,'
+    b'"cost":0.0006954,"currency":"USD","reasoning_tokens":90,"cache_read_input_tokens":100},'
+    b'"x_nanogpt_pricing":{"cost":0.0006954,"currency":"USD"}}\n\n'
+    b"data: [DONE]\n\n"
+)
+
+
+def test_a_streamed_price_reaches_the_ledger(client, upstreams, events):
+    upstreams.set(lambda r: mock_response(
+        200, content=PRICED_SSE, headers={"content-type": "text/event-stream"}
+    ))
+    r = client.post("/v1/chat/completions", json={"model": "grouped", "stream": True})
+    assert r.content == PRICED_SSE, "the stream is relayed untouched"
+    line = next(l for l in events() if "event=request" in l)
+    assert "cost=0.0006954" in line and "cached=100" in line and "reasoning=90" in line
+    req = client.get("/admin/costs").json()["requests"][0]
+    assert req["stream"] is True and req["cost"] == pytest.approx(0.0006954)
+    assert (req["cached"], req["reasoning"], req["prompt"], req["completion"]) == (100, 90, 6903, 139)
+    assert idle() == {"first": 0, "second": 0}
+
+
+def test_a_failed_request_is_one_unpriced_ledger_row(client, upstreams):
+    """Both backends 503: one failover, one relayed error, ONE row — the attempt
+    that answered the client, not one per backend tried."""
+    upstreams.set(lambda r: mock_response(503, json={"error": {"message": "full"}}))
+    client.post("/v1/chat/completions", json={"model": "grouped"})
+    costs = client.get("/admin/costs").json()
+    t = costs["totals"]
+    assert (t["requests"], t["errors"], t["priced"]) == (1, 1, 0)
+    assert costs["requests"][0]["provider"] == "second"
+
+
 # ── Failover ────────────────────────────────────────────────────────────────
 
 def test_retryable_status_fails_over_to_the_next_target(client, upstreams):

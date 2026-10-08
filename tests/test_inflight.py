@@ -10,6 +10,7 @@ closes the loop by pushing a request through and comparing the row to the line.
 import pytest
 
 from app import inflight
+from app.usage import Usage
 
 
 def _begin(op=None):
@@ -61,7 +62,7 @@ async def test_recorded_duration_replaces_the_clock():
     e.run("first", "native")
     for _ in range(30):
         e.token()
-    e.record(200, in_tokens=5, out_tokens=20, duration=4.0)
+    e.record(200, Usage(prompt=5, completion=20), duration=4.0)
     # The wall clock says something else entirely; the handler's number wins.
     row = e.as_dict(e.slot_at + 1000)
     assert row["tps"] == 5.0
@@ -73,7 +74,7 @@ async def test_recorded_duration_replaces_the_clock():
 async def test_finished_row_carries_the_final_tps():
     e = _begin()
     e.run("first", "native")
-    e.record(200, in_tokens=5, out_tokens=20, duration=4.0)
+    e.record(200, Usage(prompt=5, completion=20), duration=4.0)
     e.finish()
     row = inflight._recent[0]
     assert row["state"] == "done"
@@ -84,7 +85,7 @@ async def test_finished_row_carries_the_final_tps():
 async def test_no_output_op_reports_input_tokens_per_second():
     e = _begin(op="embedding")
     e.run("first", "native")
-    e.record(200, in_tokens=100, out_tokens=0, duration=2.0)
+    e.record(200, Usage(prompt=100, completion=0), duration=2.0)
     assert e.tps(e.slot_at + 1) == 50.0
 
 
@@ -107,7 +108,7 @@ async def test_a_backend_that_never_reports_usage_keeps_the_estimate():
     e.run("first", "native")
     for _ in range(8):
         e.token()
-    e.record(200, in_tokens=0, out_tokens=0, duration=4.0)
+    e.record(200, Usage(), duration=4.0)
     row = e.as_dict(e.slot_at + 99)
     assert row["tps"] == 2.0 and row["estimated"] is True
 
@@ -117,5 +118,5 @@ async def test_a_backend_that_never_reports_usage_keeps_the_estimate():
 async def test_tps_rounds_exactly_like_the_log_formats(tokens, secs):
     e = _begin()
     e.run("first", "native")
-    e.record(200, in_tokens=1, out_tokens=tokens, duration=secs)
+    e.record(200, Usage(prompt=1, completion=tokens), duration=secs)
     assert f"{e.tps(e.slot_at):.2f}" == f"{tokens / secs:.2f}"

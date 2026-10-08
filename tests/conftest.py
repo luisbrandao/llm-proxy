@@ -37,18 +37,27 @@ if not FIXTURE_CONFIG.exists():
 os.environ.setdefault("CONFIG_PATH", str(FIXTURE_CONFIG))
 
 from app import config as conf  # noqa: E402
-from app import inflight, registry, slots, trim  # noqa: E402
+from app import inflight, ledger, registry, slots, trim  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
+def reset_state(monkeypatch):
     """Clear the process-local accounting between tests.
 
     Mirrors exactly what the modules own: slot occupancy and the affinity
-    memory, the discovery caches and down-marks, and the in-flight feed. Anything
-    added to those modules should be reset here too.
+    memory, the discovery caches and down-marks, the in-flight feed, and the
+    cost ledger's connection. Anything added to those modules should be reset
+    here too.
+
+    The ledger is pointed at `:memory:` for every test — the default path is a
+    file beside the config, which here would mean a `tests/fixtures/ledger.sqlite`
+    growing on disk — and closed afterwards, so each test starts from an empty
+    one. A test that wants a file (persistence across a reopen) sets
+    `conf.LEDGER_PATH` itself.
     """
+    monkeypatch.setattr(conf, "LEDGER_PATH", ":memory:")
     yield
+    ledger.close()
     slots._in_use.clear()
     slots._running.clear()
     slots._last_model.clear()

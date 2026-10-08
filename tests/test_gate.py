@@ -126,7 +126,7 @@ def test_wrong_key_is_treated_as_unauthenticated(client):
 
 
 def test_admin_endpoints_are_gated(client):
-    for path in ("/admin/logs", "/admin/config", "/admin/routing", "/admin/inflight"):
+    for path in ("/admin/logs", "/admin/config", "/admin/routing", "/admin/inflight", "/admin/costs"):
         assert client.get(path).status_code == 403, f"{path} is not gated"
         assert client.get(path, headers=AUTH).status_code == 200, f"{path} rejects a valid key"
 
