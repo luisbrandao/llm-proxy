@@ -50,9 +50,12 @@ _conn: Optional[sqlite3.Connection] = None
 _path: Optional[str] = None
 # The local day the last retention prune ran for; a write on a new day re-prunes.
 _pruned_for: Optional[str] = None
-# When a write failure was last logged — one warning per WARN_EVERY seconds, not
-# one per request, when the disk is full or the file unwritable.
-_warned_at = 0.0
+# When a write failure was last logged (monotonic), None until the first — one
+# warning per WARN_EVERY seconds, not one per request, when the disk is full or
+# the file unwritable. None rather than 0.0 on purpose: monotonic time counts
+# from boot, so on a freshly started host a 0.0 baseline would swallow every
+# failure in the first five minutes — which is exactly when a bad mount shows up.
+_warned_at: Optional[float] = None
 WARN_EVERY = 300.0
 
 SCHEMA = """
@@ -197,8 +200,9 @@ async def record(
     except asyncio.CancelledError:
         raise
     except Exception as e:  # noqa: BLE001 - a broken ledger must not break requests
-        if time.monotonic() - _warned_at >= WARN_EVERY:
-            _warned_at = time.monotonic()
+        now_mono = time.monotonic()
+        if _warned_at is None or now_mono - _warned_at >= WARN_EVERY:
+            _warned_at = now_mono
             logger.warning(
                 "Cost ledger write failed (%s): %s: %s — requests are not being recorded",
                 conf.LEDGER_PATH, type(e).__name__, e,

@@ -167,7 +167,7 @@ async def test_a_disabled_ledger_records_nothing_and_says_so(monkeypatch):
 
 async def test_a_ledger_that_cannot_be_written_never_raises(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(conf, "LEDGER_PATH", str(tmp_path / "missing" / "dir" / "ledger.sqlite"))
-    monkeypatch.setattr(ledger, "_warned_at", 0.0)
+    monkeypatch.setattr(ledger, "_warned_at", None)
     caplog.set_level(logging.WARNING, logger="llm-proxy")
     await add()
     await add()
