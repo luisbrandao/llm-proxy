@@ -142,6 +142,12 @@ git push
 
 Push this **before** touching gw — step 4 pulls it.
 
+Commit **by path** (`-- monitoring/docker-compose.yml`), not `-am`: this working
+tree routinely holds unrelated in-progress edits. And expect the push to be
+rejected as non-fast-forward now and then — gw pushes a `Server Bump` whenever
+the console wrote config — so `git pull --rebase && git push` is the normal
+recovery, not a sign anything is wrong.
+
 ## 4. Deploy on gw
 
 ```bash
