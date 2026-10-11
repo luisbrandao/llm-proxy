@@ -75,6 +75,13 @@
     <section id="tab-costs" class="panel">
       <div class="toolbar">
         <span id="cost-ranges" class="crange" role="group" aria-label="date range"></span>
+        <span class="cwin" role="group" aria-label="custom dates">
+          <button id="cost-prev" class="btn tiny" title="the period before this one" aria-label="previous period">‹</button>
+          <input type="date" id="cost-since" aria-label="from">
+          <span class="muted">to</span>
+          <input type="date" id="cost-until" aria-label="to">
+          <button id="cost-next" class="btn tiny" title="the period after this one" aria-label="next period">›</button>
+        </span>
         <label class="field">model <select id="cost-model"></select></label>
         <label class="field">backend <select id="cost-provider"></select></label>
         <span id="cost-active" class="cactive"></span>

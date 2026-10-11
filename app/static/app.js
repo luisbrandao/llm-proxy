@@ -1655,15 +1655,96 @@ function renderAliases(aliases) {
  * preset, a model, a backend, and a day picked by clicking a column. Only the
  * backends that price their responses (usage.cost — OpenRouter, NanoGPT) put
  * dollars here; the rest show up with tokens and no price, never a made-up one. */
-const COST_RANGES = [["Today", 1], ["7d", 7], ["30d", 30], ["90d", 90], ["All", 0]];
+const COST_PRESETS = [
+  ["Today", "1"], ["7d", "7"], ["30d", "30"], ["90d", "90"],
+  ["This month", "month"], ["Last month", "lastmonth"], ["All", "all"],
+];
 const COST_MEASURES = [["cost", "cost"], ["requests", "requests"], ["tokens", "tokens"]];
-const costState = { days: 30, day: null, model: "", provider: "", measure: "cost" };
+// `preset` names the window; a calendar window (a month, or two dates typed in)
+// also carries explicit `since`/`until`, and a "last N days" one carries neither
+// and lets the server count back from its own today.
+const costState = { preset: "30", since: null, until: null, day: null, model: "", provider: "", measure: "cost" };
 let costData = null;
 let costChartWrap = null;
 let costResizeTimer = null;
 
+/* A date as YYYY-MM-DD in the browser's local calendar. */
+const pad2 = (n) => String(n).padStart(2, "0");
+const localDay = (dt) => `${dt.getFullYear()}-${pad2(dt.getMonth() + 1)}-${pad2(dt.getDate())}`;
+const monthStart = (y, m) => localDay(new Date(y, m, 1));
+const monthEnd = (y, m) => localDay(new Date(y, m + 1, 0));
+
+/* Point the tab at a named window. A day picked inside the old window is dropped:
+ * it may not exist in the new one, and a filter that matches nothing reads as
+ * "no data" rather than as "you filtered this". */
+function setCostPreset(preset) {
+  const now = new Date();
+  costState.preset = preset;
+  costState.day = null;
+  if (preset === "month") {
+    costState.since = monthStart(now.getFullYear(), now.getMonth());
+    costState.until = localDay(now);
+  } else if (preset === "lastmonth") {
+    costState.since = monthStart(now.getFullYear(), now.getMonth() - 1);
+    costState.until = monthEnd(now.getFullYear(), now.getMonth() - 1);
+  } else {
+    costState.since = costState.until = null;
+  }
+  loadCosts();
+}
+
+/* The window as the server reports it: dates, whatever the preset. */
+const costWindow = (d) => ({ since: d.range.since, until: d.range.until || d.today });
+
+/* Step the window back or forward by its own length — a whole calendar month at
+ * a time when it is one, so "September, then August" works by pressing ‹. */
+function stepCostWindow(dir) {
+  const d = costData;
+  if (!d || !d.range.since) return;
+  const { since, until } = costWindow(d);
+  const a = parseDay(since), b = parseDay(until);
+  const sa = new Date(a), sb = new Date(b);
+  const wholeMonth = sa.getUTCDate() === 1 && sa.getUTCFullYear() === sb.getUTCFullYear()
+    && sa.getUTCMonth() === sb.getUTCMonth()
+    && (until === d.today || sb.getUTCDate() === new Date(Date.UTC(sb.getUTCFullYear(), sb.getUTCMonth() + 1, 0)).getUTCDate());
+  let ns, nu;
+  if (wholeMonth) {
+    const y = sa.getUTCFullYear(), m = sa.getUTCMonth() + dir;
+    ns = dayKey(Date.UTC(y, m, 1));
+    nu = dayKey(Date.UTC(y, m + 1, 0));
+  } else {
+    const span = Math.round((b - a) / DAY_MS) + 1;
+    ns = dayKey(a + dir * span * DAY_MS);
+    nu = dayKey(b + dir * span * DAY_MS);
+  }
+  // Never run past today: the future has nothing in it.
+  if (parseDay(nu) > parseDay(d.today)) nu = d.today;
+  if (parseDay(ns) > parseDay(d.today)) return;
+  setCostRange(ns, nu);
+}
+
+/* An explicit window: typed dates, or a step. Recognised as a month preset when
+ * it is exactly that, so the button lights up. */
+function setCostRange(since, until) {
+  const now = new Date();
+  const thisM = [monthStart(now.getFullYear(), now.getMonth()), localDay(now)];
+  const lastM = [monthStart(now.getFullYear(), now.getMonth() - 1), monthEnd(now.getFullYear(), now.getMonth() - 1)];
+  costState.preset = since === thisM[0] && until === thisM[1] ? "month"
+    : since === lastM[0] && until === lastM[1] ? "lastmonth" : "custom";
+  costState.since = since || null;
+  costState.until = until || null;
+  costState.day = null;
+  loadCosts();
+}
+
 async function loadCosts() {
-  const q = new URLSearchParams({ days: String(costState.days), limit: "200" });
+  const q = new URLSearchParams({ limit: "200" });
+  if (costState.since || costState.until) {
+    if (costState.since) q.set("since", costState.since);
+    if (costState.until) q.set("until", costState.until);
+  } else {
+    q.set("days", costState.preset === "all" ? "0" : costState.preset);
+  }
   if (costState.day) q.set("day", costState.day);
   if (costState.model) q.set("model", costState.model);
   if (costState.provider) q.set("provider", costState.provider);
@@ -1695,7 +1776,8 @@ function fmtCost(x, currency) {
   const sym = !currency || currency === "USD" ? "$" : currency + " ";
   if (x === 0) return sym + "0";
   const abs = Math.abs(x);
-  if (abs >= 1) return sym + x.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  // en-US on purpose: the browser's own locale would print $10,40 beside $0.047.
+  if (abs >= 1) return sym + x.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   if (abs >= 0.01) return sym + x.toFixed(3);
   return sym + Number(x.toPrecision(2)).toString();
 }
@@ -1731,6 +1813,7 @@ function renderCosts() {
   const body = $("#cost-body");
   body.innerHTML = "";
   costChartWrap = null;
+  costTip();   // a re-render must not leave the old column's tooltip hanging
   if (!d.enabled) {
     body.appendChild(el("div", "notice",
       "The cost ledger is disabled (LEDGER_PATH is empty). Point it at a file to record what each request cost."));
@@ -1739,7 +1822,9 @@ function renderCosts() {
   body.appendChild(costTiles(d));
   body.appendChild(costChartCard(d));
   const grid = el("div", "cgrid");
-  grid.append(costModelCard(d), costDayCard(d));
+  const side = el("div", "cside");
+  side.append(costProviderCard(d), costDayCard(d));
+  grid.append(costModelCard(d), side);
   body.appendChild(grid);
   body.appendChild(costRequestsCard(d));
   // Drawn last: the chart needs its container's width, which exists only now.
@@ -1749,18 +1834,20 @@ function renderCosts() {
 function renderCostToolbar(d) {
   const ranges = $("#cost-ranges");
   ranges.innerHTML = "";
-  for (const [label, days] of COST_RANGES) {
-    const b = el("button", "btn" + (costState.days === days ? " active" : ""), label);
-    b.onclick = () => {
-      costState.days = days;
-      // A picked day outside the new window would filter everything to nothing.
-      if (costState.day && days > 0 && parseDay(costState.day) < parseDay(d.today) - (days - 1) * DAY_MS) {
-        costState.day = null;
-      }
-      loadCosts();
-    };
+  for (const [label, preset] of COST_PRESETS) {
+    const b = el("button", "btn" + (costState.preset === preset ? " active" : ""), label);
+    b.onclick = () => setCostPreset(preset);
     ranges.appendChild(b);
   }
+  // The dates the window actually covers, for every preset: typing in either box
+  // turns it into a custom window, and ‹ › step it by its own length.
+  const since = $("#cost-since"), until = $("#cost-until");
+  since.value = d.range.since || "";
+  until.value = d.range.until || "";
+  since.max = until.max = d.today;
+  if (d.oldest) since.min = until.min = d.oldest;
+  $("#cost-prev").disabled = !d.range.since;
+  $("#cost-next").disabled = !d.range.since || (d.range.until || d.today) >= d.today;
   fillSelect($("#cost-model"), d.models || [], costState.model, "all models");
   fillSelect($("#cost-provider"), d.providers || [], costState.provider, "all backends");
 
@@ -1870,7 +1957,7 @@ function costChartCard(d) {
 // data and not as a gap in the axis.
 function costSeries(d) {
   const byDay = new Map((d.by_day || []).map((r) => [r.day, r]));
-  const end = parseDay(d.today);
+  const end = parseDay(d.range.until || d.today);
   const first = d.by_day && d.by_day.length ? d.by_day[0].day : d.today;
   const start = parseDay(d.range.since || first);
   const out = [];
@@ -1900,6 +1987,19 @@ const svgEl = (tag, attrs) => {
   for (const k in attrs) e.setAttribute(k, attrs[k]);
   return e;
 };
+
+/* The chart's tooltip: a single element on <body>, created once. */
+function costTip() {
+  let tip = $("#cost-tip");
+  if (!tip) {
+    tip = el("div", "ctip");
+    tip.id = "cost-tip";
+    tip.setAttribute("role", "tooltip");
+    document.body.appendChild(tip);
+  }
+  tip.style.display = "none";
+  return tip;
+}
 
 function drawCostChart(d) {
   const wrap = costChartWrap;
@@ -1940,9 +2040,7 @@ function drawCostChart(d) {
   // at the data end and square on the baseline.
   const barW = Math.min(24, Math.max(1, slot - 2));
   const labelEvery = Math.max(1, Math.ceil(n / Math.max(1, Math.floor(pw / 58))));
-  const tip = el("div", "ctip");
-  tip.style.display = "none";
-  wrap.appendChild(tip);
+  const tip = costTip();
 
   series.forEach((r, i) => {
     const v = vals[i];
@@ -1985,13 +2083,15 @@ function drawCostChart(d) {
       line("tokens in / out", fmtCompact(r.prompt) + " / " + fmtCompact(r.completion));
       if (r.cached) line("from cache", pct(r.cached, r.prompt));
       tip.style.display = "";
-      const rect = wrap.getBoundingClientRect();
-      const scale = rect.width / (W + 20);
-      const cx = 10 + (x + barW / 2) * scale;
-      let left = cx - tip.offsetWidth / 2;
-      left = Math.max(4, Math.min(left, rect.width - tip.offsetWidth - 4));
-      let topPx = 10 + (v > 0 ? y(v) : y0) * scale - tip.offsetHeight - 8;
-      if (topPx < 0) topPx = 10 + y0 * scale + 8;
+      // Viewport coordinates: the tip lives on <body>, not inside the card, so no
+      // card's overflow can clip it and no later card can paint over it.
+      const box = svg.getBoundingClientRect();
+      const scale = box.width / W;
+      const cx = box.left + (x + barW / 2) * scale;
+      const barTop = box.top + (v > 0 ? y(v) : y0) * scale;
+      let left = Math.max(4, Math.min(cx - tip.offsetWidth / 2, window.innerWidth - tip.offsetWidth - 4));
+      let topPx = barTop - tip.offsetHeight - 8;
+      if (topPx < 4) topPx = Math.min(box.top + y0 * scale + 8, window.innerHeight - tip.offsetHeight - 4);
       tip.style.left = left + "px";
       tip.style.top = topPx + "px";
     };
@@ -2076,6 +2176,40 @@ function costModelCard(d) {
     tr.appendChild(costCell(m, cur));
     tr.appendChild(td(m.priced ? fmtCost(m.cost / m.priced, cur) : "—", "num"));
     tr.onclick = () => { costState.model = costState.model === m.model ? "" : m.model; loadCosts(); };
+    tbody.appendChild(tr);
+  }
+  card.appendChild(wrap);
+  return card;
+}
+
+function costProviderCard(d) {
+  const card = el("div", "ccard");
+  const head = el("div", "cchead");
+  head.appendChild(el("span", "cctitle", "By backend"));
+  head.appendChild(el("span", "muted", "ollama* hosts are one · click a row to filter"));
+  card.appendChild(head);
+  if (!d.by_provider.length) { card.appendChild(el("div", "cempty", "No requests in this range.")); return card; }
+  const cur = (d.currencies || [])[0];
+  const { wrap, tbody } = ctable([
+    { label: "backend" }, { label: "req", num: true },
+    { label: "cached", num: true, title: "share of prompt tokens the backend served from its prompt cache — a backend whose cache is unreliable shows it here" },
+    { label: "cost", num: true },
+    { label: "$/req", num: true, title: "mean cost of the priced requests" },
+    { label: "$/M tok", num: true, title: "cost per million tokens (in + out), over the priced requests only — comparable across backends whatever size their requests were" },
+  ]);
+  for (const p of d.by_provider) {
+    const tr = el("tr", "crow" + (costState.provider === p.provider ? " active" : ""));
+    tr.appendChild(td(p.provider, "cmodel"));
+    const req = td(fmtNum(p.requests), "num");
+    if (p.errors) req.appendChild(el("span", "cfail", `${p.errors} failed`));
+    tr.appendChild(req);
+    tr.appendChild(td(p.cached ? pct(p.cached, p.prompt) : "—", "num",
+      `${fmtNum(p.cached)} of ${fmtNum(p.prompt)} prompt tokens`));
+    tr.appendChild(costCell(p, cur));
+    tr.appendChild(td(p.priced ? fmtCost(p.cost / p.priced, cur) : "—", "num"));
+    tr.appendChild(td(p.priced_tokens ? fmtCost(p.cost / p.priced_tokens * 1e6, cur) : "—", "num",
+      p.priced_tokens ? `${fmtNum(p.priced_tokens)} tokens on priced requests` : "no price reported"));
+    tr.onclick = () => { costState.provider = costState.provider === p.provider ? "" : p.provider; loadCosts(); };
     tbody.appendChild(tr);
   }
   card.appendChild(wrap);
@@ -2217,6 +2351,20 @@ window.addEventListener("DOMContentLoaded", () => {
   });
 
   $("#cost-refresh").addEventListener("click", loadCosts);
+  // Picking a new week means moving both ends, one after the other — so a date
+  // that lands on the wrong side of the other end drags that end along rather
+  // than being refused, which would make the second pick impossible to reach.
+  const typedRange = (changed) => {
+    let since = $("#cost-since").value, until = $("#cost-until").value;
+    if (since && until && since > until) {
+      if (changed === "since") until = since; else since = until;
+    }
+    setCostRange(since, until);
+  };
+  $("#cost-since").addEventListener("change", () => typedRange("since"));
+  $("#cost-until").addEventListener("change", () => typedRange("until"));
+  $("#cost-prev").addEventListener("click", () => stepCostWindow(-1));
+  $("#cost-next").addEventListener("click", () => stepCostWindow(1));
   $("#cost-model").addEventListener("change", (e) => { costState.model = e.target.value; loadCosts(); });
   $("#cost-provider").addEventListener("change", (e) => { costState.provider = e.target.value; loadCosts(); });
   window.addEventListener("resize", () => {

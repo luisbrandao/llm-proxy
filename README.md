@@ -525,7 +525,7 @@ model name (e.g. `deepseek-v4-flash`). Pass `Authorization: Bearer <key>` for ga
 | `/admin/inflight` | `GET` | The request feed: live (running + queued) plus recent finished ones, with per-provider slot occupancy |
 | `/admin/inflight/{id}/cancel` | `POST` | Kill one in-flight request. `404` if it already finished |
 | `/admin/inflight/{id}/body` | `GET` | The prompt and reply captured for one row (see `INFLIGHT_BODIES`) |
-| `/admin/costs` | `GET` | Cost and token totals from the [ledger](#cost-tracking): per day, per model (with each model's split across backends), per backend, plus the newest requests. `?days=30&day=YYYY-MM-DD&model=&provider=&limit=200` |
+| `/admin/costs` | `GET` | Cost and token totals from the [ledger](#cost-tracking): per day, per model (with each model's split across backends), per backend, plus the newest requests. `?days=30` or an explicit `since=YYYY-MM-DD&until=YYYY-MM-DD` window, narrowed with `day=`, `model=`, `provider=`, capped by `limit=200` |
 | `/favicon.ico`, `/robots.txt` | `GET` | Served directly, so browser noise never reaches the proxy path |
 | `/admin/upstream-models` | `GET` | Probes every backend's raw `/v1/models` directly (`?provider=name` for just one) |
 | `/admin/routing` | `GET` | Routing graph: providers (live slots/health), logical models + priorities, aliases |
@@ -601,6 +601,10 @@ A built-in, dependency-free dashboard served by the proxy itself — open
     the total is a floor, since a backend that reports nothing adds nothing), requests
     and failures, tokens in and out, how much of the prompt came from a cache, how much
     of the output was reasoning, and the mean cost per priced request.
+  - **Range** — presets for today / 7d / 30d / 90d / this month / last month / all, and two
+    date boxes for any specific stretch (a week, a quarter). `‹` `›` step the window back
+    and forward by its own length — by whole calendar months when it is one, so September
+    then August is two clicks. A date typed past the other end drags that end with it.
   - **By day** — a column chart of cost, requests or tokens per day (one column per
     calendar day of the range, so a quiet day shows as a gap in the data rather than in
     the axis). Hover or focus a column for that day's numbers; click it to narrow the
@@ -611,6 +615,10 @@ A built-in, dependency-free dashboard served by the proxy itself — open
     a chip per backend that served it with that backend's count and spend, which is
     where the "which route for this model is actually cheaper" question gets answered.
     Clicking a row filters the tab to that model.
+  - **By backend** — one row per backend with requests, cache-hit share, cost, cost per
+    request and cost per million tokens (over the priced requests only, so backends with
+    different request sizes compare fairly). All `ollama*` hosts count as one `ollama` here
+    and in the backend filter; the request list below still names the actual host.
   - **Requests** — the newest requests in range (capped; narrow the filters to see
     more), one per row: when, model, backend, status, tokens, cache reads, cost,
     duration and caller.

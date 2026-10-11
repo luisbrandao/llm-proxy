@@ -513,29 +513,36 @@ async def admin_inflight_body(request_id: int, request: Request):
 @admin.get("/costs")
 async def admin_costs(
     request: Request, days: int = 30, day: str = "", model: str = "",
-    provider: str = "", limit: int = 200,
+    provider: str = "", limit: int = 200, since: str = "", until: str = "",
 ):
     """What each model cost, per day and per request — the Costs tab.
 
     Read from the cost ledger (app/ledger.py), the one per-request record that
-    survives a restart. `days` is the window (default 30; `0` = everything the
-    ledger keeps), `day` narrows the totals, the model table and the request
-    list to one local date while the per-day series keeps the whole window so
-    the chart stays navigable, and `model` (the name the client sent) and
-    `provider` filter everything. `limit` caps the request list (newest first).
+    survives a restart. The window is `days` (default 30; `0` = everything the
+    ledger keeps) or, to look at a specific week or month, `since` / `until`
+    (YYYY-MM-DD, inclusive; either may be given alone, and they win over `days`).
+    `day` narrows the totals, the model table and the request list to one local
+    date while the per-day series keeps the whole window so the chart stays
+    navigable, and `model` (the name the client sent) and `provider` filter
+    everything. `limit` caps the request list (newest first).
 
     A ledger that cannot be read is a 503 with the reason, never a traceback:
     the proxy itself is fine, only the tab is dark.
     """
-    if day:
-        try:
-            date.fromisoformat(day)
-        except ValueError:
-            return _bad("day must be YYYY-MM-DD")
+    parsed = {}
+    for name, value in (("day", day), ("since", since), ("until", until)):
+        if value:
+            try:
+                parsed[name] = date.fromisoformat(value)
+            except ValueError:
+                return _bad(f"{name} must be YYYY-MM-DD")
+    if "since" in parsed and "until" in parsed and parsed["since"] > parsed["until"]:
+        return _bad("since must not be after until")
     try:
         return await ledger.summary(
             days=max(0, days), day=day or None, model=model or None,
             provider=provider or None, limit=max(1, min(limit, 2000)),
+            since=since or None, until=until or None,
         )
     except Exception as e:  # noqa: BLE001 - a broken ledger file darkens one tab, not the proxy
         logger.warning("Cost ledger read failed: %s: %s", type(e).__name__, e)

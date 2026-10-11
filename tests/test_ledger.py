@@ -179,3 +179,64 @@ def test_startup_logs_the_ledger_it_opened(caplog):
     caplog.set_level(logging.INFO, logger="llm-proxy")
     ledger.startup()
     assert any("Cost ledger at :memory:" in r.getMessage() for r in caplog.records)
+
+
+async def test_an_explicit_window_picks_out_a_specific_week():
+    """A calendar week or month, not just "the last N days": `since`/`until`
+    are inclusive local dates and win over `days`."""
+    for back, cost in ((12, 1.0), (9, 2.0), (6, 4.0), (3, 8.0), (0, 16.0)):
+        await add(when=ago(back), usage=Usage(prompt=1, completion=1, cost=cost, currency="USD"))
+    since, until = ledger.local_day(ago(9)), ledger.local_day(ago(3))
+    s = await ledger.summary(days=1, since=since, until=until)
+    assert s["range"] == {"days": 1, "since": since, "until": until, "day": None}
+    assert s["totals"]["requests"] == 3 and s["totals"]["cost"] == pytest.approx(14.0)
+    # The day series covers exactly the window, ends included, nothing outside it.
+    assert [d["day"] for d in s["by_day"]] == [ledger.local_day(ago(b)) for b in (9, 6, 3)]
+    assert s["models"] == ["glm"]
+
+
+async def test_a_window_with_one_open_end():
+    await add(when=ago(20))
+    await add(when=ago(2))
+    await add()
+    s = await ledger.summary(since=ledger.local_day(ago(5)))
+    assert s["totals"]["requests"] == 2 and s["range"]["until"] == ledger.local_day()
+    s = await ledger.summary(until=ledger.local_day(ago(10)))
+    assert s["totals"]["requests"] == 1 and s["range"]["since"] is None
+
+
+async def test_a_window_in_the_past_has_no_today_in_it():
+    await add(when=ago(40), usage=Usage(prompt=1, completion=1, cost=3.0, currency="USD"))
+    await add()
+    s = await ledger.summary(since=ledger.local_day(ago(45)), until=ledger.local_day(ago(35)))
+    assert s["totals"]["requests"] == 1 and s["totals"]["cost"] == pytest.approx(3.0)
+
+
+async def test_priced_tokens_exclude_requests_that_carried_no_price():
+    """Cost per million tokens must divide by the tokens that were priced, or a
+    backend looks cheaper the more unpriced traffic it also served."""
+    await add(usage=Usage(prompt=900, completion=100, cost=0.5, currency="USD"))
+    await add(usage=Usage(prompt=5000, completion=5000))
+    t = (await ledger.summary())["totals"]
+    assert t["priced_tokens"] == 1000 and t["prompt"] == 5900
+
+
+async def test_ollama_hosts_are_one_backend_in_the_views_but_not_in_the_rows():
+    await add(provider="ollamaCitrine", model="local.glm", asked="local.glm")
+    await add(provider="ollamaGW", model="local.glm", asked="local.glm")
+    await add(provider="ollamaLuis", model="local.glm", asked="local.glm")
+    await add(provider="nano", usage=Usage(prompt=1, completion=1, cost=0.5, currency="USD"))
+
+    s = await ledger.summary()
+    by = {p["provider"]: p for p in s["by_provider"]}
+    assert set(by) == {"ollama", "nano"} and by["ollama"]["requests"] == 3
+    assert s["providers"] == ["nano", "ollama"]
+    local = next(m for m in s["by_model"] if m["model"] == "local.glm")
+    assert [(p["provider"], p["requests"]) for p in local["providers"]] == [("ollama", 3)]
+    # The request list keeps the real host, so which box answered is not lost.
+    assert {r["provider"] for r in s["requests"]} == {"ollamaCitrine", "ollamaGW", "ollamaLuis", "nano"}
+
+    # Filtering on the group takes every host in it; a real name stays exact.
+    assert (await ledger.summary(provider="ollama"))["totals"]["requests"] == 3
+    assert (await ledger.summary(provider="ollamaGW"))["totals"]["requests"] == 1
+    assert (await ledger.summary(provider="nano"))["totals"]["requests"] == 1

@@ -173,7 +173,7 @@ COSTS_FIELDS = {
 }
 COSTS_AGG_FIELDS = {
     "requests", "errors", "priced", "cost", "prompt", "completion", "cached", "cache_write",
-    "reasoning",
+    "reasoning", "priced_tokens",
 }
 COSTS_ROW_FIELDS = {
     "at", "day", "provider", "model", "asked", "served", "status", "stream", "op", "duration",
@@ -191,7 +191,7 @@ def test_costs_fields(client):
     ))
     body = client.get("/admin/costs?days=7", headers=AUTH).json()
     assert COSTS_FIELDS <= set(body), f"missing: {COSTS_FIELDS - set(body)}"
-    assert {"days", "since", "day"} <= set(body["range"]) and {"model", "provider"} <= set(body["filters"])
+    assert {"days", "since", "until", "day"} <= set(body["range"]) and {"model", "provider"} <= set(body["filters"])
     assert COSTS_AGG_FIELDS <= set(body["totals"])
     for group in ("by_day", "by_model", "by_provider"):
         assert body[group], f"{group} is empty"
@@ -213,3 +213,12 @@ def test_costs_rejects_a_malformed_day(client):
 def test_costs_never_leaks_an_api_key(client):
     text = client.get("/admin/costs", headers=AUTH).text
     assert "sk-not-for-export" not in text and '"api_key"' not in text
+
+
+def test_costs_accepts_an_explicit_window_and_rejects_a_bad_one(client):
+    ok = client.get("/admin/costs?since=2026-09-01&until=2026-09-30", headers=AUTH)
+    assert ok.status_code == 200
+    assert ok.json()["range"]["since"] == "2026-09-01" and ok.json()["range"]["until"] == "2026-09-30"
+    for query in ("since=nope", "until=2026-13-01", "since=2026-10-02&until=2026-10-01"):
+        r = client.get("/admin/costs?" + query, headers=AUTH)
+        assert r.status_code == 422, query

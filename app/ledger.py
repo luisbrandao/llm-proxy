@@ -106,12 +106,37 @@ _AGG_SQL = (
     "COUNT(*) AS agg_requests, SUM(status >= 400), SUM(cost IS NOT NULL), "
     "COALESCE(SUM(cost), 0) AS agg_cost, "
     "SUM(prompt_tokens), SUM(completion_tokens), SUM(cached_tokens), "
-    "SUM(cache_write_tokens), SUM(reasoning_tokens)"
+    "SUM(cache_write_tokens), SUM(reasoning_tokens), "
+    # Tokens on the requests that carried a price. Cost per million tokens has to
+    # divide by these, not by every token: an unpriced request adds tokens and no
+    # dollars, so dividing by all of them would make a backend look cheaper the
+    # more unpriced traffic it also served.
+    "SUM(CASE WHEN cost IS NOT NULL THEN prompt_tokens + completion_tokens ELSE 0 END)"
 )
 _AGG_COLUMNS = (
     "requests", "errors", "priced", "cost", "prompt", "completion", "cached",
-    "cache_write", "reasoning",
+    "cache_write", "reasoning", "priced_tokens",
 )
+
+
+# Backends that are one machine's worth of the same thing report under one name:
+# every `ollama*` provider (ollamaCitrine, ollamaGW, ollamaLuis) is "ollama" in the
+# backend views and filter, because "how much did the local boxes do" is the
+# question, not which of three identical hosts did it. Only the *views* group —
+# each ledger row keeps the real provider name, so the request list still says
+# which host answered.
+BACKEND_GROUPS = ("ollama",)
+_BACKEND_SQL = "CASE " + " ".join(
+    f"WHEN provider LIKE '{g}%' THEN '{g}'" for g in BACKEND_GROUPS
+) + " ELSE provider END"
+
+
+def _provider_clause(provider: str):
+    """The WHERE fragment for a backend filter: a group name matches every
+    provider in it, anything else is an exact provider."""
+    if provider in BACKEND_GROUPS:
+        return f"provider LIKE '{provider}%'", []
+    return "provider = ?", [provider]
 
 
 def local_day(now: Optional[datetime] = None) -> str:
@@ -224,23 +249,35 @@ def _where(clauses) -> str:
 
 
 def _summary(days: int, day: Optional[str], model: Optional[str],
-             provider: Optional[str], limit: int) -> dict:
+             provider: Optional[str], limit: int,
+             since: Optional[str] = None, until: Optional[str] = None) -> dict:
     with _lock:
         conn = _connect()
         if conn is None:
             return {"enabled": False, "path": "", "retention_days": conf.LEDGER_RETENTION_DAYS}
 
         today = local_day()
-        since = (date.fromisoformat(today) - timedelta(days=days - 1)).isoformat() if days > 0 else None
+        if since or until:
+            # An explicit window — a calendar week or month, any two dates —
+            # replaces the "last N days" one. Either end may be left open.
+            until = until or today
+        elif days > 0:
+            since = (date.fromisoformat(today) - timedelta(days=days - 1)).isoformat()
+            until = today
+        else:
+            until = today
 
         # The window every view shares: the range plus the model/provider filters.
         scope, params = [], []
         if since:
             scope.append("day >= ?"); params.append(since)
+        if until:
+            scope.append("day <= ?"); params.append(until)
         if model:
             scope.append("asked = ?"); params.append(model)
         if provider:
-            scope.append("provider = ?"); params.append(provider)
+            clause, extra = _provider_clause(provider)
+            scope.append(clause); params.extend(extra)
         # Everything except by_day also narrows to the selected day, so the
         # chart stays navigable (every day of the range stays visible) while the
         # totals, the model table and the request list answer for that day.
@@ -267,13 +304,13 @@ def _summary(days: int, day: Optional[str], model: Optional[str],
         by_model = {}
         for r in agg_by("asked", focus, fparams):
             by_model[r[0]] = {"model": r[0], "providers": [], **_agg(r[1:])}
-        for r in agg_by("asked, provider, model", focus, fparams):
+        for r in agg_by(f"asked, {_BACKEND_SQL}, model", focus, fparams):
             entry = by_model.get(r[0])
             if entry is not None:
                 entry["providers"].append({"provider": r[1], "model": r[2], **_agg(r[3:])})
 
         by_provider = [
-            {"provider": r[0], **_agg(r[1:])} for r in agg_by("provider", focus, fparams)
+            {"provider": r[0], **_agg(r[1:])} for r in agg_by(_BACKEND_SQL, focus, fparams)
         ]
 
         rows = conn.execute(
@@ -291,11 +328,13 @@ def _summary(days: int, day: Optional[str], model: Optional[str],
         range_only, rparams = [], []
         if since:
             range_only.append("day >= ?"); rparams.append(since)
+        if until:
+            range_only.append("day <= ?"); rparams.append(until)
         models = [r[0] for r in conn.execute(
             f"SELECT DISTINCT asked FROM requests{_where(range_only)} ORDER BY asked", rparams
         )]
         providers = [r[0] for r in conn.execute(
-            f"SELECT DISTINCT provider FROM requests{_where(range_only)} ORDER BY provider", rparams
+            f"SELECT DISTINCT {_BACKEND_SQL} AS backend FROM requests{_where(range_only)} ORDER BY backend", rparams
         )]
         currencies = [r[0] for r in conn.execute(
             f"SELECT DISTINCT currency FROM requests{_where(focus + ['cost IS NOT NULL'])} "
@@ -310,7 +349,7 @@ def _summary(days: int, day: Optional[str], model: Optional[str],
         "rows": int(count or 0),
         "oldest": oldest,
         "today": today,
-        "range": {"days": days, "since": since, "day": day},
+        "range": {"days": days, "since": since, "until": until, "day": day},
         "filters": {"model": model, "provider": provider},
         "totals": totals,
         "by_day": by_day,
@@ -325,13 +364,15 @@ def _summary(days: int, day: Optional[str], model: Optional[str],
 
 
 async def summary(days: int = 30, day: Optional[str] = None, model: Optional[str] = None,
-                  provider: Optional[str] = None, limit: int = 200) -> dict:
+                  provider: Optional[str] = None, limit: int = 200,
+                  since: Optional[str] = None, until: Optional[str] = None) -> dict:
     """What the Costs tab renders: totals, per-day, per-model (with the
     per-provider split under each), per-provider, and the newest `limit`
-    matching requests — all over the last `days` days (0 = everything kept),
-    optionally narrowed to one `day`, one `model` (the name the client sent) and
-    one `provider`."""
-    return await asyncio.to_thread(_summary, days, day, model, provider, limit)
+    matching requests — over the last `days` days (0 = everything kept), or over
+    the explicit `since`..`until` local dates (inclusive; either may be left open,
+    and they win over `days`), optionally narrowed to one `day`, one `model` (the
+    name the client sent) and one `provider`."""
+    return await asyncio.to_thread(_summary, days, day, model, provider, limit, since, until)
 
 
 def startup() -> None:
