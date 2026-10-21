@@ -50,6 +50,16 @@ providers:
     model_map:                 # native -> canonical
       deepseek-chat: deepseek-v4-pro
       deepseek-reasoner: deepseek-v4-flash
+    # DeepSeek reports cache hits but no price, so price it from a list. USD per
+    # 1M tokens by NATIVE id; used only when a response carries no usage.cost.
+    pricing:
+      models:
+        deepseek-reasoner: {input: 0.15, cached: 0.003, output: 0.60}
+        deepseek-chat: {input: 0.66, cached: 0.022, output: 1.98}
+      peak:                    # weekday UTC windows billed at 2x
+        multiplier: 2
+        weekdays: [mon, tue, wed, thu, fri]
+        utc_hours: ["01-04", "06-10"]
 
   - name: ollama
     api_key: ""

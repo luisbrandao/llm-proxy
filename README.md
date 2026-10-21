@@ -26,9 +26,10 @@ request a **clean model name** — the proxy decides *which* backend actually se
 - **In-flight visibility** — the console's In-flight tab lists every request currently
   running or queued, what each one is waiting on, and how long it has waited.
 - **Cost tracking** — the price each backend reports (`usage.cost`, as OpenRouter and
-  NanoGPT send it) and its prompt-cache hits are recorded per request in a small SQLite
-  ledger that survives restarts; the console's Costs tab breaks it down by model, by
-  day and by request.
+  NanoGPT send it), or a list price from a per-provider `pricing:` table for backends
+  that report none (DeepSeek), and its prompt-cache hits are recorded per request in a
+  small SQLite ledger that survives restarts; the console's Costs tab breaks it down by
+  model, by day and by request.
 - **Permission gate** — mark paid backends `require_permission: true`; only callers
   with a valid `Authorization: Bearer` key see or use them.
 - **OpenRouter provider routing** — pin which upstream OpenRouter uses (e.g. force
@@ -463,6 +464,7 @@ trim:
 | `provider_routing` | OpenRouter only — per-model upstream pinning, keyed by **native** id (list = strict order, dict = verbatim `provider` field) |
 | `headers` | Extra headers sent upstream, applied as **defaults** (a header the client already sent wins). For backend attribution the client can't set itself — e.g. OpenRouter app identity (`HTTP-Referer` / `X-Title`). Values support `${ENV}` |
 | `cache_ttl` | Seconds the live `/models` result is cached for this backend |
+| `pricing` | List prices for a backend whose responses carry **no** `usage.cost` (DeepSeek's own API). `models:` maps **native** id (or `"*"`) → `{input, cached, output}` USD per million tokens (`cached` defaults to `input`); optional `peak: {multiplier, weekdays, utc_hours}` surcharges a UTC window. Used only when the backend reports nothing. See [Cost tracking](#price-tables) |
 
 ### Canonical names
 
@@ -882,9 +884,34 @@ survives container recreates.
 
 A price the backend did not report is **unknown, not zero**: the ledger stores `NULL`,
 the tab shows `—` and counts how many requests were actually priced next to every total,
-so a total over mixed backends reads as the floor it is. For backends that never report a
-price, a per-model price table in the config is the natural next step; it is not there
-yet.
+so a total over mixed backends reads as the floor it is.
+
+### Price tables
+
+For a backend that never reports a price, give its provider block a `pricing:` table and
+the proxy prices each request itself, from the token counts the response *does* carry:
+
+```yaml
+  - name: deepseek
+    base_url: "https://api.deepseek.com"
+    pricing:                     # USD per 1M tokens, keyed by NATIVE model id
+      models:
+        deepseek-v4-flash: {input: 0.15, cached: 0.003, output: 0.60}
+      peak:                      # DeepSeek bills 2x on weekday UTC mornings
+        multiplier: 2
+        weekdays: [mon, tue, wed, thu, fri]
+        utc_hours: ["01-04", "06-10"]   # whole UTC hours, end exclusive
+```
+
+The price is `(in - cached) × input + cached × cached + out × output`, times the peak
+multiplier when the request **started** inside the window. Rates are the off-peak
+base. Such a price is an **estimate at list price**, not a charge: it flows to the same
+four places as a reported one, and the log line says so with `cost_src=table`. Three
+rules keep it honest: a price the backend *did* report always wins; a model missing from
+the table (and no `"*"` entry) stays unpriced; and a response with no usage block stays
+unpriced rather than costing zero. A malformed table fails the config load instead of
+pricing at zero. Vendor holidays (DeepSeek bills Chinese public holidays off-peak) are not
+modelled — those days read as peak, so the estimate errs high.
 
 ## Request Logging
 
@@ -905,7 +932,8 @@ ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=
 | `stream` | Whether the response was streamed |
 | `in`, `out`, `dur` | Prompt/completion tokens and wall-clock duration as `H:MM:SS` (rounded up to the second, so a fast request reads `0:00:01` not `0:00:00`) |
 | `cached`, `cache_write`, `reasoning` | Present only when the backend reported them: prompt tokens read from its prompt cache (a subset of `in`), prompt tokens written into it, and completion tokens spent thinking (a subset of `out`). See [Cost tracking](#cost-tracking) |
-| `cost` | What the backend said the request cost, in USD, as a plain decimal — present only when it reported one (OpenRouter, NanoGPT). `cost=0` means a free model; no field means the backend did not say. `sum by (asked) (sum_over_time({container="llm-proxy"} \| logfmt \| unwrap cost [$__range]))` charts spend per model in Grafana |
+| `cost` | What the request cost, in USD, as a plain decimal — present only when the backend reported one (OpenRouter, NanoGPT) or the provider has a [price table](#price-tables). `cost=0` means a free model; no field means nobody said. `sum by (asked) (sum_over_time({container="llm-proxy"} \| logfmt \| unwrap cost [$__range]))` charts spend per model in Grafana |
+| `cost_src` | `table` when `cost` is the proxy's list-price estimate from a [price table](#price-tables) rather than what the backend charged; absent otherwise |
 | `speed_tps` | Output tokens/s. **Omitted for embeddings & rerankers** — they return no completion tokens, so it would always be a misleading `0.00` |
 | `op`, `in_tps` | Present only on no-output ops (**`embedding`**, **`rerank`**): the op kind plus input tokens/s — the throughput that matters when nothing is generated |
 | `client_ip` | Caller address (`X-Forwarded-For`/`X-Real-IP` honored when `TRUST_PROXY_HEADERS`) |

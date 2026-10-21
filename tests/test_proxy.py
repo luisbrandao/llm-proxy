@@ -459,6 +459,79 @@ def test_a_streamed_price_reaches_the_ledger(client, upstreams, events):
     assert idle() == {"first": 0, "second": 0}
 
 
+# ── Price table (backends that report no cost) ─────────────────────────────
+
+@pytest.fixture
+def first_is_priced(upstreams, monkeypatch):
+    """Give `first` a price table, as DeepSeek's provider block has. No peak
+    window, so the result does not depend on when the suite runs."""
+    pricing = conf.Pricing(rates={"vendor/First-Native": conf.Rate(input=0.15, cached=0.003, output=0.60)})
+    monkeypatch.setattr(conf.PROVIDERS_BY_NAME["first"], "pricing", pricing)
+
+
+def _deepseek_shaped(prompt=6903, cached=6834, out=57):
+    c = completion(prompt=prompt, out=out)
+    c["usage"]["prompt_cache_hit_tokens"] = cached
+    c["usage"]["prompt_cache_miss_tokens"] = prompt - cached
+    return c
+
+
+TABLE_PRICE = (69 * 0.15 + 6834 * 0.003 + 57 * 0.60) / 1e6
+
+
+def test_an_unpriced_backend_is_priced_from_its_table(client, upstreams, events, first_is_priced):
+    """Same four readers as a reported price — and the log says where it came from."""
+    def metered():
+        # The counter is process-wide and earlier tests feed the same series, so
+        # assert on what this request added, not the absolute value.
+        m = re.search(r'llm_proxy_cost_total\{model="vendor/First-Native",provider="first"\} (\S+)',
+                      client.get("/metrics").text)
+        return float(m.group(1)) if m else 0.0
+
+    before = metered()
+    upstreams.set(lambda r: mock_response(200, json=_deepseek_shaped()))
+    client.post("/v1/chat/completions", json={"model": "grouped"})
+    line = next(l for l in events() if "event=request" in l)
+    assert "cost_src=table" in line and "cached=6834" in line
+    assert float(re.search(r" cost=(\S+)", line).group(1)) == pytest.approx(TABLE_PRICE, abs=1e-8)  # the log rounds to 8 places
+    assert client.get("/admin/inflight").json()["requests"][0]["cost"] == pytest.approx(TABLE_PRICE)
+    t = client.get("/admin/costs").json()["totals"]
+    assert t["priced"] == 1 and t["cost"] == pytest.approx(TABLE_PRICE)
+    assert metered() - before == pytest.approx(TABLE_PRICE)
+    assert idle() == {"first": 0, "second": 0}
+
+
+def test_a_reported_price_beats_the_table(client, upstreams, events, first_is_priced):
+    upstreams.set(lambda r: mock_response(200, json=priced()))
+    client.post("/v1/chat/completions", json={"model": "grouped"})
+    line = next(l for l in events() if "event=request" in l)
+    assert "cost=0.00036897" in line and "cost_src=" not in line
+
+
+def test_a_response_without_usage_stays_unpriced_despite_the_table(client, upstreams, events, first_is_priced):
+    body = completion()
+    del body["usage"]
+    upstreams.set(lambda r: mock_response(200, json=body))
+    client.post("/v1/chat/completions", json={"model": "grouped"})
+    line = next(l for l in events() if "event=request" in l)
+    assert "cost=" not in line, "no token counts is 'did not say', not free"
+
+
+def test_a_streamed_request_is_priced_from_the_table(client, upstreams, events, first_is_priced):
+    sse = (
+        b'data: {"model":"m","choices":[{"delta":{"content":"Hi"}}]}\n\n'
+        b'data: {"model":"m","choices":[],"usage":{"prompt_tokens":6903,"completion_tokens":57,'
+        b'"prompt_cache_hit_tokens":6834,"prompt_cache_miss_tokens":69}}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    upstreams.set(lambda r: mock_response(200, content=sse, headers={"content-type": "text/event-stream"}))
+    client.post("/v1/chat/completions", json={"model": "grouped", "stream": True})
+    req = client.get("/admin/costs").json()["requests"][0]
+    assert req["stream"] is True and req["cost"] == pytest.approx(TABLE_PRICE)
+    assert "cost_src=table" in next(l for l in events() if "event=request" in l)
+    assert idle() == {"first": 0, "second": 0}
+
+
 def test_a_failed_request_is_one_unpriced_ledger_row(client, upstreams):
     """Both backends 503: one failover, one relayed error, ONE row — the attempt
     that answered the client, not one per backend tried."""

@@ -2,7 +2,8 @@ import hashlib
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
 
 import yaml
 
@@ -31,6 +32,101 @@ KINDS = (KIND_HTTP, KIND_CLAUDE_CLI)
 # tracking the newest model of its family. There is no endpoint to ask, so this
 # stands in for discovery when enabled_models is empty.
 CLAUDE_CLI_MODELS = ("fable", "opus", "sonnet", "haiku")
+
+
+@dataclass(frozen=True)
+class Rate:
+    """One model's list price, USD per million tokens."""
+    input: float    # prompt tokens NOT served from the prompt cache
+    cached: float   # prompt tokens read from the cache (a subset of the prompt)
+    output: float   # completion tokens, reasoning included
+
+
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+@dataclass(frozen=True)
+class Peak:
+    """A surcharge window: inside it every rate is multiplied by `multiplier`.
+
+    DeepSeek's API bills double on weekday UTC mornings. Kept in UTC because
+    that is how vendors publish it, and so a TZ change on the host cannot
+    silently move the window. `hours` are (start, end) whole UTC hours, end
+    exclusive.
+    """
+    multiplier: float = 1.0
+    weekdays: frozenset = frozenset(range(5))   # datetime.weekday(): Mon=0
+    hours: Tuple[Tuple[int, int], ...] = ()
+
+    def applies(self, when: datetime) -> bool:
+        when = when.astimezone(timezone.utc)
+        return when.weekday() in self.weekdays and any(s <= when.hour < e for s, e in self.hours)
+
+
+@dataclass(frozen=True)
+class Pricing:
+    """A backend's price list, for backends whose responses carry no price.
+
+    `rates` is keyed by the NATIVE model id (what goes on the wire, and what the
+    request log calls `model=`); "*" covers unlisted models. A model with no
+    rate stays unpriced — an unknown price is never guessed as zero.
+    """
+    rates: Dict[str, Rate]
+    peak: Optional[Peak] = None
+
+    def price(self, model: str, prompt: int, cached: int, completion: int,
+              when: datetime) -> Optional[float]:
+        rate = self.rates.get(model) or self.rates.get("*")
+        if rate is None:
+            return None
+        cached = min(max(cached, 0), max(prompt, 0))
+        cost = ((prompt - cached) * rate.input + cached * rate.cached
+                + completion * rate.output) / 1_000_000
+        if self.peak is not None and self.peak.applies(when):
+            cost *= self.peak.multiplier
+        return cost
+
+
+def _hour_span(value, where: str) -> Tuple[int, int]:
+    """`"01-04"` or `[1, 4]` -> (1, 4)."""
+    parts = value.split("-") if isinstance(value, str) else value
+    try:
+        start, end = (int(x) for x in parts)
+    except (TypeError, ValueError):
+        raise ValueError(f"{where}: hour span {value!r} must look like \"01-04\" or [1, 4]")
+    if not 0 <= start < end <= 24:
+        raise ValueError(f"{where}: hour span {value!r} must satisfy 0 <= start < end <= 24")
+    return start, end
+
+
+def _pricing(raw, where: str) -> Optional[Pricing]:
+    """Parse a provider's `pricing:` block. Loud on a malformed table: a typo
+    that silently prices at zero would be worse than no table at all."""
+    if not raw:
+        return None
+    rates = {}
+    for model, r in (raw.get("models") or {}).items():
+        try:
+            rates[str(model)] = Rate(
+                input=float(r["input"]), cached=float(r.get("cached", r["input"])),
+                output=float(r["output"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(f"{where}: model {model!r} needs numeric input/output (cached optional)")
+    peak = None
+    p = raw.get("peak")
+    if p:
+        days = p.get("weekdays", list(WEEKDAYS[:5]))
+        try:
+            weekdays = frozenset(WEEKDAYS.index(str(d).lower()[:3]) for d in days)
+        except ValueError:
+            raise ValueError(f"{where}: peak weekdays must be names like mon, tue, …")
+        peak = Peak(
+            multiplier=float(p.get("multiplier", 1)),
+            weekdays=weekdays,
+            hours=tuple(_hour_span(h, where) for h in (p.get("utc_hours") or [])),
+        )
+    return Pricing(rates=rates, peak=peak)
 
 
 @dataclass
@@ -80,6 +176,9 @@ class Provider:
     # `http` only; the routing fields (models, slots, priority, permission) apply
     # to every kind.
     kind: str = KIND_HTTP
+    # Price list used only when a response carries no `usage.cost` (DeepSeek's
+    # own API). See `Pricing`.
+    pricing: Optional[Pricing] = None
     # Reverse of model_map (canonical name -> native id), built in __post_init__.
     _to_native: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
@@ -282,6 +381,7 @@ def _load(text: bytes):
                 strip_path_prefix=str(item.get("strip_path_prefix", "")),
                 strip_fields=item.get("strip_fields") or [],
                 headers={str(k): _interpolate(str(v)) for k, v in (item.get("headers") or {}).items()},
+                pricing=_pricing(item.get("pricing"), f"provider {item['name']!r} pricing"),
             )
         )
 

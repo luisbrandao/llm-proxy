@@ -5,7 +5,7 @@ import logging
 import math
 import time
 import zlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Union
 
 import httpx
@@ -272,6 +272,9 @@ async def _emit_request_log(
             "cache_write": usage.cache_write or None,
             "reasoning": usage.reasoning or None,
             "cost": format_cost(usage.cost),
+            # Present only when the price is the proxy's list-price estimate
+            # (the provider's `pricing:` table), not what the backend charged.
+            "cost_src": "table" if usage.estimated else None,
             # H:MM:SS, rounded UP to the whole second so a sub-second request
             # reads 0:00:01, never a misleading 0:00:00.
             "dur": str(timedelta(seconds=math.ceil(duration))),
@@ -317,6 +320,26 @@ def _log_upstream_error(provider: str, model: str, status: int, body: str) -> No
         snippet = snippet[:4000] + "... [truncated]"
     qualifier = "passthrough" if model == "unknown" else f"model: {model}"
     logger.warning(f"Upstream error {status} from '{provider}' ({qualifier}):\n{snippet}")
+
+
+def _apply_pricing(provider: Provider, model: str, usage: Usage, started: float) -> None:
+    """Price a request from the provider's `pricing:` table when the backend did not.
+
+    A price the backend reported always wins, and a request with no token counts
+    (no usage block at all) stays unpriced — zero tokens is "did not say", not
+    "free". Priced at the request's start, so a request straddling the edge of a
+    peak window is billed the way it was admitted.
+    """
+    if usage.cost is not None or provider.pricing is None:
+        return
+    if not (usage.prompt or usage.completion):
+        return
+    cost = provider.pricing.price(
+        model, usage.prompt, usage.cached, usage.completion,
+        datetime.fromtimestamp(started, timezone.utc),
+    )
+    if cost is not None:
+        usage.cost, usage.currency, usage.estimated = cost, "USD", True
 
 
 def _record_metrics(provider: str, model: str, usage: Usage, duration: float) -> None:
@@ -433,6 +456,8 @@ async def _handle_non_stream(
             served = data["model"]
     except ValueError:
         pass
+    if not is_error:
+        _apply_pricing(provider, model, usage, start)
 
     if is_error:
         _log_upstream_error(pname, model, status_code, resp_body)
@@ -616,6 +641,8 @@ async def _handle_stream(
             # handler returns long before the body is done. record-then-finish, so
             # the history row carries the outcome and not just "it ended".
             duration = time.time() - start
+            if not error:
+                _apply_pricing(provider, model, usage, start)
             if entry is not None:
                 entry.record(status_code, usage, duration)
                 entry.finish()

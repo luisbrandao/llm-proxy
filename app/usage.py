@@ -40,6 +40,9 @@ class Usage:
     # What the backend says this request cost, in `currency`. None = not reported.
     cost: Optional[float] = None
     currency: Optional[str] = None
+    # True when `cost` came from the provider's `pricing:` table rather than the
+    # backend: a list-price estimate, logged as `cost_src=table`.
+    estimated: bool = False
 
     @property
     def priced(self) -> bool:
