@@ -37,7 +37,7 @@ if not FIXTURE_CONFIG.exists():
 os.environ.setdefault("CONFIG_PATH", str(FIXTURE_CONFIG))
 
 from app import config as conf  # noqa: E402
-from app import inflight, ledger, rates, registry, slots, smart, trim  # noqa: E402
+from app import inflight, ledger, notify, rates, registry, slots, smart, trim  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -71,6 +71,7 @@ def reset_state(monkeypatch):
     smart._shares = {}
     smart._refreshed_at = None
     rates.reset()
+    notify.reset()
     inflight._active.clear()
     inflight._recent.clear()
     inflight._bodies.clear()
@@ -89,6 +90,13 @@ def no_smart_refresh_loop(monkeypatch):
 
     monkeypatch.setattr(smart, "refresh_loop", idle)
     monkeypatch.setattr(rates, "refresh_loop", idle)
+    monkeypatch.setattr(notify, "loop", idle)
+
+
+@pytest.fixture(autouse=True)
+def no_notifications(monkeypatch):
+    """Warnings go nowhere unless a test configures `notify:` and mocks ntfy itself."""
+    monkeypatch.setattr(conf, "NOTIFY", conf.Notify())
 
 
 @pytest.fixture(autouse=True)

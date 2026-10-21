@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app import auth, configwrite, inflight, ledger, logbuffer, rates, registry, slots, smart, upstream, version
+from app import auth, configwrite, inflight, ledger, logbuffer, notify, rates, registry, slots, smart, upstream, version
 from app import config as conf
 from app.metrics import metrics_response
 from app.proxy import proxy_request
@@ -204,6 +204,8 @@ async def lifespan(app: FastAPI):
     smart_task = asyncio.create_task(smart.refresh_loop())
     # Published rates, subscription quota and balances, from the vendors' own APIs.
     rates_task = asyncio.create_task(rates.refresh_loop())
+    # Warnings (low balance, used-up allowance) to ntfy, when `notify:` is configured.
+    notify_task = asyncio.create_task(notify.loop())
     try:
         yield
     finally:
@@ -211,6 +213,7 @@ async def lifespan(app: FastAPI):
             reload_task.cancel()
         smart_task.cancel()
         rates_task.cancel()
+        notify_task.cancel()
         # Close the shared upstream connection pools (see app/upstream.py).
         await upstream.aclose()
         ledger.close()

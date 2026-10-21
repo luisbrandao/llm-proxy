@@ -321,7 +321,7 @@ class Routing:
     # limiting by default; 4xx like 400/404 are request problems every backend
     # would reject identically, so they're relayed as-is.
     failover_statuses: frozenset = field(
-        default_factory=lambda: frozenset({429, 500, 502, 503, 504})
+        default_factory=lambda: frozenset({402, 429, 500, 502, 503, 504})
     )
     # Cost-aware ordering of one model's backends (app/smart.py). Off by default:
     # the configured `priority` order — which puts the cheaper quota first — is
@@ -337,6 +337,27 @@ class Routing:
 
 # Where the Dockerfile puts the tokenizer the context guardrail counts with.
 DEFAULT_TOKENIZER = "/app/tokenizers/qwen3.8.json"
+
+
+@dataclass
+class Notify:
+    """Where warnings go (app/notify.py): an ntfy topic, and when a balance is "low".
+
+    Off until `url` is set. `low_balance` is the default threshold in the account's own
+    currency (USD for the three vendors read today), `low_balance_by` overrides it per
+    provider, and a warning that is still true is repeated every `reminder_hours`."""
+    url: str = ""
+    token: str = ""
+    low_balance: float = 1.0
+    low_balance_by: Dict[str, float] = field(default_factory=dict)
+    reminder_hours: float = 12.0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.url)
+
+    def threshold(self, provider: str) -> float:
+        return self.low_balance_by.get(provider, self.low_balance)
 
 
 @dataclass
@@ -465,9 +486,21 @@ def _load(text: bytes):
         failover_statuses=(
             frozenset(int(s) for s in fos)
             if fos is not None
-            else frozenset({429, 500, 502, 503, 504})
+            else frozenset({402, 429, 500, 502, 503, 504})
         ),
     )
+
+    nt = raw.get("notify") or {}
+    try:
+        notify = Notify(
+            url=_interpolate(str(nt.get("ntfy") or "")).strip(),
+            token=_interpolate(str(nt.get("token") or "")).strip(),
+            low_balance=max(0.0, float(nt.get("low_balance", 1.0))),
+            low_balance_by={str(k): max(0.0, float(v)) for k, v in (nt.get("low_balance_by") or {}).items()},
+            reminder_hours=max(0.1, float(nt.get("reminder_hours", 12.0))),
+        )
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"notify: thresholds must be numbers ({e})")
 
     tr = raw.get("trim") or {}
     trim = Trim(
@@ -492,7 +525,7 @@ def _load(text: bytes):
         if k:
             auth_keys.add(k)
 
-    return providers, aliases, logical, routing, auth_keys, trim
+    return providers, aliases, logical, routing, auth_keys, trim, notify
 
 
 def _boot():
@@ -505,7 +538,7 @@ def _boot():
     return _load(text)
 
 
-PROVIDERS, ALIASES, LOGICAL_MODELS, ROUTING, AUTH_KEYS, TRIM = _boot()
+PROVIDERS, ALIASES, LOGICAL_MODELS, ROUTING, AUTH_KEYS, TRIM, NOTIFY = _boot()
 PROVIDERS_BY_NAME = {p.name: p for p in PROVIDERS}
 
 
@@ -527,7 +560,7 @@ def reload_if_changed() -> bool:
     parsed (and logged by the caller) once, not on every tick; the next real
     edit triggers a retry.
     """
-    global PROVIDERS, ALIASES, LOGICAL_MODELS, ROUTING, AUTH_KEYS, TRIM, PROVIDERS_BY_NAME
+    global PROVIDERS, ALIASES, LOGICAL_MODELS, ROUTING, AUTH_KEYS, TRIM, NOTIFY, PROVIDERS_BY_NAME
     global _last_sig, _loaded_digest
     sig = _stat_sig()
     if sig == _last_sig:
@@ -537,13 +570,14 @@ def reload_if_changed() -> bool:
     digest = hashlib.sha256(text).hexdigest()
     if digest == _loaded_digest:
         return False
-    providers, aliases, logical, routing, auth_keys, trim = _load(text)
+    providers, aliases, logical, routing, auth_keys, trim, notify = _load(text)
     PROVIDERS = providers
     ALIASES = aliases
     LOGICAL_MODELS = logical
     ROUTING = routing
     AUTH_KEYS = auth_keys
     TRIM = trim
+    NOTIFY = notify
     PROVIDERS_BY_NAME = {p.name: p for p in providers}
     _loaded_digest = digest
     return True

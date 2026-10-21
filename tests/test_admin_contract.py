@@ -248,7 +248,7 @@ def test_the_smart_endpoint_refuses_bad_input(client, body):
 
 
 # Every field the Costs tab reads from /admin/accounts.
-ACCOUNT_FIELDS = {"name", "vendor", "balance", "quota", "updated_at", "rates_at", "error"}
+ACCOUNT_FIELDS = {"name", "vendor", "balance", "quota", "state", "low_threshold", "updated_at", "rates_at", "error"}
 QUOTA_FIELDS = {"used", "limit", "remaining", "percent", "reset_at", "allow_overage", "available", "mode"}
 
 

@@ -177,7 +177,7 @@ routing:
   # Upstream HTTP statuses that count as a "backend error" and trigger failover
   # to the next target (a connection failure always does). 4xx like 400/404 are
   # relayed as-is — every backend would reject them the same way. Default below.
-  failover_statuses: [429, 500, 502, 503, 504]
+  failover_statuses: [402, 429, 500, 502, 503, 504]   # 402: balance ran out between two reads
   # Smart routing: try a model's backends cheapest-first, ranked by what the cost
   # ledger has seen each one charge per million tokens (see README "Smart routing").
   # OFF by default — the priority order above runs unless this is true. Switchable
@@ -192,6 +192,18 @@ routing:
   # backend_modes:
   #   google: fixed
   #   nanoGPT: first
+
+# Warnings to an ntfy topic (see README "Warnings"): a balance running low or empty, a
+# subscription allowance used up, a payment refused. Off until `ntfy` is set. Inside the
+# docker network the topic is http://ntfy:80/<topic>; `token` is sent as a Bearer token
+# when the server needs one. One message when a condition becomes true, a reminder every
+# `reminder_hours` while it stays true, and a recovery message when it clears.
+# notify:
+#   ntfy: "http://ntfy:80/llm-proxy"
+#   token: "tk_..."               # or "${NTFY_TOKEN}"
+#   low_balance: 1.0              # warn under this many dollars (the account's own currency)
+#   low_balance_by: {openRouter: 5.0}   # per-backend override
+#   reminder_hours: 12
 
 # Context guardrail (see README "Context guardrail"). Acts only on a chat body
 # that carries an integer `num_ctx` (Open WebUI sends the model's configured

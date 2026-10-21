@@ -121,6 +121,38 @@ def quota_state(provider: str, native: Optional[str]) -> Optional[str]:
     return "billed" if q.allow_overage else "refused"
 
 
+# A balance at or below this counts as empty: a cent is below what any request costs, and
+# an exact zero is not how a prepaid account runs out (it goes a few millicents negative,
+# or sits at a remainder no request can use).
+EMPTY_BELOW = 0.01
+
+
+def out_of_funds(provider: str) -> bool:
+    """True when a backend has no money to serve a request with, as last read.
+
+    A subscription with allowance left pays for itself whatever the balance says, so it
+    is never out of funds. A backend whose balance we cannot read is assumed fine: the
+    cost of a wrong "empty" is a working backend skipped until the next read, the cost
+    of a wrong "fine" is one request that fails over."""
+    b = _balances.get(provider)
+    if b is None:
+        return False
+    q = _quotas.get(provider)
+    if q is not None and q.available:
+        return False
+    return b.amount <= EMPTY_BELOW
+
+
+def funds_state(provider: str) -> Optional[str]:
+    """`empty`, `low` (under the `notify:` threshold) or `ok`; None when unread."""
+    b = _balances.get(provider)
+    if b is None:
+        return None
+    if out_of_funds(provider):
+        return "empty"
+    return "low" if b.amount < conf.NOTIFY.threshold(provider) else "ok"
+
+
 def expected_per_mtok(card: RateCard, when: datetime, cache_share: float, out_share: float) -> float:
     """Blended USD per million tokens for a request mix.
 
@@ -299,6 +331,8 @@ def accounts_snapshot() -> dict:
                 "reset_at": q.reset_at, "allow_overage": q.allow_overage,
                 "available": q.available, "mode": q.mode,
             } if q else None,
+            "state": funds_state(p.name),
+            "low_threshold": conf.NOTIFY.threshold(p.name),
             "updated_at": _account_at.get(p.name),
             "rates_at": _catalog_at.get(p.name),
             "error": "; ".join(errors) or None,

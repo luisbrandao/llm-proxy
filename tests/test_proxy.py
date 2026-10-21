@@ -70,7 +70,7 @@ routing:
   queue_timeout: 3
   failover: true
   down_backoff: 15
-  failover_statuses: [429, 500, 502, 503, 504]
+  failover_statuses: [402, 429, 500, 502, 503, 504]
 """
 
 
@@ -306,6 +306,52 @@ def test_history_row_tokens_per_second_is_the_logged_number(client, upstreams, e
     # is untyped, so a dropped one is a blank cell, not an error.
     assert {"tps", "estimated", "in_tokens", "out_tokens", "duration", "queued_for",
             "running_for", "chunks", "req_bytes"} <= set(row)
+
+
+# ── An empty balance ────────────────────────────────────────────────────────
+
+def _empty(provider):
+    from app import rates
+    from app.providers import Balance
+    rates._balances[provider] = Balance("USD", 0.0)
+
+
+def test_a_backend_with_no_money_is_skipped_while_another_can_serve(client, upstreams):
+    _empty("first")
+    r = client.post("/v1/chat/completions", json={"model": "grouped"})
+    assert r.status_code == 200
+    assert [upstreams.host(x) for x in upstreams.requests] == ["second.invalid"]
+    assert idle() == {"first": 0, "second": 0}
+
+
+def test_when_every_backend_looks_empty_the_request_is_still_tried(client, upstreams):
+    """A balance is only as fresh as the last read; refusing would be worse than trying."""
+    _empty("first"); _empty("second")
+    assert client.post("/v1/chat/completions", json={"model": "grouped"}).status_code == 200
+    assert [upstreams.host(x) for x in upstreams.requests] == ["first.invalid"]
+
+
+def test_a_402_moves_the_request_on_and_raises_the_alarm(client, upstreams, monkeypatch):
+    """The balance ran out between two reads: the client must not see the 402."""
+    from app import notify
+    raised = []
+    monkeypatch.setattr(notify, "payment_required", lambda provider, model=None: raised.append((provider, model)))
+    upstreams.set(lambda r: mock_response(402, json={"error": {"message": "Insufficient Balance"}})
+                  if upstreams.host(r) == "first.invalid" else mock_response(200, json=completion()))
+    r = client.post("/v1/chat/completions", json={"model": "grouped"})
+    assert r.status_code == 200
+    assert [upstreams.host(x) for x in upstreams.requests] == ["first.invalid", "second.invalid"]
+    assert raised == [("first", "vendor/First-Native")]
+    assert idle() == {"first": 0, "second": 0}
+
+
+def test_a_402_from_the_last_backend_is_relayed_verbatim(client, upstreams, monkeypatch):
+    from app import notify
+    monkeypatch.setattr(notify, "payment_required", lambda *a, **k: None)
+    upstreams.set(lambda r: mock_response(402, json={"error": {"message": "Insufficient Balance"}}))
+    r = client.post("/v1/chat/completions", json={"model": "grouped"})
+    assert r.status_code == 402 and "Insufficient Balance" in r.text
+    assert idle() == {"first": 0, "second": 0}
 
 
 # ── Moving a conversation between backends ──────────────────────────────────

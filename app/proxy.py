@@ -14,7 +14,7 @@ from fastapi.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from app import config as conf
-from app import auth, claude_cli, clientinfo, inflight, ledger, registry, router, slots, smart, trim, upstream
+from app import auth, claude_cli, clientinfo, inflight, ledger, notify, rates, registry, router, slots, smart, trim, upstream
 from app.config import Provider
 from app.metrics import (
     COST_TOTAL,
@@ -836,6 +836,11 @@ async def _dispatch(
             )
             continue
 
+        if resp.status_code == 402:
+            # Payment required: the backend's balance ran out between two reads. The
+            # failover below moves this request on; the warning is fire-and-forget.
+            notify.payment_required(target.provider, target.model)
+
         # The backend answered with a retryable error status (the connection was
         # fine, the response wasn't). Try the next target if any remain; otherwise
         # fall through and relay this error to the client verbatim.
@@ -1021,9 +1026,12 @@ async def _route(
         if not targets:
             return _unauthorized(raw_model)
 
-    # Prefer backends not currently marked down, but keep them as a last resort.
+    # Prefer backends that are up and have money, but keep the rest as a last resort: a
+    # backend marked down may have recovered, and a balance is only as fresh as the last
+    # read, so something we believe is empty is still better than refusing the request.
     healthy = [t for t in targets if not registry.is_down(t.provider)]
-    candidates = healthy or targets
+    funded = [t for t in healthy if not rates.out_of_funds(t.provider)]
+    candidates = funded or healthy or targets
 
     # Smart routing (app/smart.py): cheapest backend first, when switched on, and
     # the operator's `first`/`last` overrides, always. A reorder of the candidates

@@ -1943,7 +1943,7 @@ function costAccounts() {
   const rows = (accountsData && accountsData.accounts) || [];
   if (!rows.length) { wrap.style.display = "none"; return wrap; }
   for (const a of rows) {
-    const t = el("div", "caccount" + (a.error ? " err" : ""));
+    const t = el("div", "caccount" + (a.error ? " err" : "") + (a.state === "empty" ? " empty" : a.state === "low" ? " low" : ""));
     t.appendChild(el("div", "cacchead", a.name));
     if (a.balance) {
       const money = a.balance.currency === "USD" ? "$" + a.balance.amount.toFixed(2) : a.balance.amount.toFixed(2) + " " + a.balance.currency;
@@ -1966,6 +1966,11 @@ function costAccounts() {
       if (!q.available) {
         t.appendChild(el("div", "ctsub warnline", q.allow_overage ? "allowance used up — billing the balance" : "allowance used up"));
       }
+    }
+    if (a.state === "empty") {
+      t.appendChild(el("div", "ctsub warnline bad", "balance empty — requests skip this backend and fail over"));
+    } else if (a.state === "low") {
+      t.appendChild(el("div", "ctsub warnline", "balance low — under the " + (a.balance.currency === "USD" ? "$" : "") + a.low_threshold.toFixed(2) + " warning level"));
     }
     const foot = el("div", "ctsub muted");
     foot.textContent = "read " + ago(a.updated_at) + (a.rates_at ? " · rates " + ago(a.rates_at) : "");

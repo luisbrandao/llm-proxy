@@ -497,7 +497,9 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
   background: var(--bg-2); border: 1px solid var(--line); border-radius: 9px; padding: 10px 13px;
   display: flex; flex-direction: column; gap: 5px; min-width: 0;
 }
-.caccount.err { border-color: rgba(224,169,59,.5); }
+.caccount.err, .caccount.low { border-color: rgba(224,169,59,.5); }
+.caccount.empty { border-color: rgba(229,96,77,.6); background: rgba(229,96,77,.06); }
+.warnline.bad { color: var(--red); }
 .cacchead { font-family: var(--mono); font-weight: 600; font-size: 13px; color: #fff; }
 .caccbal .ctvalue { font-size: 20px; }
 .cmeter { height: 8px; background: var(--bg); border: 1px solid var(--line-2); border-radius: 4px; overflow: hidden; }

@@ -170,8 +170,8 @@ again.
 If a chosen backend errors the proxy releases the slot, marks the backend down for
 `routing.down_backoff` seconds, and retries the next-priority target. "Errors" means both
 a connection-level failure (connection refused, timeout, …) **and** an upstream HTTP
-response whose status is in `routing.failover_statuses` (default `429, 500, 502, 503,
-504`) — a backend that answers `503 Service Unavailable` is failed over just like one
+response whose status is in `routing.failover_statuses` (default `402, 429, 500, 502,
+503, 504`) — a backend that answers `503 Service Unavailable` is failed over just like one
 that's unreachable. Deliberate 4xx (bad request, auth) are relayed to the client as-is,
 since every backend would reject them identically. Once **all** candidates fail, the
 client gets the last upstream error verbatim (its real status and body), not a synthetic
@@ -205,6 +205,30 @@ while the counter's `remaining` is above zero: nano's own `recommendedMode` verd
 `subscription` for a while after the allowance is gone and requests are already being billed, so
 it can veto but never grant. The allowance covers only some models: one outside the subscription bills the balance even while allowance remains, which is
 why the covered list is read too.
+
+### Empty balances and warnings
+
+A prepaid backend that runs dry used to hand your client its raw `402 Insufficient Balance`.
+Now:
+
+- **Skipped while another can serve.** A backend whose balance was last read as empty (a cent or
+  less, with no subscription allowance left to pay for it) is moved to the end of the line, like
+  one marked down. If every backend looks empty the request is still tried, because a balance is
+  only as fresh as the last read (every couple of minutes).
+- **A 402 fails over.** `402` is in the default `failover_statuses`, so when an account empties
+  *between* two reads the request moves to the next backend instead of reaching your client, and
+  the last backend's 402 is relayed verbatim if nothing else can serve it.
+- **The Costs tab says so.** An account tile turns amber under the warning level and red when
+  empty.
+
+Set `notify:` in the config and the proxy also **warns you on ntfy**: a balance under its
+threshold (`low_balance`, default $1, per backend with `low_balance_by`), a balance empty, a
+subscription allowance used up (and what happens next), a payment refused on a live request, and
+a recovery message when you top up. One message when a condition *becomes* true, a reminder every
+`reminder_hours` (12) while it stays true. A restart does not re-announce what is already true,
+a message that ntfy did not accept is retried on the next check rather than lost, and nothing in
+it can fail or slow a request. Off until `notify.ntfy` is set; inside the docker network the topic
+is `http://ntfy:80/<topic>`, and `notify.token` is sent as a Bearer token for a server with auth.
 
 ### Moving a conversation between backends
 
@@ -484,7 +508,7 @@ routing:
   failover: true      # retry the next target on backend error
   auto_group: true    # identical canonical names across backends load-balance
   down_backoff: 15    # seconds a failed backend is skipped before retry
-  failover_statuses: [429, 500, 502, 503, 504]  # upstream statuses that fail over
+  failover_statuses: [402, 429, 500, 502, 503, 504]  # upstream statuses that fail over
 
 # Context guardrail: shrink a chat that cannot fit the `num_ctx` it declares.
 trim:
@@ -629,7 +653,7 @@ model name (e.g. `deepseek-v4-flash`). Pass `Authorization: Bearer <key>` for ga
 | `/admin/inflight` | `GET` | The request feed: live (running + queued) plus recent finished ones, with per-provider slot occupancy |
 | `/admin/inflight/{id}/cancel` | `POST` | Kill one in-flight request. `404` if it already finished |
 | `/admin/inflight/{id}/body` | `GET` | The prompt and reply captured for one row (see `INFLIGHT_BODIES`) |
-| `/admin/accounts` | `GET` | Each backend's balance and subscription quota as the vendors last reported them (read in the background every couple of minutes; numbers only, no keys) |
+| `/admin/accounts` | `GET` | Each backend's balance (with `state`: `ok`, `low` or `empty`) and subscription quota as the vendors last reported them (read in the background every couple of minutes; numbers only, no keys) |
 | `/admin/costs` | `GET` | Cost and token totals from the [ledger](#cost-tracking): per day, per model (with each model's split across backends), per backend, plus the newest requests. `?days=30` or an explicit `since=YYYY-MM-DD&until=YYYY-MM-DD` window, narrowed with `day=`, `model=`, `provider=`, capped by `limit=200` |
 | `/favicon.ico`, `/robots.txt` | `GET` | Served directly, so browser noise never reaches the proxy path |
 | `/admin/upstream-models` | `GET` | Probes every backend's raw `/v1/models` directly (`?provider=name` for just one) |
