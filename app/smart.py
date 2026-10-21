@@ -159,15 +159,22 @@ def _rank(base: list, asked: str) -> Tuple[list, dict]:
 
 
 def _override(order: list) -> Tuple[list, bool]:
-    """Apply `first` / `last`. Priorities become strictly 1..n: a forced backend
-    that merely tied with another at priority 1 would still be round-robined with
-    it, which is not "use X because I said so"."""
+    """Apply `first` / `last`; returns the list and whether the override *changed* anything.
+
+    Priorities become strictly 1..n: a forced backend that merely tied with another at
+    priority 1 would still be round-robined with it, which is not "use X because I said
+    so". "Changed" means the order moved, or a priority tie existed that the strict
+    numbering has now broken (that alters which backend a free slot goes to). An override
+    that is in force but already agrees with the order — `last` on a backend that is
+    already last — changes nothing, and must not be reported as if it had."""
     first = [t for t in order if mode_of(t.provider) == "first"]
     last = [t for t in order if mode_of(t.provider) == "last"]
     if not first and not last:
         return order, False
     rest = [t for t in order if mode_of(t.provider) not in ("first", "last")]
-    return [dataclasses.replace(t, priority=i + 1) for i, t in enumerate(first + rest + last)], True
+    final = [dataclasses.replace(t, priority=i + 1) for i, t in enumerate(first + rest + last)]
+    tied = len({t.priority for t in order}) < len(order)
+    return final, tied or [t.provider for t in final] != [t.provider for t in order]
 
 
 def _num(price: float) -> Optional[float]:
@@ -194,7 +201,11 @@ def order(targets: list, asked: str) -> Tuple[list, Optional[dict]]:
     if not smart_moved and not pinned:
         return base, None
     return final, {
-        "by": "pinned" if pinned else "smart",
+        # What actually moved the order: the cost ranking, your first/last override,
+        # or both. Nothing is reported when neither changed anything.
+        "by": "smart+pinned" if smart_moved and pinned else "pinned" if pinned else "smart",
+        "smart": smart_moved,
+        "pinned": pinned,
         "to": final[0].provider,
         "prices": {p: _num(v[0]) for p, v in seen.items()},
         "sources": {p: v[1] for p, v in seen.items()},

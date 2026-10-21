@@ -538,12 +538,10 @@ function fillFlightRow(row, r) {
     line1.appendChild(tr);
   }
   if (r.routed) {
-    const rt = el("span", "fltag " + (r.routed.by === "pinned" ? "warn" : ""), r.routed.by === "pinned" ? "pinned" : "smart");
-    const prices = Object.entries(r.routed.prices || {}).map(([p, v]) => p + " " + fmtCost(v) + "/M").join(" · ");
-    rt.title = (r.routed.by === "pinned"
-      ? "an operator override (first/last) set the backend order"
-      : "smart routing put the cheapest backend first")
-      + " — tried first: " + r.routed.to + (prices ? " · observed " + prices : "");
+    const rt = el("span", "fltag " + (r.routed.pinned ? "warn" : ""), r.routed.by);
+    const prices = Object.entries(r.routed.prices || {}).map(([p, v]) => p + " " + (v == null ? "refuses" : fmtCost(v) + "/M")).join(" · ");
+    rt.title = routedWhy(r.routed)
+      + " — tried first: " + r.routed.to + (prices ? " · priced " + prices : "");
     line1.appendChild(rt);
   }
   if (r.cached) {
@@ -1500,6 +1498,18 @@ async function loadRouting() {
   renderAliases(data.aliases || {});
 }
 
+/* What moved a model's backend order, in words: the cost ranking, an operator override, or both.
+ * `pinned` appears only when a first/last setting changed the order — an override that
+ * already agrees with it is in force but moves nothing, and says nothing. */
+function routedWhy(x) {
+  const smart = x.smart != null ? x.smart : x.by === "smart" || x.by === "smart+pinned";
+  const pinned = x.pinned != null ? x.pinned : x.by === "pinned" || x.by === "smart+pinned";
+  const parts = [];
+  if (smart) parts.push("smart routing reordered the backends by cost");
+  if (pinned) parts.push("your first/last setting changed the order");
+  return parts.join(" and ");
+}
+
 /* ── Routing: smart routing ───────────────────────────────── */
 /* The switch for cost-aware ordering of a model's backends (app/smart.py), the
  * per-backend override ("use X because I said so"), and what the ranking sees.
@@ -1603,7 +1613,11 @@ function renderSmart(s, readOnly) {
       const changed = m.by != null;
       tr.appendChild(td(m.current.join(" → "), "cwho" + (changed ? " cnow" : "")));
       const badge = el("td");
-      if (changed) badge.appendChild(el("span", "fltag " + (m.by === "pinned" ? "warn" : ""), m.by));
+      if (changed) {
+        const tag = el("span", "fltag " + (m.by.includes("pinned") ? "warn" : ""), m.by);
+        tag.title = routedWhy(m);
+        badge.appendChild(tag);
+      }
       tr.appendChild(badge);
       mt.tbody.appendChild(tr);
     }

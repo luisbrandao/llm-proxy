@@ -139,9 +139,10 @@ def test_first_and_last_are_strict_even_with_smart_routing_off(smart_on):
 
 
 def test_an_override_beats_the_cost_ranking(smart_on):
+    """`a` is the dearest and sits last in the config; forcing it first still wins."""
     smart_on(backend_modes={"a": "first"})
     prices(a=9.0, b=1.0, c=2.0)
-    out, note = smart.order(targets(("a", 1), ("b", 2), ("c", 3)), "m")
+    out, note = smart.order(targets(("b", 1), ("c", 2), ("a", 3)), "m")
     assert names(out) == ["a", "b", "c"] and note["by"] == "pinned"
 
 
@@ -456,3 +457,59 @@ def test_the_snapshot_says_where_each_price_came_from(smart_on, monkeypatch):
     rows = {r["provider"]: r for r in smart.snapshot()["prices"]}
     assert rows["a"]["source"] == "observed" and rows["b"]["source"] == "list"
     assert rows["b"]["usd_per_mtok"] == pytest.approx(1.0)
+
+
+# ── what the label says moved the order ─────────────────────────────────────
+
+def test_an_override_that_agrees_with_the_order_changes_nothing_and_says_nothing(smart_on):
+    """`last` on a backend that is already last: in force, but not news."""
+    smart_on(smart_routing=False, backend_modes={"c": "last"})
+    out, note = smart.order(targets(("a", 1), ("b", 2), ("c", 3)), "m")
+    assert names(out) == ["a", "b", "c"] and note is None
+
+
+def test_the_cost_ranking_is_credited_when_an_override_changed_nothing(smart_on):
+    """glm-5.3 on the live proxy: nvidia is `last` and already last, the ranking did the moving."""
+    smart_on(backend_modes={"c": "last"})
+    prices(a=3.0, b=1.0)
+    out, note = smart.order(targets(("a", 1), ("b", 2), ("c", 3)), "m")
+    assert names(out) == ["b", "a", "c"]
+    assert (note["by"], note["smart"], note["pinned"]) == ("smart", True, False)
+
+
+def test_an_override_is_credited_when_it_is_the_only_thing_that_moved(smart_on):
+    smart_on(smart_routing=False, backend_modes={"c": "first"})
+    out, note = smart.order(targets(("a", 1), ("b", 2), ("c", 3)), "m")
+    assert names(out) == ["c", "a", "b"]
+    assert (note["by"], note["smart"], note["pinned"]) == ("pinned", False, True)
+
+
+def test_both_causes_are_named_when_both_moved_the_order(smart_on):
+    smart_on(backend_modes={"a": "last"})
+    prices(b=1.0, c=0.5)                     # a is not ranked; b and c trade places, then a goes last
+    out, note = smart.order(targets(("a", 1), ("b", 2), ("c", 3)), "m")
+    assert names(out) == ["c", "b", "a"]
+    assert (note["by"], note["smart"], note["pinned"]) == ("smart+pinned", True, True)
+
+
+def test_an_override_that_breaks_a_priority_tie_counts_even_if_the_order_looks_the_same(smart_on):
+    """With a, b, c all at priority 1 the slot picker round-robins them; `last` on c makes
+    that strict, which changes where requests go even though the listed order is unchanged."""
+    smart_on(smart_routing=False, backend_modes={"c": "last"})
+    out, note = smart.order(targets(("a", 1), ("b", 1), ("c", 1)), "m")
+    assert [(t.provider, t.priority) for t in out] == [("a", 1), ("b", 2), ("c", 3)]
+    assert note["by"] == "pinned"
+
+
+def test_the_snapshot_labels_each_model_by_what_actually_moved_it(smart_on, monkeypatch):
+    smart_on(backend_modes={"c": "last", "x": "last"})
+    monkeypatch.setattr(conf, "LOGICAL_MODELS", {
+        "ranked": conf.LogicalModel("ranked", [conf.Target("a", None, 1), conf.Target("b", None, 2), conf.Target("c", None, 3)]),
+        "agrees": conf.LogicalModel("agrees", [conf.Target("a", None, 1), conf.Target("b", None, 2), conf.Target("c", None, 3)]),
+        "forced": conf.LogicalModel("forced", [conf.Target("c", None, 1), conf.Target("a", None, 2)]),
+    })
+    smart._prices = {("ranked", "a"): (3.0, 10), ("ranked", "b"): (1.0, 10)}
+    got = {m["name"]: (m["by"], m["current"]) for m in smart.snapshot()["models"]}
+    assert got["ranked"] == ("smart", ["b", "a", "c"])
+    assert got["agrees"] == (None, ["a", "b", "c"])
+    assert got["forced"] == ("pinned", ["a", "c"])

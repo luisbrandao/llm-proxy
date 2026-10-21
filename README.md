@@ -288,8 +288,12 @@ A backend none of these can price is *unrankable* and keeps its place.
   other backends stay failover targets, so a forced backend that errors does not take the
   request down with it. A `claude-cli` backend is always `fixed` — it draws from a
   subscription seat and has no per-request price to rank.
-- **See what it is doing.** A reordered request carries a `smart` or `pinned` badge in the
-  In-flight tab and `route=smart|pinned` in its log line. The Routing tab lists each
+- **See what it is doing.** A request whose backend order was changed carries a badge in the
+  In-flight tab and `route=` in its log line, saying what moved it: `smart` (the cost ranking),
+  `pinned` (a `first`/`last` setting), or `smart+pinned`. An override that is in force but
+  already agrees with the order — `last` on a backend that is already last — moves nothing and
+  shows nothing; `pinned` means it actually changed which backend goes first (or broke a
+  priority tie). The Routing tab lists each
   model's order *now* beside its configured one, and the price used for each backend with
   where it came from (`quota`, `list`, `config`, `observed`).
 
@@ -1018,7 +1022,7 @@ ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=
 | `client_host` | Reverse-DNS of `client_ip` (omitted if unresolved or `RESOLVE_CLIENT_HOST=false`) |
 | `svc`, `ua` | Service guessed from the User-Agent's leading token, and the full User-Agent |
 | `err` | Short error category (`invalid_request`, `unauthorized`, `rate_limited`, `upstream_error`…); absent on success |
-| `route` | Present only when [smart routing](#smart-routing) or a `first`/`last` override reordered the backends for this request: `smart` or `pinned` |
+| `route` | Present only when [smart routing](#smart-routing) or a `first`/`last` override actually changed the backend order for this request: `smart`, `pinned` or `smart+pinned` |
 | `trimmed`, `trim_capped` | Present only when the [context guardrail](#context-guardrail) shrank the request: messages dropped and old tool results cut to an excerpt. `{trimmed!=""}` in Loki finds every trimmed request; the matching `CONTEXT TRIM request #N …` WARNING has the token estimates |
 
 An **embedding or rerank** request returns no completion tokens (`out=0`), so it's tagged
