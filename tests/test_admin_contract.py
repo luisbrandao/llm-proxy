@@ -247,6 +247,27 @@ def test_the_smart_endpoint_refuses_bad_input(client, body):
     assert r.status_code == 422 and "error" in r.json()
 
 
+# Every field the Costs tab reads from /admin/accounts.
+ACCOUNT_FIELDS = {"name", "vendor", "balance", "quota", "updated_at", "rates_at", "error"}
+QUOTA_FIELDS = {"used", "limit", "remaining", "percent", "reset_at", "allow_overage", "available", "mode"}
+
+
+def test_accounts_fields(client, monkeypatch):
+    from app import config as conf
+    from app import rates
+    from app.providers import Balance, Quota
+    monkeypatch.setattr(conf.PROVIDERS_BY_NAME["alpha"], "vendor", "nanogpt")
+    rates._quotas["alpha"] = Quota(used=58, limit=60, remaining=2, reset_at=1792972800.0,
+                                   allow_overage=True, available=True, mode="subscription")
+    rates._balances["alpha"] = Balance("USD", 15.99)
+    body = client.get("/admin/accounts", headers=AUTH).json()
+    assert {"accounts", "rates_at", "cards"} <= set(body)
+    row = body["accounts"][0]
+    assert ACCOUNT_FIELDS <= set(row), f"missing: {ACCOUNT_FIELDS - set(row)}"
+    assert QUOTA_FIELDS <= set(row["quota"]) and {"currency", "amount"} <= set(row["balance"])
+    assert "sk-not-for-export" not in str(body)
+
+
 def test_costs_never_leaks_an_api_key(client):
     text = client.get("/admin/costs", headers=AUTH).text
     assert "sk-not-for-export" not in text and '"api_key"' not in text

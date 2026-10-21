@@ -274,6 +274,185 @@ def test_the_snapshot_shows_each_models_order_now_against_its_configured_one(sma
     snap = smart.snapshot()
     assert snap["enabled"] is True and snap["min_requests"] == 5
     assert snap["models"] == [{"name": "m", "static": ["a", "b"], "current": ["b", "a"], "by": "smart"}]
-    assert {"model": "m", "provider": "b", "usd_per_mtok": 1.0, "requests": 10} in snap["prices"]
+    assert {"model": "m", "provider": "b", "usd_per_mtok": 1.0, "source": "observed", "requests": 10} in snap["prices"]
     modes = {p["name"]: p["mode"] for p in snap["providers"]}
     assert modes["d"] == "fixed" and modes["a"] == "auto"
+
+
+# ── ranking by published rates ──────────────────────────────────────────────
+
+from datetime import datetime, timezone
+
+from app import rates
+from app.config import Rate
+from app.providers import Override, Quota, RateCard
+
+
+def card(inp, cached=None, out=None, **kw):
+    return RateCard(Rate(input=inp, cached=inp if cached is None else cached, output=inp if out is None else out), **kw)
+
+
+def list_price(provider, c):
+    rates._cards[(provider, f"native-{provider}")] = c
+
+
+def quota(**kw):
+    base = dict(used=10, limit=100, remaining=90, reset_at=1.0, allow_overage=True, available=True)
+    base.update(kw)
+    return Quota(**base)
+
+
+def utc(*args):
+    return datetime(*args, tzinfo=timezone.utc)
+
+
+def test_a_published_rate_prices_a_backend_nobody_has_sent_a_request_to(smart_on):
+    """The worry about "last prices": a backend that never gets traffic must not stay
+    stuck at whatever it once cost. With a published rate it is priced without any."""
+    smart_on()
+    list_price("a", card(3.0))
+    list_price("b", card(1.0))                  # no ledger rows for either
+    out, note = smart.order(targets(("a", 1), ("b", 2)), "m")
+    assert names(out) == ["b", "a"]
+    assert note["sources"] == {"a": "list", "b": "list"}
+
+
+def test_a_rate_change_reorders_the_very_next_request_with_no_traffic_in_between(smart_on):
+    smart_on()
+    list_price("a", card(1.0))
+    list_price("b", card(2.0))
+    assert names(smart.order(targets(("a", 1), ("b", 2)), "m")[0]) == ["a", "b"]
+    list_price("a", card(5.0))                  # the vendor re-prices; the hourly refresh lands it
+    assert names(smart.order(targets(("a", 1), ("b", 2)), "m")[0]) == ["b", "a"]
+
+
+def test_a_backend_whose_cache_does_not_work_is_priced_as_if_it_had_none(smart_on):
+    """b is cheaper on paper and has a steep cache discount; a is dearer with no cache
+    price. What decides it is how well b's cache really works, which only the ledger knows."""
+    smart_on()
+    list_price("a", card(0.50, cached=0.50))
+    list_price("b", card(1.00, cached=0.05))
+    smart._shares = {("m", "b"): (0.95, 0.0, 10), ("m", "a"): (0.0, 0.0, 10)}
+    assert names(smart.order(targets(("a", 1), ("b", 2)), "m")[0]) == ["b", "a"]     # cache hits: 0.0975
+    smart._shares[("m", "b")] = (0.0, 0.0, 10)                                       # cache never hits: 1.00
+    assert names(smart.order(targets(("a", 1), ("b", 2)), "m")[0]) == ["a", "b"]
+
+
+def test_without_enough_history_the_shares_come_from_the_model_across_backends(smart_on):
+    smart_on(smart_min_requests=5)
+    smart._shares = {("m", "a"): (0.8, 0.1, 30), ("m", "c"): (0.4, 0.3, 10), ("m", "b"): (0.99, 0.0, 2)}
+    assert smart._shares_for("m", "a") == (0.8, 0.1)                       # its own, enough samples
+    h, o = smart._shares_for("m", "b")                                      # 2 requests: not enough
+    assert (h, o) == pytest.approx((0.7, 0.15))                            # weighted by requests: a 30, c 10
+    assert smart._shares_for("other", "a") == smart.DEFAULT_SHARES         # no history anywhere
+
+
+def test_a_peak_window_counts_when_the_request_falls_inside_it(smart_on):
+    smart_on()
+    peak = Override(prices=(("input", 2.0), ("cached", 0.2), ("output", 2.0)),
+                    days=frozenset(range(5)), start=60, end=240)
+    list_price("a", card(1.0, cached=0.1, out=1.0, overrides=(peak,)))
+    list_price("b", card(1.5, cached=0.15, out=1.5))
+    t = targets(("a", 1), ("b", 2))
+    assert smart.price_for("m", t[0], utc(2026, 10, 21, 2, 0))[0] == pytest.approx(2.0)    # Wednesday 02:00
+    assert smart.price_for("m", t[0], utc(2026, 10, 21, 14, 0))[0] == pytest.approx(1.0)
+    assert smart.price_for("m", t[0], utc(2026, 10, 24, 2, 0))[0] == pytest.approx(1.0)    # Saturday
+
+
+def test_the_peak_surcharge_reorders_the_ranking_at_that_instant(smart_on, monkeypatch):
+    smart_on()
+    peak = Override(prices=(("input", 2.0), ("cached", 2.0), ("output", 2.0)), days=frozenset(range(5)))
+    list_price("a", card(1.0, overrides=(peak,)))
+    list_price("b", card(1.5))
+
+    class Clock(datetime):
+        now_value = utc(2026, 10, 21, 14, 0)
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.now_value
+
+    monkeypatch.setattr(smart, "datetime", Clock)
+    Clock.now_value = utc(2026, 10, 24, 14, 0)                              # Saturday: a is 1.0
+    assert names(smart.order(targets(("a", 1), ("b", 2)), "m")[0]) == ["a", "b"]
+    Clock.now_value = utc(2026, 10, 21, 14, 0)                              # Wednesday: a is 2.0
+    assert names(smart.order(targets(("a", 1), ("b", 2)), "m")[0]) == ["b", "a"]
+
+
+# ── a subscription: free while it lasts, then priced ────────────────────────
+
+def test_a_subscription_with_allowance_is_free_even_when_its_list_price_is_higher(smart_on):
+    smart_on()
+    list_price("a", card(9.0))
+    list_price("b", card(1.0))
+    rates._quotas["a"] = quota()
+    out, note = smart.order(targets(("b", 1), ("a", 2)), "m")
+    assert names(out) == ["a", "b"]
+    assert note["prices"]["a"] == 0.0 and note["sources"] == {"b": "list", "a": "quota"}
+
+
+def test_when_the_allowance_runs_out_the_same_backend_is_priced_at_its_list_price(smart_on):
+    """"Quota first, then decide": nothing is flipped by hand."""
+    smart_on()
+    list_price("a", card(9.0))
+    list_price("b", card(1.0))
+    rates._quotas["a"] = quota()
+    assert names(smart.order(targets(("b", 1), ("a", 2)), "m")[0]) == ["a", "b"]
+    rates._quotas["a"] = quota(remaining=0, available=False, allow_overage=True)
+    assert names(smart.order(targets(("a", 1), ("b", 2)), "m")[0]) == ["b", "a"]
+
+
+def test_a_backend_that_will_refuse_past_its_allowance_ranks_last(smart_on):
+    smart_on()
+    list_price("a", card(0.1))
+    list_price("b", card(1.0))
+    rates._quotas["a"] = quota(remaining=0, available=False, allow_overage=False)
+    out, note = smart.order(targets(("a", 1), ("b", 2)), "m")
+    assert names(out) == ["b", "a"]
+    assert note["prices"]["a"] is None and note["sources"]["a"] == "no quota"
+
+
+def test_a_model_the_subscription_does_not_cover_is_priced_at_list_despite_allowance(smart_on):
+    smart_on()
+    list_price("a", card(9.0))
+    list_price("b", card(1.0))
+    rates._quotas["a"] = quota()
+    rates._included["a"] = frozenset({"some-other-model"})      # native-a is not covered
+    assert names(smart.order(targets(("a", 1), ("b", 2)), "m")[0]) == ["b", "a"]
+
+
+def test_the_operators_pricing_table_is_what_the_ranking_uses(smart_on, monkeypatch):
+    from app.config import Pricing
+    smart_on()
+    monkeypatch.setattr(conf.PROVIDERS_BY_NAME["a"], "pricing", Pricing(rates={"native-a": Rate(0.2, 0.2, 0.2)}))
+    list_price("b", card(1.0))
+    out, note = smart.order(targets(("b", 1), ("a", 2)), "m")
+    assert names(out) == ["a", "b"] and note["sources"]["a"] == "config"
+
+
+def test_a_backend_with_no_rate_falls_back_to_what_it_has_been_charged(smart_on):
+    smart_on()
+    list_price("a", card(3.0))
+    smart._prices = {("m", "b"): (1.0, 10)}                     # b publishes nothing; observed only
+    out, note = smart.order(targets(("a", 1), ("b", 2)), "m")
+    assert names(out) == ["b", "a"] and note["sources"] == {"a": "list", "b": "observed"}
+
+
+def test_a_backend_with_neither_rate_nor_history_keeps_its_place(smart_on):
+    smart_on()
+    list_price("b", card(2.0))
+    list_price("c", card(1.0))
+    out, _ = smart.order(targets(("a", 1), ("b", 2), ("c", 3)), "m")
+    assert names(out) == ["a", "c", "b"]
+
+
+def test_the_snapshot_says_where_each_price_came_from(smart_on, monkeypatch):
+    smart_on()
+    monkeypatch.setattr(conf, "LOGICAL_MODELS", {
+        "m": conf.LogicalModel("m", [conf.Target("a", None, 1), conf.Target("b", None, 2)]),
+    })
+    rates._cards[("b", "m")] = card(1.0)     # a logical target's native id is the model name unless pinned
+    smart._prices = {("m", "a"): (3.0, 10)}
+    rows = {r["provider"]: r for r in smart.snapshot()["prices"]}
+    assert rows["a"]["source"] == "observed" and rows["b"]["source"] == "list"
+    assert rows["b"]["usd_per_mtok"] == pytest.approx(1.0)

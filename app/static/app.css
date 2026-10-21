@@ -491,6 +491,23 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
 .cselect.mode-fixed { color: var(--muted); }
 .cnow { color: var(--accent); }
 
+/* Costs: the accounts strip, one tile per backend whose balance or quota we can read. */
+.cacc { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 10px; margin-bottom: 12px; }
+.caccount {
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: 9px; padding: 10px 13px;
+  display: flex; flex-direction: column; gap: 5px; min-width: 0;
+}
+.caccount.err { border-color: rgba(224,169,59,.5); }
+.cacchead { font-family: var(--mono); font-weight: 600; font-size: 13px; color: #fff; }
+.caccbal .ctvalue { font-size: 20px; }
+.cmeter { height: 8px; background: var(--bg); border: 1px solid var(--line-2); border-radius: 4px; overflow: hidden; }
+.cmeterfill { display: block; height: 100%; background: var(--accent-2); }
+.cmeter.high .cmeterfill { background: var(--amber); }
+.cmeter.over .cmeterfill { background: var(--red); }
+.warnline { color: var(--amber); }
+.csrc { font-size: 11px; color: var(--muted); }
+.csrc.quota { color: var(--accent); }
+
 /* ── Models ────────────────────────────────────────────────── */
 .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
 @media (max-width: 880px) { .cols { grid-template-columns: 1fr; } }

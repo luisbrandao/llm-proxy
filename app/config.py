@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import yaml
 
@@ -99,6 +100,16 @@ def _hour_span(value, where: str) -> Tuple[int, int]:
     return start, end
 
 
+def _vendor(value, name: str) -> str:
+    """A provider's explicit `vendor:`, validated. Loud on a typo, like the other
+    tables: a vendor silently read as "none" would leave its quota and rates unread
+    with nothing to say why."""
+    vendor = str(value or "").strip().lower()
+    if vendor and vendor not in VENDORS:
+        raise ValueError(f"provider {name!r}: vendor {vendor!r} is not one of {', '.join(VENDORS)}")
+    return vendor
+
+
 def _pricing(raw, where: str) -> Optional[Pricing]:
     """Parse a provider's `pricing:` block. Loud on a malformed table: a typo
     that silently prices at zero would be worse than no table at all."""
@@ -179,6 +190,11 @@ class Provider:
     # Price list used only when a response carries no `usage.cost` (DeepSeek's
     # own API). See `Pricing`.
     pricing: Optional[Pricing] = None
+    # Which vendor's account API this backend speaks (app/providers/), so the proxy
+    # can read its published rates, subscription quota and balance. Normally left
+    # blank: it is worked out from `base_url` (see `vendor_of`). Set it only for a
+    # backend reached through a host the detection does not know.
+    vendor: str = ""
     # Reverse of model_map (canonical name -> native id), built in __post_init__.
     _to_native: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
@@ -197,6 +213,28 @@ class Provider:
     def to_native(self, canonical: str) -> str:
         """Client-facing name -> native backend id on the wire (identity if unmapped)."""
         return self._to_native.get(canonical, canonical)
+
+
+# Vendors whose account API the proxy can read (app/providers/). Detected from the
+# host of `base_url`; a provider can name one explicitly with `vendor:`.
+VENDORS = ("openrouter", "nanogpt", "deepseek")
+_VENDOR_HOSTS = {
+    "openrouter.ai": "openrouter",
+    "nano-gpt.com": "nanogpt",
+    "api.nano-gpt.com": "nanogpt",
+    "api.deepseek.com": "deepseek",
+}
+
+
+def vendor_of(provider) -> str:
+    """The vendor module a provider is served by, or "" when it has none.
+
+    Explicit `vendor:` wins; otherwise the host of `base_url`. A backend with no
+    known vendor is simply priced from what its responses report, as before."""
+    if provider.vendor:
+        return provider.vendor
+    host = urlparse(provider.base_url or "").hostname or ""
+    return _VENDOR_HOSTS.get(host.lower(), "")
 
 
 def native_for(model_name: str, provider_name: str, model: Optional[str] = None) -> str:
@@ -382,6 +420,7 @@ def _load(text: bytes):
                 strip_fields=item.get("strip_fields") or [],
                 headers={str(k): _interpolate(str(v)) for k, v in (item.get("headers") or {}).items()},
                 pricing=_pricing(item.get("pricing"), f"provider {item['name']!r} pricing"),
+                vendor=_vendor(item.get("vendor"), item["name"]),
             )
         )
 

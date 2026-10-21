@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app import auth, configwrite, inflight, ledger, logbuffer, registry, slots, smart, upstream, version
+from app import auth, configwrite, inflight, ledger, logbuffer, rates, registry, slots, smart, upstream, version
 from app import config as conf
 from app.metrics import metrics_response
 from app.proxy import proxy_request
@@ -202,12 +202,15 @@ async def lifespan(app: FastAPI):
     )
     # Observed prices for smart routing, re-read from the ledger off the request path.
     smart_task = asyncio.create_task(smart.refresh_loop())
+    # Published rates, subscription quota and balances, from the vendors' own APIs.
+    rates_task = asyncio.create_task(rates.refresh_loop())
     try:
         yield
     finally:
         if reload_task is not None:
             reload_task.cancel()
         smart_task.cancel()
+        rates_task.cancel()
         # Close the shared upstream connection pools (see app/upstream.py).
         await upstream.aclose()
         ledger.close()
@@ -511,6 +514,18 @@ async def admin_inflight_body(request_id: int, request: Request):
     return {"id": request_id, "limit": conf.INFLIGHT_BODY_LIMIT, **rec}
 
 
+
+
+@admin.get("/accounts")
+async def admin_accounts(request: Request):
+    """Each backend's balance and subscription quota, as the vendors last reported them.
+
+    Read from the snapshot `app/rates.py` keeps fresh in the background (quota and
+    balances every couple of minutes), so this never calls a vendor itself. Numbers
+    only: a key is never part of it. A backend that could not be read carries its error
+    and the age of the last good reading, rather than disappearing.
+    """
+    return rates.accounts_snapshot()
 
 
 @admin.get("/costs")

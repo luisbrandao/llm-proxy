@@ -78,6 +78,9 @@ providers:
     cache_ttl: 10
 
   - name: openRouter
+    # The vendor (openrouter / nanogpt / deepseek) is detected from base_url, so the
+    # proxy reads this backend's published rates and balance on its own. Add
+    # `vendor: openrouter` only for a backend reached through a host it does not know.
     api_key: "sk-your-openrouter-key"   # or "${OPENROUTER_API_KEY}" to read from env
     require_permission: true   # paid backend -> only authenticated callers
     base_url: "https://openrouter.ai/api"

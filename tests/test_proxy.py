@@ -333,6 +333,30 @@ def test_smart_routing_sends_the_request_to_the_cheaper_backend(client, upstream
     assert idle() == {"first": 0, "second": 0}
 
 
+def test_a_subscription_with_allowance_takes_the_request_then_loses_it_when_it_runs_out(
+        client, upstreams, events, monkeypatch):
+    """"Quota first, then decide", through the real lifecycle: `second` is free while its
+    allowance lasts, though `first` is cheaper per token on paper."""
+    from app import rates
+    from app.config import Rate
+    from app.providers import Quota, RateCard
+    _smart(monkeypatch)
+    rates._cards[("first", "vendor/First-Native")] = RateCard(Rate(0.10, 0.01, 0.20))
+    rates._cards[("second", "vendor/Second-Native")] = RateCard(Rate(0.50, 0.05, 1.00))
+    rates._quotas["second"] = Quota(used=1, limit=100, remaining=99, reset_at=None,
+                                    allow_overage=True, available=True)
+    client.post("/v1/chat/completions", json={"model": "grouped"})
+    assert upstreams.host(upstreams.requests[-1]) == "second.invalid"
+    row = client.get("/admin/inflight").json()["requests"][0]
+    assert row["routed"]["sources"] == {"first": "list", "second": "quota"}
+
+    rates._quotas["second"] = Quota(used=100, limit=100, remaining=0, reset_at=None,
+                                    allow_overage=True, available=False)
+    client.post("/v1/chat/completions", json={"model": "grouped"})
+    assert upstreams.host(upstreams.requests[-1]) == "first.invalid"      # now it is just the cheaper list price
+    assert idle() == {"first": 0, "second": 0}
+
+
 def test_switched_off_the_configured_order_runs_and_nothing_is_marked(client, upstreams, events, monkeypatch):
     smart = _smart(monkeypatch, smart_routing=False)
     smart._prices = {("grouped", "first"): (3.0, 10), ("grouped", "second"): (1.0, 10)}

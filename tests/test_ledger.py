@@ -240,3 +240,25 @@ async def test_ollama_hosts_are_one_backend_in_the_views_but_not_in_the_rows():
     assert (await ledger.summary(provider="ollama"))["totals"]["requests"] == 3
     assert (await ledger.summary(provider="ollamaGW"))["totals"]["requests"] == 1
     assert (await ledger.summary(provider="nano"))["totals"]["requests"] == 1
+
+
+async def test_shares_describe_the_workload_whether_or_not_it_was_priced():
+    """Cache share and output share are what the ledger adds to a published rate; they
+    must exist for a backend whose responses carry no price at all."""
+    await add(usage=Usage(prompt=900, completion=100, cached=720))
+    await add(usage=Usage(prompt=100, completion=100, cached=0))
+    got = await ledger.observed_shares(14)
+    h, o, n = got[("glm", "nano")]
+    assert (h, o, n) == (pytest.approx(720 / 1000), pytest.approx(200 / 1200), 2)
+
+
+async def test_shares_ignore_failed_requests_and_empty_ones():
+    await add(status=503, usage=Usage(prompt=100, completion=0, cached=100))
+    await add(usage=Usage())
+    assert await ledger.observed_shares(14) == {}
+
+
+async def test_the_shares_window_is_bounded():
+    await add(when=ago(20), usage=Usage(prompt=10, completion=10))
+    assert await ledger.observed_shares(14) == {}
+    assert len(await ledger.observed_shares(30)) == 1

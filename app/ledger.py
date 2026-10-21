@@ -407,6 +407,44 @@ async def observed_prices(days: int = 7) -> dict:
     return await asyncio.to_thread(_observed_prices, days)
 
 
+def _observed_shares(days: int) -> dict:
+    with _lock:
+        conn = _connect()
+        if conn is None:
+            return {}
+        since = (date.fromisoformat(local_day()) - timedelta(days=max(1, days) - 1)).isoformat()
+        rows = conn.execute(
+            "SELECT asked, provider, SUM(prompt_tokens), SUM(cached_tokens), "
+            "SUM(completion_tokens), COUNT(*) FROM requests "
+            "WHERE day >= ? AND status < 400 AND prompt_tokens + completion_tokens > 0 "
+            "GROUP BY asked, provider",
+            (since,),
+        ).fetchall()
+    out = {}
+    for asked, provider, prompt, cached, completion, n in rows:
+        total = (prompt or 0) + (completion or 0)
+        if total:
+            out[(asked, provider)] = (
+                min(1.0, (cached or 0) / prompt) if prompt else 0.0,
+                (completion or 0) / total,
+                int(n),
+            )
+    return out
+
+
+async def observed_shares(days: int = 14) -> dict:
+    """`{(asked model, provider): (cache share, output share, requests)}` over the last
+    `days` days, from successful requests, priced or not.
+
+    The cache share is the fraction of prompt tokens read from the backend's cache and
+    the output share the fraction of all tokens that are completion. They describe the
+    workload and how well a backend's cache really works — the things a price list
+    cannot say — so they are what the ledger contributes to a cost estimate whose rates
+    come from the vendor. Read by `smart.refresh`, off the request path.
+    """
+    return await asyncio.to_thread(_observed_shares, days)
+
+
 def startup() -> None:
     """Open the ledger at boot so a bad path is logged once, up front, instead
     of on the first request — and so the retention prune runs before traffic."""

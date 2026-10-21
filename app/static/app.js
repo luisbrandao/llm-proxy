@@ -1548,10 +1548,11 @@ function renderSmart(s, readOnly) {
     (s.refreshed_at ? "prices read " + new Date(s.refreshed_at * 1000).toLocaleTimeString() : "prices not read yet")));
   card.appendChild(head);
   const hint = el("div", "hint smarthint");
-  hint.textContent = "Orders each model's backends cheapest-first per request, using what the cost ledger has seen each "
-    + "one charge for that model. A backend with fewer than " + s.min_requests + " priced requests, or set to fixed, "
-    + "keeps the place its priority gives it — smart routing never moves what it cannot price. "
-    + "first / last override everything, on or off.";
+  hint.textContent = "Orders each model's backends cheapest-first per request. A subscription with allowance left "
+    + "counts as free, and as its list price once it runs out; every other backend is priced from the vendor's "
+    + "published rate, kept current hourly, weighted by how well its cache really works. A backend with no published "
+    + "rate falls back to what it has been charged (needs " + s.min_requests + " priced requests). Anything it cannot "
+    + "price, or set to fixed, keeps the place its priority gives it. first / last override everything, on or off.";
   card.appendChild(hint);
 
   // ── per-backend mode ──
@@ -1613,11 +1614,11 @@ function renderSmart(s, readOnly) {
   // ── the prices it ranks by ──
   const pc = el("div", "ccard");
   const ph = el("div", "cchead");
-  ph.appendChild(el("span", "cctitle", "Observed prices"));
-  ph.appendChild(el("span", "muted", `last ${s.window_days} days · priced, successful requests only · cheapest marked`));
+  ph.appendChild(el("span", "cctitle", "Prices used"));
+  ph.appendChild(el("span", "muted", "what the ranking prices each backend at, and where that price comes from · cheapest marked"));
   pc.appendChild(ph);
   if (!s.prices.length) {
-    pc.appendChild(el("div", "cempty", "No priced requests in the window yet — nothing to rank by."));
+    pc.appendChild(el("div", "cempty", "Nothing to rank by yet — no published rates read and no priced requests in the window."));
   } else {
     const byModel = new Map();
     for (const r of s.prices) {
@@ -1626,12 +1627,14 @@ function renderSmart(s, readOnly) {
     }
     const pt = ctable([
       { label: "model" }, { label: "backend" },
-      { label: "$ / M tok", num: true, title: "blended price per million tokens (input + output), including whatever the cache saved" },
-      { label: "requests", num: true, title: "priced requests behind the figure; below " + s.min_requests + " it is not used" },
+      { label: "source", title: "quota: a subscription with allowance left · list: the vendor's published rate · config: your pricing table · observed: what it has been charged · no quota: past its allowance and it will refuse" },
+      { label: "$ / M tok", num: true, title: "blended price per million tokens, input and output, at the rate in force right now and this backend's real cache hit rate" },
+      { label: "requests", num: true, title: "recent requests behind the cache and output shares (or the observed price)" },
     ]);
+    const cost = (r) => (r.usd_per_mtok == null ? Infinity : r.usd_per_mtok);
     for (const [model, rows] of byModel) {
-      rows.sort((a, b) => a.usd_per_mtok - b.usd_per_mtok);
-      const usable = rows.filter((r) => r.requests >= s.min_requests);
+      rows.sort((a, b) => cost(a) - cost(b));
+      const usable = rows.filter((r) => r.usd_per_mtok != null);
       const cheapest = usable.length > 1 ? usable[0] : null;
       for (const r of rows) {
         const tr = el("tr");
@@ -1639,13 +1642,11 @@ function renderSmart(s, readOnly) {
         const name = el("td");
         name.appendChild(document.createTextNode(r.provider));
         if (r === cheapest) name.appendChild(el("span", "fltag", "cheapest"));
-        if (r.requests < s.min_requests) {
-          const t = el("span", "fltag warn", "too few");
-          t.title = "fewer than " + s.min_requests + " priced requests — not ranked";
-          name.appendChild(t);
-        }
         tr.appendChild(name);
-        tr.appendChild(td(fmtCost(r.usd_per_mtok), "num", String(r.usd_per_mtok)));
+        tr.appendChild(td(r.source || "", r.source === "quota" ? "csrc quota" : "csrc"));
+        tr.appendChild(r.usd_per_mtok == null
+          ? td("refuses", "num", "past its allowance, and the subscription does not bill overage")
+          : td(r.source === "quota" ? "free" : fmtCost(r.usd_per_mtok), "num", String(r.usd_per_mtok)));
         tr.appendChild(td(fmtNum(r.requests), "num"));
         pt.tbody.appendChild(tr);
       }
@@ -1907,7 +1908,76 @@ function setCostRange(since, until) {
   loadCosts();
 }
 
+/* ── Costs: accounts (balances and subscription quota) ───────── */
+/* From /admin/accounts: what each vendor last reported, read in the background every
+ * couple of minutes — this never makes the proxy call a vendor. Fetched alongside the
+ * ledger and drawn into a strip that survives the tab re-rendering. */
+let accountsData = null;
+
+async function loadAccounts() {
+  try {
+    const res = await api("/admin/accounts");
+    if (res.ok) { accountsData = await res.json(); const el_ = $("#cost-accounts"); if (el_) el_.replaceWith(costAccounts()); }
+  } catch { /* the strip stays as it was */ }
+}
+
+function ago(epochSeconds) {
+  if (!epochSeconds) return "never";
+  const s = Math.max(0, Date.now() / 1000 - epochSeconds);
+  if (s < 90) return "just now";
+  if (s < 5400) return Math.round(s / 60) + " min ago";
+  return Math.round(s / 3600) + " h ago";
+}
+
+function untilReset(epochSeconds) {
+  if (!epochSeconds) return "";
+  const s = epochSeconds - Date.now() / 1000;
+  if (s <= 0) return "resetting now";
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  return "resets in " + (d ? d + "d " + h + "h" : h ? h + "h " + m + "m" : m + "m");
+}
+
+function costAccounts() {
+  const wrap = el("div", "cacc");
+  wrap.id = "cost-accounts";
+  const rows = (accountsData && accountsData.accounts) || [];
+  if (!rows.length) { wrap.style.display = "none"; return wrap; }
+  for (const a of rows) {
+    const t = el("div", "caccount" + (a.error ? " err" : ""));
+    t.appendChild(el("div", "cacchead", a.name));
+    if (a.balance) {
+      const money = a.balance.currency === "USD" ? "$" + a.balance.amount.toFixed(2) : a.balance.amount.toFixed(2) + " " + a.balance.currency;
+      const b = el("div", "caccbal");
+      b.append(el("span", "ctvalue", money), el("span", "ctsub", " balance"));
+      t.appendChild(b);
+    }
+    if (a.quota) {
+      const q = a.quota, pct_ = Math.min(100, q.percent * 100);
+      const meter = el("div", "cmeter" + (q.percent >= 1 ? " over" : q.percent >= 0.85 ? " high" : ""));
+      const fill = el("span", "cmeterfill");
+      fill.style.width = pct_.toFixed(1) + "%";
+      meter.appendChild(fill);
+      t.appendChild(meter);
+      const line = el("div", "ctsub");
+      line.textContent = `${(q.used / 1e6).toFixed(1)}M of ${(q.limit / 1e6).toFixed(0)}M input tokens · ${(q.percent * 100).toFixed(0)}% · ${untilReset(q.reset_at)}`;
+      line.title = "the subscription counts input tokens only, cached input included"
+        + (q.allow_overage ? " · past it, requests bill the balance at the listed price" : " · past it, requests are refused");
+      t.appendChild(line);
+      if (!q.available) {
+        t.appendChild(el("div", "ctsub warnline", q.allow_overage ? "allowance used up — billing the balance" : "allowance used up"));
+      }
+    }
+    const foot = el("div", "ctsub muted");
+    foot.textContent = "read " + ago(a.updated_at) + (a.rates_at ? " · rates " + ago(a.rates_at) : "");
+    t.appendChild(foot);
+    if (a.error) { const e = el("div", "ctsub warnline", a.error); e.title = a.error; t.appendChild(e); }
+    wrap.appendChild(t);
+  }
+  return wrap;
+}
+
 async function loadCosts() {
+  loadAccounts();
   const q = new URLSearchParams({ limit: "200" });
   if (costState.since || costState.until) {
     if (costState.since) q.set("since", costState.since);
@@ -1989,6 +2059,7 @@ function renderCosts() {
       "The cost ledger is disabled (LEDGER_PATH is empty). Point it at a file to record what each request cost."));
     return;
   }
+  body.appendChild(costAccounts());
   body.appendChild(costTiles(d));
   body.appendChild(costChartCard(d));
   const grid = el("div", "cgrid");

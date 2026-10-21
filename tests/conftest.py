@@ -37,7 +37,7 @@ if not FIXTURE_CONFIG.exists():
 os.environ.setdefault("CONFIG_PATH", str(FIXTURE_CONFIG))
 
 from app import config as conf  # noqa: E402
-from app import inflight, ledger, registry, slots, smart, trim  # noqa: E402
+from app import inflight, ledger, rates, registry, slots, smart, trim  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -68,7 +68,9 @@ def reset_state(monkeypatch):
     registry._down_until.clear()
     registry._locks.clear()
     smart._prices = {}
+    smart._shares = {}
     smart._refreshed_at = None
+    rates.reset()
     inflight._active.clear()
     inflight._recent.clear()
     inflight._bodies.clear()
@@ -86,6 +88,7 @@ def no_smart_refresh_loop(monkeypatch):
         await asyncio.Event().wait()
 
     monkeypatch.setattr(smart, "refresh_loop", idle)
+    monkeypatch.setattr(rates, "refresh_loop", idle)
 
 
 @pytest.fixture(autouse=True)

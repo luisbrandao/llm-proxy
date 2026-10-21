@@ -60,6 +60,7 @@ FORWARD_LIMITS = httpx.Limits(
 
 _forward = None
 _probe = None
+_account = None
 
 
 def forward_client() -> httpx.AsyncClient:
@@ -79,10 +80,24 @@ def probe_client() -> httpx.AsyncClient:
     return _probe
 
 
+# The vendors' account APIs (published rates, subscription quota, balance), read by
+# a background task. A model catalog is 800 KB, so the read timeout is longer than a
+# discovery probe's, but still short: a slow vendor must not pile tasks up.
+ACCOUNT_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
+
+
+def account_client() -> httpx.AsyncClient:
+    """The shared client for `app/rates.py`'s account and catalog reads."""
+    global _account
+    if _account is None:
+        _account = httpx.AsyncClient(timeout=ACCOUNT_TIMEOUT, follow_redirects=True)
+    return _account
+
+
 async def aclose() -> None:
-    """Close both pools. Called once, from the lifespan's shutdown side."""
-    global _forward, _probe
-    for client in (_forward, _probe):
+    """Close the pools. Called once, from the lifespan's shutdown side."""
+    global _forward, _probe, _account
+    for client in (_forward, _probe, _account):
         if client is not None:
             try:
                 await client.aclose()
@@ -90,3 +105,4 @@ async def aclose() -> None:
                 pass
     _forward = None
     _probe = None
+    _account = None

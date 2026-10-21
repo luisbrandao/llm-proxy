@@ -178,6 +178,32 @@ client gets the last upstream error verbatim (its real status and body), not a s
 502. Streaming requests can fail over up to the first byte (after that the HTTP status is
 already committed).
 
+### Rates, quota and balances
+
+Smart routing needs to know what each backend charges *now*, and the people who know are the
+vendors. A background task (`app/rates.py`) reads, per backend whose vendor it recognises:
+
+| every | what | from |
+|---|---|---|
+| hour | the vendor's price list, filtered to the models you use, and which models a subscription covers | OpenRouter `/models`, NanoGPT `/api/v1/models?detailed=true` |
+| 2 minutes | subscription allowance left and its reset time | NanoGPT `/api/subscription/v1/usage` |
+| 2 minutes | account balance | OpenRouter `/credits`, NanoGPT `/api/check-balance`, DeepSeek `/user/balance` |
+
+The vendor is worked out from the host of `base_url` (`openrouter.ai`, `nano-gpt.com`,
+`api.deepseek.com`); set `vendor:` on a provider only to name one explicitly. DeepSeek
+publishes no rate API, so its prices stay in the [`pricing:` table](#price-tables), which also
+wins over a fetched catalog for any model it lists. Units differ per vendor and are converted
+to USD per million tokens; every endpoint, field and unit is written down in
+[`docs/providers/`](docs/providers/README.md).
+
+A vendor that fails leaves its last good data and logs one warning per window, so an outage
+can age the numbers but never empty them or fail a request. The Costs tab shows each
+backend's balance and allowance meter, and `GET /admin/accounts` returns the same.
+
+NanoGPT's allowance counts **input tokens only, cached input included**, and covers only some
+models: one outside the subscription bills the balance even while allowance remains, which is
+why the covered list is read too.
+
 ### Smart routing
 
 `priority` is a decision made once, in the config — usually "the cheap quota first".
@@ -185,11 +211,23 @@ Smart routing is the other way to make it: **per request, cheapest backend first
 **off by default**; with it off the priority order runs exactly as before. The Routing tab
 has the switch (written back to `routing.smart_routing`), or set it in the file.
 
-What it ranks by is what each backend has *actually charged* for that model — blended
-dollars per million tokens over the last `smart_window_days` (7) from the [cost
-ledger](#cost-tracking), not a list price. A list price cannot see that one backend's
-prompt cache is unreliable, that another doubles in a peak window, or how many reasoning
-tokens a model burns; the observed figure already contains all of it.
+Each backend that can serve the model is priced, in this order of preference:
+
+1. **A subscription with allowance left is free** — for the models it covers. Once the
+   allowance is used up the same backend is priced at its list price, or ranked last when it
+   refuses to bill past it. That is "quota first, then decide" with nobody flipping a switch.
+2. **The vendor's published rate**, read in the background (see
+   [Rates, quota and balances](#rates-quota-and-balances)), evaluated at *this instant* — so a
+   peak-hour surcharge counts when it applies — and weighted by how requests for this model
+   really behave on that backend: the share of prompt tokens its cache serves and the share
+   of tokens that are output, both from the [ledger](#cost-tracking). An unreliable cache
+   therefore shows up as a higher price, and a rate change is felt within the hour with **no
+   traffic needed**, so a backend nobody has used lately is still priced and cannot get stuck.
+3. **What it has been charged**, for a backend with no published rates: blended dollars per
+   million tokens over the last `smart_window_days` (7), trusted only with
+   `smart_min_requests` (5) priced requests behind it.
+
+A backend none of these can price is *unrankable* and keeps its place.
 
 - **Only reorders.** The backends a request may reach are the ones resolution produced and
   the auth gate left; smart routing never adds one, and failover still walks the rest.
@@ -215,14 +253,13 @@ tokens a model burns; the observed figure already contains all of it.
   subscription seat and has no per-request price to rank.
 - **See what it is doing.** A reordered request carries a `smart` or `pinned` badge in the
   In-flight tab and `route=smart|pinned` in its log line. The Routing tab lists each
-  model's order *now* beside its configured one, and the prices the ranking uses.
+  model's order *now* beside its configured one, and the price used for each backend with
+  where it came from (`quota`, `list`, `config`, `observed`).
 
-Known limits, so they are not discovered the hard way: the ranking has **no sense of the
-hour** (a backend with a peak surcharge averages it out over the window), and it is a
-**feedback loop** (the backend that is chosen warms its cache, gets cheaper and stays
-chosen). Smart routing also only ranks backends whose cost is known — those that report a
-price, or have a [`pricing:` table](#cost-tracking) — and for OpenRouter and NanoGPT it
-trusts their own internal routers to pick the upstream.
+Known limits, so they are not discovered the hard way: for OpenRouter the catalog price is the
+cheapest upstream host's, while the request goes to whichever host OpenRouter picks, so treat it
+as a lower bound; the cache and output shares come from recent traffic and are a default until a
+backend has some; and OpenRouter and NanoGPT are trusted to pick their own upstream.
 
 ### Context guardrail
 
@@ -507,6 +544,7 @@ model and via auto-group resolves as the logical model (it's earlier in the orde
   explicit `model:` only to pin a specific native id (e.g. a per-box quant); otherwise it's
   inherited from `model_map`. Backends sharing the *same* canonical name auto-group without
   an entry.
+- **`vendor`** on a provider — normally blank; see [Rates, quota and balances](#rates-quota-and-balances).
 - **`routing:`** — `queue_timeout`, `failover`, `auto_group`, `down_backoff`,
   `failover_statuses`, `queue_affinity`, `affinity_max_skips` (see above), and the
   [smart routing](#smart-routing) keys `smart_routing`, `smart_window_days`,
@@ -578,6 +616,7 @@ model name (e.g. `deepseek-v4-flash`). Pass `Authorization: Bearer <key>` for ga
 | `/admin/inflight` | `GET` | The request feed: live (running + queued) plus recent finished ones, with per-provider slot occupancy |
 | `/admin/inflight/{id}/cancel` | `POST` | Kill one in-flight request. `404` if it already finished |
 | `/admin/inflight/{id}/body` | `GET` | The prompt and reply captured for one row (see `INFLIGHT_BODIES`) |
+| `/admin/accounts` | `GET` | Each backend's balance and subscription quota as the vendors last reported them (read in the background every couple of minutes; numbers only, no keys) |
 | `/admin/costs` | `GET` | Cost and token totals from the [ledger](#cost-tracking): per day, per model (with each model's split across backends), per backend, plus the newest requests. `?days=30` or an explicit `since=YYYY-MM-DD&until=YYYY-MM-DD` window, narrowed with `day=`, `model=`, `provider=`, capped by `limit=200` |
 | `/favicon.ico`, `/robots.txt` | `GET` | Served directly, so browser noise never reaches the proxy path |
 | `/admin/upstream-models` | `GET` | Probes every backend's raw `/v1/models` directly (`?provider=name` for just one) |
@@ -648,8 +687,10 @@ A built-in, dependency-free dashboard served by the proxy itself — open
   - A finished row also carries a **`cost`** cell — what the backend said it charged, `—`
     for a backend that reports no price — and a `cache hit N` badge when part of the
     prompt was served from the backend's prompt cache.
-- **Costs** — what the proxy's traffic cost, from the [cost ledger](#cost-tracking).
-  One filter row scopes everything on the tab: a range preset (today / 7d / 30d / 90d /
+- **Costs** — what the proxy's traffic cost, from the [cost ledger](#cost-tracking). At the top, an
+  **Accounts** strip: each backend's balance and, for a subscription, an allowance meter with
+  the reset countdown (amber from 85%, red when used up) — see
+  [Rates, quota and balances](#rates-quota-and-balances). One filter row scopes everything on the tab: a range preset (today / 7d / 30d / 90d /
   all), a model, a backend, and a day picked by clicking a column of the chart.
   - A **KPI row**: total cost (with how many of the requests actually carried a price —
     the total is a floor, since a backend that reports nothing adds nothing), requests
