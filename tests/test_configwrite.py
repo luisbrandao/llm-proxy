@@ -251,3 +251,49 @@ async def test_detached_config_is_detected_and_refused(cfg, tmp_path):
         assert "force-recreate" in err
 
         conf.CONFIG_PATH = str(path)
+
+
+async def test_the_smart_switch_is_written_into_routing_and_nothing_else_moves(cfg):
+    ok, err = await configwrite.set_smart(enabled=True, modes={"beta": "last", "alpha": "auto"})
+    assert (ok, err) == (True, None)
+    text = cfg.read_text()
+    assert "smart_routing: true" in text and "beta: last" in text and "alpha:" not in text.split("backend_modes")[1]
+    # The rest of the section and the file's comments are exactly as they were.
+    assert "queue_timeout: 0   # trailing comment on a scalar" in text
+    assert "# Top-of-file comment that must survive every write." in text
+    assert text.index("failover: true") < text.index("smart_routing")
+
+
+async def test_identical_smart_saves_are_byte_identical(cfg):
+    await configwrite.set_smart(enabled=True, modes={"alpha": "first", "beta": "fixed"})
+    once = cfg.read_text()
+    await configwrite.set_smart(enabled=True, modes={"alpha": "first", "beta": "fixed"})
+    assert cfg.read_text() == once
+
+
+async def test_an_all_auto_map_removes_the_key_and_a_partial_call_leaves_the_rest(cfg):
+    await configwrite.set_smart(enabled=True, modes={"beta": "last"})
+    await configwrite.set_smart(enabled=False)            # modes untouched
+    text = cfg.read_text()
+    assert "smart_routing: false" in text and "beta: last" in text
+    await configwrite.set_smart(modes={"beta": "auto"})   # switch untouched
+    text = cfg.read_text()
+    assert "backend_modes" not in text and "smart_routing: false" in text
+
+
+async def test_smart_creates_the_routing_section_when_the_file_has_none(load_config):
+    path = load_config("providers:\n  - {name: a, base_url: 'http://a.invalid'}\n")
+    ok, err = await configwrite.set_smart(enabled=True)
+    assert (ok, err) == (True, None)
+    assert "routing:" in path.read_text() and "smart_routing: true" in path.read_text()
+
+
+async def test_a_read_only_config_refuses_the_smart_edit_and_stays_untouched(cfg):
+    before = cfg.read_text()
+    os.chmod(cfg, 0o444)
+    try:
+        ok, err = await configwrite.set_smart(enabled=True)
+    finally:
+        os.chmod(cfg, 0o644)
+    assert ok is False and "not writable" in err
+    assert cfg.read_text() == before

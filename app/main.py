@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app import auth, configwrite, inflight, ledger, logbuffer, registry, slots, upstream, version
+from app import auth, configwrite, inflight, ledger, logbuffer, registry, slots, smart, upstream, version
 from app import config as conf
 from app.metrics import metrics_response
 from app.proxy import proxy_request
@@ -200,11 +200,14 @@ async def lifespan(app: FastAPI):
         if conf.CONFIG_RELOAD_INTERVAL > 0
         else None
     )
+    # Observed prices for smart routing, re-read from the ledger off the request path.
+    smart_task = asyncio.create_task(smart.refresh_loop())
     try:
         yield
     finally:
         if reload_task is not None:
             reload_task.cancel()
+        smart_task.cancel()
         # Close the shared upstream connection pools (see app/upstream.py).
         await upstream.aclose()
         ledger.close()
@@ -598,6 +601,8 @@ def _config_snapshot() -> dict:
             "down_backoff": conf.ROUTING.down_backoff,
             "queue_affinity": conf.ROUTING.queue_affinity,
             "affinity_max_skips": conf.ROUTING.affinity_max_skips,
+            "smart_routing": conf.ROUTING.smart_routing,
+            "backend_modes": dict(conf.ROUTING.backend_modes),
         },
     }
 
@@ -785,7 +790,44 @@ async def admin_routing(request: Request):
         "providers": providers,
         "logical_models": logical_models,
         "aliases": conf.ALIASES,
+        "smart": smart.snapshot(),
     }
+
+
+@admin.put("/config/smart")
+async def admin_set_smart(request: Request):
+    """The smart-routing switch and the per-backend overrides.
+
+    `{"enabled": bool}` and/or `{"modes": {provider: "auto"|"fixed"|"first"|"last"}}`;
+    either may be given alone. `modes` replaces the whole mapping. Applied to the
+    live process and written to the config file, like every other console edit.
+    """
+    body = await request.json()
+    enabled, modes = body.get("enabled"), body.get("modes")
+    if enabled is None and modes is None:
+        return _bad('body must carry "enabled" and/or "modes"')
+    if enabled is not None and not isinstance(enabled, bool):
+        return _bad("enabled must be true or false")
+    if modes is not None:
+        if not isinstance(modes, dict):
+            return _bad('modes must be {"provider": "auto|fixed|first|last", ...}')
+        cleaned = {}
+        for name, mode in modes.items():
+            name, mode = str(name), str(mode).strip().lower()
+            if name not in conf.PROVIDERS_BY_NAME:
+                return _bad(f"unknown provider '{name}'")
+            if mode not in conf.BACKEND_MODES:
+                return _bad(f"'{mode}' is not one of {', '.join(conf.BACKEND_MODES)}")
+            cleaned[name] = mode
+        modes = cleaned
+    ok, error = await configwrite.set_smart(enabled, modes)
+    what = ", ".join(
+        part for part in (
+            f"smart_routing = {enabled}" if enabled is not None else "",
+            f"backend_modes = {sorted(m for m, v in modes.items() if v != 'auto')}" if modes is not None else "",
+        ) if part
+    )
+    return await _persisted(ok, error, what)
 
 
 @admin.post("/routing/{model}")

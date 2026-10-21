@@ -75,7 +75,7 @@ class Entry:
         "method", "path", "req_bytes", "client_ip", "svc", "provider",
         "native_model", "candidates", "attempt", "slot_at", "chunks",
         "task", "stream_task", "cancelled", "status", "in_tokens", "out_tokens",
-        "skipped", "estimated", "upstream_secs", "trimmed",
+        "skipped", "estimated", "upstream_secs", "trimmed", "routed",
         "cached", "cache_write", "reasoning", "cost", "currency",
     )
 
@@ -104,6 +104,9 @@ class Entry:
         # Set when the context guardrail shrank this request (see app/trim.py):
         # {"dropped", "capped", "before", "after", "budget"}; None otherwise.
         self.trimmed = None
+        # Set when smart routing or a `first`/`last` override reordered the
+        # backends (app/smart.py): {"by": "smart"|"pinned", "to", "prices"}.
+        self.routed = None
         self.slot_at = None
         self.chunks = 0
         # The task serving this request — uvicorn's per-request ASGI task, since
@@ -166,6 +169,11 @@ class Entry:
         """The context guardrail shrank this request. Surfaced as a badge on the
         row and as `trimmed=` on the request log line, the same numbers."""
         self.trimmed = info
+
+    def mark_routed(self, info: dict) -> None:
+        """Smart routing or an operator override changed the backend order.
+        Surfaced as a badge on the row and as `route=` on the request log line."""
+        self.routed = info
 
     def chunk(self) -> None:
         """Count one SSE `data:` event, so a streaming row shows visible progress
@@ -365,6 +373,7 @@ class Entry:
             "attempt": self.attempt,
             "skipped": self.skipped,
             "trimmed": self.trimmed,
+            "routed": self.routed,
             "stream": self.stream,
             "op": self.op,
             "method": self.method,

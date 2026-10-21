@@ -144,6 +144,7 @@ def test_admin_write_endpoints_are_gated_too(client):
     assert client.put("/admin/config/aliases", json={"aliases": {}}).status_code == 403
     assert client.delete("/admin/config/models/grouped").status_code == 403
     assert client.post("/admin/inflight/1/cancel").status_code == 403
+    assert client.put("/admin/config/smart", json={"enabled": True}).status_code == 403
 
 
 def test_admin_config_never_returns_an_api_key(client, load_config, monkeypatch):

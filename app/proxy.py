@@ -14,7 +14,7 @@ from fastapi.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from app import config as conf
-from app import auth, claude_cli, clientinfo, inflight, ledger, registry, router, slots, trim, upstream
+from app import auth, claude_cli, clientinfo, inflight, ledger, registry, router, slots, smart, trim, upstream
 from app.config import Provider
 from app.metrics import (
     COST_TOTAL,
@@ -185,7 +185,7 @@ async def _emit_request_log(
     request: Request, provider: str, model: str, status: int,
     usage: Usage, duration: float, stream: bool,
     asked: Optional[str] = None, trimmed: Optional[dict] = None,
-    served: Optional[str] = None,
+    served: Optional[str] = None, route: Optional[str] = None,
 ) -> None:
     """Emit the single, always-on, parseable line summarizing one request, and
     append the same record to the cost ledger.
@@ -279,6 +279,9 @@ async def _emit_request_log(
             "in_tps": f"{usage.prompt / duration if duration > 0 else 0:.2f}" if op else None,
             "trimmed": trimmed["dropped"] if trimmed else None,
             "trim_capped": trimmed["capped"] if trimmed else None,
+            # Present only when smart routing or a first/last override reordered
+            # the backends for this request: `smart` or `pinned`.
+            "route": route,
         })
     svc = clientinfo.service_from_ua(ua)
     fields.update({
@@ -394,6 +397,7 @@ async def _handle_non_stream(
     # already carries it, so nothing extra has to be threaded down here.
     asked = entry.model if entry is not None else None
     trimmed = entry.trimmed if entry is not None else None
+    route = entry.routed["by"] if entry is not None and entry.routed else None
 
     if conf.LOG_INPUT:
         _log_curl(method, url, headers, body_str)
@@ -457,7 +461,7 @@ async def _handle_non_stream(
         headers=_relay_headers(resp_headers),
         background=BackgroundTask(
             _emit_request_log, request, pname, model, status_code,
-            usage, duration, False, asked, trimmed, served,
+            usage, duration, False, asked, trimmed, served, route,
         ),
     )
 
@@ -473,6 +477,7 @@ async def _handle_stream(
     # See _handle_non_stream: the client-facing name for the log's `asked=` field.
     asked = entry.model if entry is not None else None
     trimmed = entry.trimmed if entry is not None else None
+    route = entry.routed["by"] if entry is not None and entry.routed else None
 
     if conf.LOG_INPUT:
         _log_curl(method, url, headers, body_str)
@@ -530,7 +535,7 @@ async def _handle_stream(
             headers=_relay_headers(resp_headers),
             background=BackgroundTask(
                 _emit_request_log, request, pname, model, status_code, Usage(), 0.0,
-                True, asked, trimmed,
+                True, asked, trimmed, None, route,
             ),
         )
 
@@ -626,7 +631,7 @@ async def _handle_stream(
                     _record_metrics(pname, model, usage, duration)
             await _emit_request_log(
                 request, pname, model, status_code, usage, duration,
-                True, asked, trimmed, resp_model,
+                True, asked, trimmed, resp_model, route,
             )
             if delta_contents is not None:
                 full_text = "".join(delta_contents)
@@ -984,6 +989,14 @@ async def _route(
     # Prefer backends not currently marked down, but keep them as a last resort.
     healthy = [t for t in targets if not registry.is_down(t.provider)]
     candidates = healthy or targets
+
+    # Smart routing (app/smart.py): cheapest backend first, when switched on, and
+    # the operator's `first`/`last` overrides, always. A reorder of the candidates
+    # already chosen above — it cannot add a backend the gate or the resolver
+    # left out — and a no-op unless one of those is in force.
+    candidates, routed = smart.order(candidates, raw_model)
+    if routed is not None:
+        entry.mark_routed(routed)
 
     # Context guardrail: a conversation the client says cannot fit (`num_ctx`)
     # is shrunk once here, before any target is chosen, so every failover

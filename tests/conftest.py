@@ -37,7 +37,7 @@ if not FIXTURE_CONFIG.exists():
 os.environ.setdefault("CONFIG_PATH", str(FIXTURE_CONFIG))
 
 from app import config as conf  # noqa: E402
-from app import inflight, ledger, registry, slots, trim  # noqa: E402
+from app import inflight, ledger, registry, slots, smart, trim  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -67,10 +67,25 @@ def reset_state(monkeypatch):
     registry._last_good.clear()
     registry._down_until.clear()
     registry._locks.clear()
+    smart._prices = {}
+    smart._refreshed_at = None
     inflight._active.clear()
     inflight._recent.clear()
     inflight._bodies.clear()
     trim._loaded = ("", None)
+
+
+@pytest.fixture(autouse=True)
+def no_smart_refresh_loop(monkeypatch):
+    """The lifespan starts `smart.refresh_loop`, whose first act is to overwrite the
+    price snapshot from the (empty) ledger — which would race with a test that sets
+    `smart._prices` by hand. The loop is replaced by one that idles; `refresh()`
+    itself is tested directly in test_smart.py."""
+    async def idle():
+        import asyncio
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(smart, "refresh_loop", idle)
 
 
 @pytest.fixture(autouse=True)

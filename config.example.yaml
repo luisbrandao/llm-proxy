@@ -165,6 +165,20 @@ routing:
   # to the next target (a connection failure always does). 4xx like 400/404 are
   # relayed as-is — every backend would reject them the same way. Default below.
   failover_statuses: [429, 500, 502, 503, 504]
+  # Smart routing: try a model's backends cheapest-first, ranked by what the cost
+  # ledger has seen each one charge per million tokens (see README "Smart routing").
+  # OFF by default — the priority order above runs unless this is true. Switchable
+  # from the console's Routing tab, which writes it back here.
+  smart_routing: false
+  smart_window_days: 7      # how far back the observed prices are read
+  smart_min_requests: 5     # priced requests a (model, backend) needs before it is ranked
+  # Per-backend override. auto (default) takes part in the ranking; fixed is never
+  # moved by it; first / last put a backend ahead of / behind the rest of its
+  # model's backends — "use X because I said so" — with smart routing on or off.
+  # A claude-cli backend is always fixed. Only non-default entries need listing.
+  # backend_modes:
+  #   google: fixed
+  #   nanoGPT: first
 
 # Context guardrail (see README "Context guardrail"). Acts only on a chat body
 # that carries an integer `num_ctx` (Open WebUI sends the model's configured

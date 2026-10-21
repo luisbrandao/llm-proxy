@@ -482,7 +482,7 @@ function renderFlight(data) {
 function flightSig(r) {
   return [
     r.state, r.status, r.age, r.queued_for, r.running_for, r.duration, r.chunks,
-    r.provider, r.attempt, r.skipped, JSON.stringify(r.trimmed || null),
+    r.provider, r.attempt, r.skipped, JSON.stringify(r.trimmed || null), JSON.stringify(r.routed || null),
     r.in_tokens, r.out_tokens, r.estimated, r.tps, r.cost, r.cached,
     r.client_host, r.has_body, killSent.has(r.id),
     JSON.stringify(bodyOpen.get(r.id) || null),
@@ -536,6 +536,15 @@ function fillFlightRow(row, r) {
       + " oldest message(s), cut " + t.capped + " old tool result(s) to an excerpt, forwarded ~"
       + t.after + " tokens" + (t.after > t.budget ? " (still over: the newest turn alone does not fit)" : "");
     line1.appendChild(tr);
+  }
+  if (r.routed) {
+    const rt = el("span", "fltag " + (r.routed.by === "pinned" ? "warn" : ""), r.routed.by === "pinned" ? "pinned" : "smart");
+    const prices = Object.entries(r.routed.prices || {}).map(([p, v]) => p + " " + fmtCost(v) + "/M").join(" · ");
+    rt.title = (r.routed.by === "pinned"
+      ? "an operator override (first/last) set the backend order"
+      : "smart routing put the cheapest backend first")
+      + " — tried first: " + r.routed.to + (prices ? " · observed " + prices : "");
+    line1.appendChild(rt);
   }
   if (r.cached) {
     const c = el("span", "fltag", "cache hit " + fmtCompact(r.cached));
@@ -1465,6 +1474,7 @@ async function loadRouting() {
   try { res = await api("/admin/routing"); }
   catch { $("#logical").innerHTML = '<div class="notice">Cannot reach the proxy.</div>'; return; }
   if (res.status === 403) {
+    $("#smart").innerHTML = "";
     $("#providers").innerHTML = "";
     $("#aliases").innerHTML = "";
     $("#logical").innerHTML = '<div class="notice">Unauthorized — set a valid bearer key to view routing.</div>';
@@ -1484,9 +1494,165 @@ async function loadRouting() {
     cfg.title = "the config file mount is read-only; drop :ro on the volume to persist changes";
   }
   const downSet = new Set((data.providers || []).filter((p) => p.is_down).map((p) => p.name));
+  renderSmart(data.smart || null, !data.config_writable || !!data.config_detached);
   renderProviders(data.providers || []);
   renderLogical(data.logical_models || [], downSet);
   renderAliases(data.aliases || {});
+}
+
+/* ── Routing: smart routing ───────────────────────────────── */
+/* The switch for cost-aware ordering of a model's backends (app/smart.py), the
+ * per-backend override ("use X because I said so"), and what the ranking sees.
+ * Every control saves on change: a PUT that rewrites the config and applies live,
+ * then the whole tab re-renders from the server's answer. */
+const BACKEND_MODE_HELP = {
+  auto: "takes part in the cost ranking when smart routing is on",
+  fixed: "smart routing never moves it — it stays where its priority puts it",
+  first: "always tried before the other backends of a model — your override; works with smart routing off too",
+  last: "always tried after the others — for a backend that is giving trouble; works with smart routing off too",
+};
+
+async function smartSave(body, what) {
+  let res;
+  try {
+    res = await api("/admin/config/smart", {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+  } catch { toast("Save failed — cannot reach the proxy", "bad"); return; }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.persisted === false) {
+    toast(data.error || `Save failed (${res.status})`, "bad");
+  } else {
+    toast(what);
+  }
+  loadRouting();
+}
+
+function renderSmart(s, readOnly) {
+  const wrap = $("#smart");
+  wrap.innerHTML = "";
+  if (!s) return;
+  wrap.appendChild(el("h2", null, "Smart routing"));
+
+  // ── the switch ──
+  const card = el("div", "ccard");
+  const head = el("div", "cchead");
+  head.appendChild(el("span", "cctitle", s.enabled ? "on — cheapest backend first" : "off — configured priority order"));
+  const sw = el("button", "btn" + (s.enabled ? " primary" : ""), s.enabled ? "Turn off" : "Turn on");
+  sw.disabled = readOnly;
+  sw.title = readOnly ? "the config file is read-only or detached" : "";
+  sw.onclick = () => smartSave({ enabled: !s.enabled }, "Smart routing turned " + (s.enabled ? "off" : "on"));
+  head.appendChild(sw);
+  head.appendChild(el("span", "muted",
+    `ranked by observed $ per million tokens over the last ${s.window_days} days · ` +
+    (s.refreshed_at ? "prices read " + new Date(s.refreshed_at * 1000).toLocaleTimeString() : "prices not read yet")));
+  card.appendChild(head);
+  const hint = el("div", "hint smarthint");
+  hint.textContent = "Orders each model's backends cheapest-first per request, using what the cost ledger has seen each "
+    + "one charge for that model. A backend with fewer than " + s.min_requests + " priced requests, or set to fixed, "
+    + "keeps the place its priority gives it — smart routing never moves what it cannot price. "
+    + "first / last override everything, on or off.";
+  card.appendChild(hint);
+
+  // ── per-backend mode ──
+  const bt = ctable([
+    { label: "backend" }, { label: "kind" }, { label: "mode", title: "hover an option for what it does" },
+  ]);
+  // What gets written back is only what the operator set: a locked backend (the
+  // subscription seat) is implicitly fixed and must never land in the file.
+  const modes = {};
+  for (const p of s.providers) if (!p.locked) modes[p.name] = p.mode;
+  for (const p of s.providers) {
+    const tr = el("tr");
+    tr.appendChild(td(p.name, "cmodel"));
+    tr.appendChild(td(p.kind));
+    const cell = el("td");
+    const sel = el("select", "cselect mode-" + p.mode);
+    for (const m of ["auto", "fixed", "first", "last"]) {
+      const o = el("option", null, m);
+      o.value = m;
+      o.title = BACKEND_MODE_HELP[m];
+      if (m === p.mode) o.selected = true;
+      sel.appendChild(o);
+    }
+    sel.disabled = readOnly || p.locked;
+    sel.title = p.locked
+      ? "a subscription seat has no per-request price — always fixed"
+      : BACKEND_MODE_HELP[p.mode];
+    sel.onchange = () => smartSave({ modes: { ...modes, [p.name]: sel.value } }, p.name + " set to " + sel.value);
+    cell.appendChild(sel);
+    tr.appendChild(cell);
+    bt.tbody.appendChild(tr);
+  }
+  card.appendChild(bt.wrap);
+  wrap.appendChild(card);
+
+  // ── each model's order now ──
+  if (s.models.length) {
+    const mc = el("div", "ccard");
+    const mh = el("div", "cchead");
+    mh.appendChild(el("span", "cctitle", "Order per model"));
+    mh.appendChild(el("span", "muted", "what a request for it tries first, now"));
+    mc.appendChild(mh);
+    const mt = ctable([{ label: "model" }, { label: "configured" }, { label: "now" }, { label: "" }]);
+    for (const m of s.models) {
+      const tr = el("tr");
+      tr.appendChild(td(m.name, "cmodel"));
+      tr.appendChild(td(m.static.join(" → "), "cwho"));
+      const changed = m.by != null;
+      tr.appendChild(td(m.current.join(" → "), "cwho" + (changed ? " cnow" : "")));
+      const badge = el("td");
+      if (changed) badge.appendChild(el("span", "fltag " + (m.by === "pinned" ? "warn" : ""), m.by));
+      tr.appendChild(badge);
+      mt.tbody.appendChild(tr);
+    }
+    mc.appendChild(mt.wrap);
+    wrap.appendChild(mc);
+  }
+
+  // ── the prices it ranks by ──
+  const pc = el("div", "ccard");
+  const ph = el("div", "cchead");
+  ph.appendChild(el("span", "cctitle", "Observed prices"));
+  ph.appendChild(el("span", "muted", `last ${s.window_days} days · priced, successful requests only · cheapest marked`));
+  pc.appendChild(ph);
+  if (!s.prices.length) {
+    pc.appendChild(el("div", "cempty", "No priced requests in the window yet — nothing to rank by."));
+  } else {
+    const byModel = new Map();
+    for (const r of s.prices) {
+      if (!byModel.has(r.model)) byModel.set(r.model, []);
+      byModel.get(r.model).push(r);
+    }
+    const pt = ctable([
+      { label: "model" }, { label: "backend" },
+      { label: "$ / M tok", num: true, title: "blended price per million tokens (input + output), including whatever the cache saved" },
+      { label: "requests", num: true, title: "priced requests behind the figure; below " + s.min_requests + " it is not used" },
+    ]);
+    for (const [model, rows] of byModel) {
+      rows.sort((a, b) => a.usd_per_mtok - b.usd_per_mtok);
+      const usable = rows.filter((r) => r.requests >= s.min_requests);
+      const cheapest = usable.length > 1 ? usable[0] : null;
+      for (const r of rows) {
+        const tr = el("tr");
+        tr.appendChild(td(r === rows[0] ? model : "", "cmodel"));
+        const name = el("td");
+        name.appendChild(document.createTextNode(r.provider));
+        if (r === cheapest) name.appendChild(el("span", "fltag", "cheapest"));
+        if (r.requests < s.min_requests) {
+          const t = el("span", "fltag warn", "too few");
+          t.title = "fewer than " + s.min_requests + " priced requests — not ranked";
+          name.appendChild(t);
+        }
+        tr.appendChild(name);
+        tr.appendChild(td(fmtCost(r.usd_per_mtok), "num", String(r.usd_per_mtok)));
+        tr.appendChild(td(fmtNum(r.requests), "num"));
+        pt.tbody.appendChild(tr);
+      }
+    }
+    pc.appendChild(pt.wrap);
+  }
+  wrap.appendChild(pc);
 }
 
 function renderProviders(providers) {

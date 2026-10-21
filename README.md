@@ -20,6 +20,9 @@ request a **clean model name** — the proxy decides *which* backend actually se
   about to need again.
 - **Failover** — if a backend errors, the request retries the next one; offline
   backends drop out of the model list and are skipped.
+- **Smart routing** — an optional switch that tries a model's backends cheapest-first,
+  ranked by what each has actually charged (from the cost ledger), plus a per-backend
+  override to force one first or last when it is giving you trouble.
 - **In-flight visibility** — the console's In-flight tab lists every request currently
   running or queued, what each one is waiting on, and how long it has waited.
 - **Cost tracking** — the price each backend reports (`usage.cost`, as OpenRouter and
@@ -173,6 +176,52 @@ since every backend would reject them identically. Once **all** candidates fail,
 client gets the last upstream error verbatim (its real status and body), not a synthetic
 502. Streaming requests can fail over up to the first byte (after that the HTTP status is
 already committed).
+
+### Smart routing
+
+`priority` is a decision made once, in the config — usually "the cheap quota first".
+Smart routing is the other way to make it: **per request, cheapest backend first**. It is
+**off by default**; with it off the priority order runs exactly as before. The Routing tab
+has the switch (written back to `routing.smart_routing`), or set it in the file.
+
+What it ranks by is what each backend has *actually charged* for that model — blended
+dollars per million tokens over the last `smart_window_days` (7) from the [cost
+ledger](#cost-tracking), not a list price. A list price cannot see that one backend's
+prompt cache is unreliable, that another doubles in a peak window, or how many reasoning
+tokens a model burns; the observed figure already contains all of it.
+
+- **Only reorders.** The backends a request may reach are the ones resolution produced and
+  the auth gate left; smart routing never adds one, and failover still walks the rest.
+- **Never moves what it cannot price.** A backend with fewer than `smart_min_requests` (5)
+  priced requests for the model, or one set to `fixed`, keeps the place its `priority` gives
+  it; only the rankable ones trade places among themselves. An unknown price is never read
+  as cheap. Equal prices keep the configured order — a local box priced at 0 stays where it
+  is next to another at 0 — and each position keeps its priority value, so a tie tier stays
+  a tie tier and still round-robins.
+- **Overrides always win.** `routing.backend_modes` sets a mode per backend:
+
+  | mode | meaning |
+  |---|---|
+  | `auto` (default) | takes part in the ranking when smart routing is on |
+  | `fixed` | never moved by the ranking — keep Google here while it is a special case |
+  | `first` | tried before every other backend of the model |
+  | `last` | tried after every other backend of the model |
+
+  `first` / `last` are the "use X because I said so" lever for a backend that is giving
+  trouble, and apply with smart routing **off** too. They are priority, not exclusivity: the
+  other backends stay failover targets, so a forced backend that errors does not take the
+  request down with it. A `claude-cli` backend is always `fixed` — it draws from a
+  subscription seat and has no per-request price to rank.
+- **See what it is doing.** A reordered request carries a `smart` or `pinned` badge in the
+  In-flight tab and `route=smart|pinned` in its log line. The Routing tab lists each
+  model's order *now* beside its configured one, and the prices the ranking uses.
+
+Known limits, so they are not discovered the hard way: the ranking has **no sense of the
+hour** (a backend with a peak surcharge averages it out over the window), and it is a
+**feedback loop** (the backend that is chosen warms its cache, gets cheaper and stays
+chosen). Smart routing also only ranks backends whose cost is known — those that report a
+price, or have a [`pricing:` table](#cost-tracking) — and for OpenRouter and NanoGPT it
+trusts their own internal routers to pick the upstream.
 
 ### Context guardrail
 
@@ -457,7 +506,9 @@ model and via auto-group resolves as the logical model (it's earlier in the orde
   inherited from `model_map`. Backends sharing the *same* canonical name auto-group without
   an entry.
 - **`routing:`** — `queue_timeout`, `failover`, `auto_group`, `down_backoff`,
-  `failover_statuses`, `queue_affinity`, `affinity_max_skips` (see above).
+  `failover_statuses`, `queue_affinity`, `affinity_max_skips` (see above), and the
+  [smart routing](#smart-routing) keys `smart_routing`, `smart_window_days`,
+  `smart_min_requests`, `backend_modes`.
 - **`trim:`** — the context guardrail: `enabled`, `tokenizer`, `chars_per_token`, `response_headroom`,
   `max_tool_result_tokens`, `protect_recent` (see [Context guardrail](#context-guardrail)).
 
@@ -535,6 +586,7 @@ model name (e.g. `deepseek-v4-flash`). Pass `Authorization: Bearer <key>` for ga
 | `/admin/config/providers/{name}/model-map` | `PUT` | Set a backend's `model_map` (native id → canonical name); refuses a non-bijection |
 | `/admin/config/aliases` | `PUT` | Replace the alias map |
 | `/admin/config/models/{name}` | `PUT` / `DELETE` | Create, replace or drop a logical model (group) |
+| `/admin/config/smart` | `PUT` | The [smart routing](#smart-routing) switch and per-backend modes: `{"enabled": bool}` and/or `{"modes": {"google": "fixed", ...}}`. Applied live and written to the config |
 | `/*` | any | Catch-all proxy — routed from the request body's `model` |
 
 All `/admin/*` endpoints are gated by the same bearer keys as `POST /logging` (the
@@ -680,7 +732,9 @@ Each kill is logged at `WARNING` with the request id, model, backend and elapsed
 - **Models** — the aggregated catalog, plus a **Probe upstreams** button that queries
   each backend's real `/v1/models` so every endpoint's full list is visible at once
   (independent of `enabled_models`).
-- **Routing** — each logical model drawn as connected boxes (model → prioritized
+- **Routing** — a **Smart routing** section on top (the on/off switch, a mode per backend, each
+  model's order now against its configured one, and the observed prices it ranks by — see
+  [Smart routing](#smart-routing)), then each logical model drawn as connected boxes (model → prioritized
   targets) with live down/busy badges; rearrange priorities with `↑`/`↓` or by editing
   the number. Edits apply immediately **and are written back into the config file**.
   Auto-grouped models and aliases are shown read-only.
@@ -858,6 +912,7 @@ ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=
 | `client_host` | Reverse-DNS of `client_ip` (omitted if unresolved or `RESOLVE_CLIENT_HOST=false`) |
 | `svc`, `ua` | Service guessed from the User-Agent's leading token, and the full User-Agent |
 | `err` | Short error category (`invalid_request`, `unauthorized`, `rate_limited`, `upstream_error`…); absent on success |
+| `route` | Present only when [smart routing](#smart-routing) or a `first`/`last` override reordered the backends for this request: `smart` or `pinned` |
 | `trimmed`, `trim_capped` | Present only when the [context guardrail](#context-guardrail) shrank the request: messages dropped and old tool results cut to an excerpt. `{trimmed!=""}` in Loki finds every trimmed request; the matching `CONTEXT TRIM request #N …` WARNING has the token estimates |
 
 An **embedding or rerank** request returns no completion tokens (`out=0`), so it's tagged

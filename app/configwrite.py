@@ -390,6 +390,52 @@ async def set_aliases(aliases: dict) -> tuple:
     return await _edit(mutate, check)
 
 
+async def set_smart(enabled=None, modes=None) -> tuple:
+    """Persist `routing.smart_routing` and/or `routing.backend_modes`.
+
+    `enabled` (a bool) and `modes` ({provider: mode}) are independent: None leaves
+    that part of the file alone. `modes` replaces the whole mapping, and `auto` is
+    the default so it is never written — an all-`auto` map removes the key rather
+    than leaving `backend_modes: {}` behind. Edits only the `routing:` section, in
+    place, so its comments and the rest of the file are untouched.
+    """
+    wanted_modes = (
+        {str(k): str(v) for k, v in modes.items() if str(v) != "auto"} if modes is not None else None
+    )
+
+    def mutate(doc):
+        routing = doc.get("routing")
+        if not isinstance(routing, CommentedMap):
+            routing = CommentedMap()
+            doc["routing"] = routing
+        if enabled is not None:
+            routing["smart_routing"] = bool(enabled)
+        if wanted_modes is not None:
+            if wanted_modes:
+                existing = routing.get("backend_modes")
+                target = existing if isinstance(existing, CommentedMap) else CommentedMap()
+                for key in [k for k in target if k not in wanted_modes]:
+                    del target[key]
+                for key, value in wanted_modes.items():
+                    target[key] = value
+                routing["backend_modes"] = target
+            elif "backend_modes" in routing:
+                del routing["backend_modes"]
+        return None
+
+    def check(parsed):
+        got = parsed.get("routing") or {}
+        if enabled is not None and bool(got.get("smart_routing")) != bool(enabled):
+            return "self-check failed: smart_routing in the rewritten file does not match"
+        if wanted_modes is not None:
+            written = {str(k): str(v) for k, v in (got.get("backend_modes") or {}).items()}
+            if written != wanted_modes:
+                return "self-check failed: backend_modes in the rewritten file don't match"
+        return None
+
+    return await _edit(mutate, check)
+
+
 async def set_logical_model(name: str, targets) -> tuple:
     """Create or replace one `models:` entry from `[{provider, model?, priority}]`.
 

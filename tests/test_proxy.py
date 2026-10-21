@@ -308,6 +308,71 @@ def test_history_row_tokens_per_second_is_the_logged_number(client, upstreams, e
             "running_for", "chunks", "req_bytes"} <= set(row)
 
 
+# ── Smart routing ───────────────────────────────────────────────────────────
+
+def _smart(monkeypatch, **routing):
+    import dataclasses
+    from app import smart
+    routing.setdefault("smart_routing", True)
+    routing.setdefault("smart_min_requests", 1)
+    monkeypatch.setattr(conf, "ROUTING", dataclasses.replace(conf.ROUTING, **routing))
+    return smart
+
+
+def test_smart_routing_sends_the_request_to_the_cheaper_backend(client, upstreams, events, monkeypatch):
+    smart = _smart(monkeypatch)
+    # `first` is the configured priority-1 backend, but `second` is cheaper.
+    smart._prices = {("grouped", "first"): (3.0, 10), ("grouped", "second"): (1.0, 10)}
+    r = client.post("/v1/chat/completions", json={"model": "grouped"})
+    assert r.status_code == 200
+    assert [upstreams.host(x) for x in upstreams.requests] == ["second.invalid"]
+    line = next(l for l in events() if "event=request" in l)
+    assert "route=smart" in line and "provider=second" in line
+    row = client.get("/admin/inflight").json()["requests"][0]
+    assert row["routed"]["by"] == "smart" and row["routed"]["to"] == "second"
+    assert idle() == {"first": 0, "second": 0}
+
+
+def test_switched_off_the_configured_order_runs_and_nothing_is_marked(client, upstreams, events, monkeypatch):
+    smart = _smart(monkeypatch, smart_routing=False)
+    smart._prices = {("grouped", "first"): (3.0, 10), ("grouped", "second"): (1.0, 10)}
+    client.post("/v1/chat/completions", json={"model": "grouped"})
+    assert [upstreams.host(x) for x in upstreams.requests] == ["first.invalid"]
+    assert "route=" not in next(l for l in events() if "event=request" in l)
+    assert client.get("/admin/inflight").json()["requests"][0]["routed"] is None
+
+
+def test_an_override_wins_with_smart_routing_off(client, upstreams, events, monkeypatch):
+    """"Use X because I said so": `second` is forced first, no prices involved."""
+    _smart(monkeypatch, smart_routing=False, backend_modes={"second": "first"})
+    client.post("/v1/chat/completions", json={"model": "grouped"})
+    assert [upstreams.host(x) for x in upstreams.requests] == ["second.invalid"]
+    assert "route=pinned" in next(l for l in events() if "event=request" in l)
+
+
+def test_a_forced_backend_that_fails_still_fails_over(client, upstreams, monkeypatch):
+    """Priority, not exclusivity: when the forced backend is down the rest still serve."""
+    _smart(monkeypatch, smart_routing=False, backend_modes={"second": "first"})
+
+    def handler(request):
+        if upstreams.host(request) == "second.invalid":
+            return mock_response(503, json={"error": "busy"})
+        return mock_response(200, json=completion())
+
+    upstreams.set(handler)
+    r = client.post("/v1/chat/completions", json={"model": "grouped"})
+    assert r.status_code == 200
+    assert [upstreams.host(x) for x in upstreams.requests] == ["second.invalid", "first.invalid"]
+    assert idle() == {"first": 0, "second": 0}
+
+
+def test_an_explicit_provider_pin_is_never_reordered(client, upstreams, monkeypatch):
+    smart = _smart(monkeypatch, backend_modes={"second": "first"})
+    smart._prices = {("first:grouped", "first"): (9.0, 10)}
+    client.post("/v1/chat/completions", json={"model": "first:grouped"})
+    assert [upstreams.host(x) for x in upstreams.requests] == ["first.invalid"]
+
+
 # ── Cost & cache ────────────────────────────────────────────────────────────
 
 def priced(cost=0.000368968443, cached=6834, reasoning=21, **kw):

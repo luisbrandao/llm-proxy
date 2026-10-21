@@ -23,6 +23,7 @@ decompresses the response. Single process, async, one uvicorn worker.
 | `app/auth.py` | Bearer-key gate: `is_authorized(request)`, `restricted(provider)`. |
 | `app/proxy.py` | Request lifecycle: parse → resolve → gate → `_dispatch` (acquire slot, build body, forward, failover) → `_handle_non_stream` / `_handle_stream`. Also decompression, `_error` (the one OpenAI-shaped error envelope) and `_relay_headers`. |
 | `app/trim.py` | The context guardrail: `trim_request(payload, body_str, asked)` returns a shrunk copy of a chat body that declares `num_ctx` and is estimated to exceed it, or `None` when nothing needs to change. Excerpts old oversized tool results first, then drops the oldest turns at tool-call block boundaries; system messages always survive. Returns a `Trimmed` (payload + dropped/capped/before/after/budget) that `_route` writes to the entry (`Entry.mark_trimmed`) so the row badge and the log's `trimmed=`/`trim_capped=` fields carry the same numbers. Configured by the `trim:` section (`conf.TRIM`). Counts with a real tokenizer (`_TokenMeter`, the `tokenizer.json` that `trim.tokenizer` names — the image bakes Qwen's) over what the chat template renders; `_CharMeter` (JSON chars / `chars_per_token`) is only the fallback. Called once per request in `proxy._route`, in a worker thread (`asyncio.to_thread`), before `_dispatch`. |
+| `app/smart.py` | Smart routing. `order(targets, asked)` (pure, sync) returns the targets in the order a request should try them plus a note (`{"by": "smart"\|"pinned", "to", "prices"}`, or `None` when untouched): when `routing.smart_routing` is on, the rankable targets (`auto` mode, ≥ `smart_min_requests` priced requests) are sorted by observed $/M tokens and dealt back into the positions the rankable ones held, each position keeping its original `priority` value; then `first`/`last` overrides (`routing.backend_modes`) are applied with strict priorities 1..n. `refresh()` re-reads `ledger.observed_prices` into `_prices` every `REFRESH_SECS` from the lifespan task `refresh_loop`; `snapshot()` backs the Routing tab. Called once per request in `proxy._route`, after the down-backend filter and before the guardrail. |
 | `app/usage.py` | One `Usage` out of every vendor's spelling of the response's usage block: `prompt`/`completion`, prompt-cache `cached`/`cache_write`, `reasoning`, and `cost`/`currency` (`usage.cost`, OpenRouter and NanoGPT; NanoGPT's `x_nanogpt_pricing` as fallback). `parse(data)` takes the whole response object and returns `None` when there is no `usage`. `cost` is `None` when not reported — never 0, since `cost: 0` is a real statement (a free model). A leaf. |
 | `app/ledger.py` | The cost ledger: one SQLite row per completed request (`LEDGER_PATH`, default `ledger.sqlite` beside the config; `""` off, `":memory:"` process-lifetime). `record(...)` from `proxy._emit_request_log`, `summary(days, day, model, provider, limit, since, until)` for `/admin/costs`: totals, `by_day`, `by_model` (with each model's per-provider split), `by_provider`, newest `requests`. An explicit `since`/`until` (inclusive local dates) wins over `days`. The backend views and filter group `ollama*` providers as one `ollama` (`BACKEND_GROUPS`) — rows keep the real provider name. Every call runs in `asyncio.to_thread` on one connection under `_lock`; `record` never raises. Retention prune (`LEDGER_RETENTION_DAYS`) at connect and on the first write of a new local day. `startup()`/`close()` from the lifespan. |
 | `app/version.py` | Build identity — `VERSION` (the image tag, e.g. `master-52`), `REVISION` (git sha), `summary()`, `as_dict()`. Read from `APP_VERSION`/`APP_REVISION` at import; baked in by the Dockerfile from CI build-args. **Not** hot-reloaded — it is build metadata, not config. |
@@ -45,6 +46,7 @@ decompresses the response. Single process, async, one uvicorn worker.
 6. `trim.trim_request` — the context guardrail. Only touches a body with `messages` + an
    integer `num_ctx` that is estimated to exceed it; anything else passes through untouched.
    Runs once, before any target is chosen, so every failover attempt forwards the same body.
+6b. `smart.order` — reorder the candidates (cost ranking when switched on, `first`/`last` overrides always). Sits after the down filter and before `trim`/`_dispatch`; a no-op unless one of those is in force, and it only permutes the candidate list, so it can neither add a backend nor drop one.
 7. `_dispatch`: loop — `slots.acquire` → `_build_body` (rewrite model id, inject `provider_routing`) → forward. Fails over on two conditions: an `httpx.RequestError` (connection failure) **or** an upstream response whose status is in `ROUTING.failover_statuses` (`_should_failover`, default 429/5xx). Either one → release slot, `mark_down`, drop this target, try next. Exhausted: a connection failure → `_backend_error`; a relayed upstream error → that last response **verbatim** (real status + body). `clear_down` runs only on a `< 400` response.
 8. After the response is delivered (background task / stream `finally`): the handler's one `usage.parse` result feeds `_record_metrics`, `Entry.record`, and `_emit_request_log` — which writes the `event=request` line **and** the ledger row (`ledger.record`), so the four readers of a request's usage can never disagree. Only the attempt that answered the client reaches this step: a failed-over attempt's response is discarded with its background task, so a request is one line and one row however many backends it tried.
 
@@ -58,7 +60,7 @@ main.py                        ASGI entry: routes, /admin router, lifespan
   └─ proxy.py                  request lifecycle, failover
        └─ router.py            name -> ordered targets
             └─ registry.py     discovery + health
-  registry · slots · inflight · auth · clientinfo · configwrite · trim · claude_cli · ledger   services
+  registry · slots · inflight · auth · clientinfo · configwrite · trim · claude_cli · ledger · smart   services
        └─ config.py            the leaf everything reads
   config.py · metrics.py · logbuffer.py · upstream.py · version.py · usage.py   leaves
 ```
@@ -331,7 +333,14 @@ independent rules. If you add process-local state, add it to the reset list in
   `/admin/costs`, and a missing row is one missing row, not a dip Prometheus turns
   into a phantom spike. Keep it that way: never initialise a counter, a slot, a
   health mark or anything else in process state from it, and never let admission,
-  routing or failover read it — write-only from the request path, like `inflight`.
+  routing or failover read it from the request path — write-only from the request
+  path, like `inflight`. **The one deliberate exception is `smart.refresh`**: a
+  background task (never the request path) reads `ledger.observed_prices` into the
+  plain dict `smart._prices`, and requests read only that dict. It is safe because
+  of how it fails: a broken or empty ledger leaves the last snapshot or none, and
+  no snapshot means the configured priority order — the ledger can degrade routing
+  to what it was before it existed, never fail a request. Do not widen it: nothing
+  else may read the ledger on a request, and the snapshot must stay a rebound dict.
   Every call runs in `asyncio.to_thread` (SQLite blocks; the loop is relaying
   streams), on one connection under `_lock`, and `record` **never raises**: the
   response is already on its way, so a full disk is a rate-limited WARNING and a
@@ -344,6 +353,24 @@ independent rules. If you add process-local state, add it to the reset list in
   estimate of usage drawn from a subscription seat, not a charge. In the deploy
   the file sits in the config directory mount and is gitignored there — the host
   commits `config.yaml` by path, never `-a`, or the ledger ends up in git.
+- **Smart routing only reorders, and never moves what it cannot price.**
+  `smart.order` permutes the candidate list `_route` already built — after the
+  resolver, the auth gate and the down filter — so it cannot add a backend the caller
+  may not reach (the "never substitute a backend" rule holds by construction), and
+  failover still walks everything left. Within that: a target is *rankable* only with
+  mode `auto` and at least `smart_min_requests` priced requests for this model; an
+  unrankable target (unknown price, `fixed`, a `claude-cli` seat) keeps its
+  position, because an unknown price must never read as cheap. Rankable targets are
+  dealt back into the positions rankable ones held **with each position's original
+  `priority` value**, so a tie tier is still a tie tier for `slots._pick_free`'s
+  round-robin — never rewrite priorities to 1..n in the ranking. The `first`/`last`
+  override is the exception: it assigns strict priorities, because a forced backend
+  tied with another would still be round-robined. Work on **copies**
+  (`dataclasses.replace`): the targets are shared with the live config. Both are
+  priority, not exclusivity — failover must still reach the rest. `backend_modes`
+  values are validated at load and a typo **raises**; a mode silently read as `auto`
+  would hand an override the operator believes is in force to the ranking. The
+  console only ever writes what the operator set (never the seat's implicit `fixed`).
 - **Metric names use the `llm_proxy_` prefix** (renamed from `deepseek_proxy_`).
 - **Never persist or re-seed the counters.** A restart resetting them to zero is a real
   counter reset, and `rate()`/`increase()` handle it correctly. A snapshot restored from
@@ -395,6 +422,7 @@ one:
 | `tests/test_trim.py` | The context guardrail is a no-op unless `num_ctx` is present and exceeded (a fitting body returns `None`, not a copy); system messages survive; the oldest turns go first; a tool call and its results are never separated at the cut (swept across budgets); old oversized tool results are excerpted before any turn is dropped while recent ones stay whole; the newest turn is always sent; images are counted flat; the `trim:` section parses and hot-reloads. With a tokenizer (a byte-per-token `tokenizer.json` built in the test, so counts are worked out by hand): what the template prints is counted, not its JSON escape, nor sampling fields; excerpts are cut in tokens; a tokenizer that will not load falls back to chars and warns once; a relative path resolves against the config directory; the default path is the one the Dockerfile writes. `test_proxy.py` covers the wire: a trimmed body reaches the backend, a fitting one is forwarded verbatim, and a failover re-sends the same trimmed body. |
 | `tests/test_claude_cli.py` | The claude-cli backend through the real lifecycle, with the CLI replaced by a fake script run via the real subprocess path: the OpenAI ↔ CLI translation, the lockdown flags and empty cwd, a keyless caller never reaching the CLI, CLI errors → HTTP statuses and failover, images and legacy `functions` refused with a 400, emulated function calling (functions as prompt text with the CLI's tools still off, a call caught mid-stream and the process killed before it carries on, argument types put right by the schema, parallel calls, `tool_choice`, history rendered into the transcript), and **no `claude` process outliving its slot** on timeout or cancellation. |
 | `tests/test_usage.py` | The usage parser against the two real priced samples (OpenRouter, NanoGPT) and every other spelling of cache and reasoning counts; that no usage block is `None` while an unpriced one is a `Usage` with `cost=None`; that `cost: 0` stays a price; that malformed fields zero out instead of raising; the log's plain-decimal cost format. |
+| `tests/test_smart.py` | Smart routing: inert unless switched on; cheapest first; each position keeps its priority value so a tie tier survives; an unpriced / under-sampled / `fixed` / seat backend is never moved; equal prices (local boxes at 0) keep the configured order; prices are per model; `first`/`last` are strict, work with smart routing off, beat the ranking and leave the input targets unmutated; a mistyped `backend_modes` fails the load; the ledger snapshot counts only successful priced requests with tokens, per real provider; a failed refresh keeps the last snapshot and never raises. `test_proxy.py` drives it through the lifecycle: the cheaper backend gets the request and the log/row say so, off means configured order, an override wins and still fails over, an explicit `provider:model` pin is untouched; `test_configwrite.py` covers `set_smart` (comments kept, byte-identical resave, partial calls, section created). |
 | `tests/test_ledger.py` | The ledger's aggregate shape (totals, by day, by model with the per-provider split, by provider, newest requests), the day/range/model/provider filters and that the day filter leaves the day series whole, retention pruning on reopen (and `0` = keep everything), a file ledger surviving a reopen, a disabled ledger recording nothing, and that a ledger that cannot be written warns once and **never raises**. `test_proxy.py` covers the wire end: a priced response reaches the log line, the In-flight row, the ledger and `llm_proxy_cost_total` as one number; an unpriced one stays unpriced; a free model is priced at zero; a stream's final chunk is parsed; a failed-over request is one row. |
 | `tests/test_inflight.py` | The feed's derived numbers, driven on `Entry` directly: tokens/s divides over upstream time (queue wait excluded), takes the handler's recorded duration over the clock, is reset by a failover, keeps the `~` estimate when a backend never reports usage, and rounds exactly as the log formats. `test_proxy.py` closes the loop by matching a history row to its `speed_tps` line. |
 
@@ -402,6 +430,9 @@ Conventions that matter when adding tests:
 
 - `tests/conftest.py` sets `CONFIG_PATH` **before** anything imports `app.*`, because
   `config.py` reads it at import time.
+- `no_smart_refresh_loop` is autouse and swaps `smart.refresh_loop` for one that idles:
+  the lifespan would otherwise overwrite a test's hand-set `smart._prices` from the
+  empty ledger. Tests set `smart._prices` directly and call `smart.refresh()` themselves.
 - `reset_state` is autouse and clears the process-local dicts between tests. Add new
   process-local state to it, or tests leak into each other. It also points
   `conf.LEDGER_PATH` at `:memory:` and closes the ledger afterwards, so every test

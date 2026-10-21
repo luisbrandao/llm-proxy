@@ -210,6 +210,43 @@ def test_costs_rejects_a_malformed_day(client):
     assert r.status_code == 422 and "day" in r.json()["error"]
 
 
+# Every field the Routing tab reads from `smart` in /admin/routing.
+SMART_FIELDS = {"enabled", "window_days", "min_requests", "refreshed_at", "providers", "prices", "models"}
+
+
+def test_routing_view_carries_the_smart_block(client):
+    from app import smart
+    smart._prices = {("grouped", "alpha"): (1.5, 12)}
+    body = client.get("/admin/routing", headers=AUTH).json()
+    s = body["smart"]
+    assert SMART_FIELDS <= set(s), f"missing: {SMART_FIELDS - set(s)}"
+    assert {"name", "kind", "mode", "locked"} <= set(s["providers"][0])
+    assert {"model", "provider", "usd_per_mtok", "requests"} <= set(s["prices"][0])
+    assert {"name", "static", "current", "by"} <= set(s["models"][0])
+    assert set(client.get("/admin/config", headers=AUTH).json()["routing"]) >= {"smart_routing", "backend_modes"}
+
+
+def test_the_smart_switch_and_modes_are_written_and_applied(client):
+    from app import config as conf
+    r = client.put("/admin/config/smart", headers=AUTH, json={"enabled": True, "modes": {"beta": "last"}})
+    assert r.status_code == 200 and r.json()["persisted"] is True
+    assert conf.ROUTING.smart_routing is True and conf.ROUTING.backend_modes == {"beta": "last"}
+    assert client.get("/admin/routing", headers=AUTH).json()["smart"]["enabled"] is True
+    # A later call may carry only one of the two; the other is left alone.
+    client.put("/admin/config/smart", headers=AUTH, json={"enabled": False})
+    assert conf.ROUTING.smart_routing is False and conf.ROUTING.backend_modes == {"beta": "last"}
+    client.put("/admin/config/smart", headers=AUTH, json={"modes": {"beta": "auto"}})
+    assert conf.ROUTING.backend_modes == {}
+
+
+@pytest.mark.parametrize("body", [
+    {}, {"enabled": "yes"}, {"modes": ["alpha"]}, {"modes": {"nope": "first"}}, {"modes": {"alpha": "frist"}},
+])
+def test_the_smart_endpoint_refuses_bad_input(client, body):
+    r = client.put("/admin/config/smart", headers=AUTH, json=body)
+    assert r.status_code == 422 and "error" in r.json()
+
+
 def test_costs_never_leaks_an_api_key(client):
     text = client.get("/admin/costs", headers=AUTH).text
     assert "sk-not-for-export" not in text and '"api_key"' not in text

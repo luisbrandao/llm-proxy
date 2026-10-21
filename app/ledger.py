@@ -375,6 +375,38 @@ async def summary(days: int = 30, day: Optional[str] = None, model: Optional[str
     return await asyncio.to_thread(_summary, days, day, model, provider, limit, since, until)
 
 
+def _observed_prices(days: int) -> dict:
+    with _lock:
+        conn = _connect()
+        if conn is None:
+            return {}
+        since = (date.fromisoformat(local_day()) - timedelta(days=max(1, days) - 1)).isoformat()
+        rows = conn.execute(
+            "SELECT asked, provider, SUM(cost), "
+            "SUM(prompt_tokens + completion_tokens), COUNT(*) FROM requests "
+            "WHERE day >= ? AND cost IS NOT NULL AND status < 400 "
+            "AND prompt_tokens + completion_tokens > 0 GROUP BY asked, provider",
+            (since,),
+        ).fetchall()
+    return {
+        (asked, provider): (cost / tokens * 1e6, int(n))
+        for asked, provider, cost, tokens, n in rows if tokens
+    }
+
+
+async def observed_prices(days: int = 7) -> dict:
+    """`{(asked model, provider): (USD per million tokens, priced requests)}` over
+    the last `days` days, counting only successful requests that carried a price.
+
+    Per *provider name*, not the ollama-style group the views use: smart routing
+    orders real backends. Tokens are prompt + completion, so the figure is a
+    blended price that already contains whatever the cache saved and whatever
+    reasoning cost — the thing a list price cannot tell you. Read by
+    `smart.refresh`, off the request path.
+    """
+    return await asyncio.to_thread(_observed_prices, days)
+
+
 def startup() -> None:
     """Open the ledger at boot so a bad path is logged once, up front, instead
     of on the first request — and so the retention prune runs before traffic."""

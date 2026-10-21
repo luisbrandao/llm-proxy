@@ -154,6 +154,17 @@ class LogicalModel:
     targets: List[Target] = field(default_factory=list)
 
 
+# What a backend may do under smart routing (app/smart.py), set per backend in
+# `routing.backend_modes`; an unlisted backend is `auto`.
+#   auto   takes part in the cost ranking (when smart routing is on)
+#   fixed  smart routing never moves it — it stays where `priority` put it
+#   first  operator override: tried before every other backend of the model
+#   last   operator override: tried after every other backend of the model
+# `first`/`last` apply whether or not smart routing is on: they are the
+# "use X because I said so" lever, not part of the cost ranking.
+BACKEND_MODES = ("auto", "fixed", "first", "last")
+
+
 @dataclass
 class Routing:
     queue_timeout: float = 0.0   # seconds to wait for a slot; 0 = wait forever
@@ -175,6 +186,16 @@ class Routing:
     failover_statuses: frozenset = field(
         default_factory=lambda: frozenset({429, 500, 502, 503, 504})
     )
+    # Cost-aware ordering of one model's backends (app/smart.py). Off by default:
+    # the configured `priority` order — which puts the cheaper quota first — is
+    # what runs unless this is switched on.
+    smart_routing: bool = False
+    # How far back the observed prices it ranks by are read, and how many priced
+    # requests a (model, backend) pair needs before it is ranked at all.
+    smart_window_days: int = 7
+    smart_min_requests: int = 5
+    # provider name -> one of BACKEND_MODES. See above.
+    backend_modes: Dict[str, str] = field(default_factory=dict)
 
 
 # Where the Dockerfile puts the tokenizer the context guardrail counts with.
@@ -280,6 +301,16 @@ def _load(text: bytes):
         logical[str(name)] = LogicalModel(name=str(name), targets=targets)
 
     r = raw.get("routing") or {}
+    modes = {}
+    for name, mode in (r.get("backend_modes") or {}).items():
+        mode = str(mode).strip().lower()
+        if mode not in BACKEND_MODES:
+            # Loud: a typo that silently left a backend on `auto` would hand an
+            # override the operator believes is in force to the cost ranking.
+            raise ValueError(
+                f"routing.backend_modes[{name!r}]: {mode!r} is not one of {', '.join(BACKEND_MODES)}"
+            )
+        modes[str(name)] = mode
     fos = r.get("failover_statuses")
     routing = Routing(
         queue_timeout=float(r.get("queue_timeout", 0) or 0),
@@ -288,6 +319,10 @@ def _load(text: bytes):
         down_backoff=float(r.get("down_backoff", 15)),
         queue_affinity=bool(r.get("queue_affinity", True)),
         affinity_max_skips=max(0, int(r.get("affinity_max_skips", 3))),
+        smart_routing=bool(r.get("smart_routing", False)),
+        smart_window_days=max(1, int(r.get("smart_window_days", 7))),
+        smart_min_requests=max(1, int(r.get("smart_min_requests", 5))),
+        backend_modes=modes,
         failover_statuses=(
             frozenset(int(s) for s in fos)
             if fos is not None
