@@ -126,6 +126,10 @@ curl -s -H "Authorization: Bearer $T" \
 Unlike the llama-swap fleet (thousands of tags, needs paging), this package has a
 few dozen tags and one un-paged request returns all of them.
 
+The workflow also pushes `master-N` as a **git tag** on the built commit (last step,
+after the image push), so `git fetch --tags && git rev-parse master-N` says what code a
+running version is, and `git log master-A..master-B` what a deploy changed.
+
 Deploy the **explicit `master-N` tag, not `latest`.** The compose file is the
 record of what production runs; `latest` makes that unreadable and makes
 rollback guesswork.

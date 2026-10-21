@@ -274,8 +274,10 @@ independent rules. If you add process-local state, add it to the reset list in
   `/health`, `/metrics` (`llm_proxy_build_info`) and the console header report it. That
   equality is the whole point — the compose file pins a tag, and this is what lets you
   confirm the process *answering requests* is that build rather than a container that
-  never got recreated. If you change how the tag is derived, change the build-arg in the
-  same commit. The `ARG` lines sit **after** `pip install` in the Dockerfile on purpose:
+  never got recreated. The same `master-N` is pushed as a git tag on the built commit
+  (the workflow's last step, after the image push), so a live version maps to its source
+  with `git checkout master-N`. If you change how the tag is derived, change the build-arg
+  and that tag step in the same commit. The `ARG` lines sit **after** `pip install` in the Dockerfile on purpose:
   `APP_VERSION` changes every build, and an `ARG` above the install would invalidate that
   layer every time. An undefined `ARG` expands to `""`, not to nothing, which is why
   `version.py` treats blank as absent and reports `dev`.

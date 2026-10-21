@@ -1678,7 +1678,11 @@ function renderLogical(models, downSet) {
   wrap.innerHTML = "";
   wrap.appendChild(el("h2", null, "Model routing"));
   if (!models.length) { wrap.appendChild(el("div", "hint", "No explicit logical models configured.")); return; }
-  for (const m of models) wrap.appendChild(modelCard(m, downSet));
+  // A card is two or three rows of data, so they sit side by side rather than
+  // one per screen-width line.
+  const grid = el("div", "mgrid");
+  for (const m of models) grid.appendChild(modelCard(m, downSet));
+  wrap.appendChild(grid);
 }
 
 function modelCard(model, downSet) {

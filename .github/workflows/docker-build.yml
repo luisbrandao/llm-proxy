@@ -42,7 +42,7 @@ jobs:
     needs: test
     runs-on: ubuntu-24.04   # see the test job
     permissions:
-      contents: read
+      contents: write     # to push the build's git tag (see the last step)
       packages: write
 
     steps:
@@ -84,3 +84,15 @@ jobs:
             APP_REVISION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # The image tag `master-N` and this git tag are the same name on purpose: for
+      # any running version, `git checkout master-N` is the code it was built from.
+      # After the push, so a tag exists only for a build that produced an image.
+      # Idempotent: a re-run of a run keeps its run_number, so the tag may already
+      # exist, pointing at this same commit. A tag push does not retrigger this
+      # workflow, which listens to branch pushes only.
+      - name: Tag the commit with the build
+        run: |
+          tag="master-${{ github.run_number }}"
+          git rev-parse -q --verify "refs/tags/$tag" >/dev/null || git tag "$tag" "${{ github.sha }}"
+          git push origin "refs/tags/$tag"

@@ -994,6 +994,12 @@ summary above is emitted in addition, so you can both alert on it and read the f
 Pushes to `master` (ignoring `.md`-only changes) build the Docker image and push to GitHub
 Container Registry, tagged `latest` and `master-{run_number}`, using `GITHUB_TOKEN`.
 
+The same name is pushed as a **git tag** on the built commit, after the image push, so a
+tag exists only for a build that produced an image. For any running version —
+`/health`, the console's build chip, the image in the compose file — `git checkout master-70`
+is the code it was built from, and `git log master-69..master-70` is what changed between
+two deploys.
+
 ## Tech Stack
 
 - **FastAPI** + **uvicorn** — async ASGI

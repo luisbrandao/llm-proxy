@@ -530,8 +530,14 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
 /* ── Routing: logical model cards (connected boxes) ────────── */
 .logical { margin-bottom: 18px; }
 .mcard { border: 1px solid var(--line); border-radius: 11px; background: var(--panel); margin-bottom: 12px; overflow: hidden; }
-.mhead { display: flex; align-items: center; gap: 12px; padding: 11px 14px; background: var(--bg-2); border-bottom: 1px solid var(--line); }
-.mname { font-family: var(--mono); font-weight: 600; font-size: 14px; color: #fff; }
+.mhead { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 11px 14px; background: var(--bg-2); border-bottom: 1px solid var(--line); }
+.mname { font-family: var(--mono); font-weight: 600; font-size: 14px; color: #fff; word-break: break-word; }
+/* Model routing cards: as many columns as fit at 520px, so two on a laptop and
+   three on a wide screen; a narrow window falls back to one. `align-items: start`
+   because the cards differ in height (2 targets vs 4) and should not stretch. */
+.mgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(520px, 1fr)); gap: 12px; align-items: start; }
+.mgrid .mcard { margin-bottom: 0; min-width: 0; }
+@media (max-width: 600px) { .mgrid { grid-template-columns: 1fr; } }
 .mtcount { margin-left: 2px; }
 .mactions { margin-left: auto; display: flex; gap: 8px; }
 
