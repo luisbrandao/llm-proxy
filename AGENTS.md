@@ -374,7 +374,10 @@ independent rules. If you add process-local state, add it to the reset list in
   vendor, never to a public catalog (OpenRouter's `/models`), and `accounts_snapshot` carries
   numbers only. **Units are the trap**: every parser converts to USD per million tokens;
   OpenRouter prices per token and NanoGPT's `cacheReadInputPer1kTokens` is per thousand,
-  whatever its `unit` field says — a slip is a silent 1000x. **A subscription is free only for
+  whatever its `unit` field says — a slip is a silent 1000x. **A subscription counts as left
+  only while `remaining > 0`** — NanoGPT's `recommendedMode` verdict lags (it still said
+  `subscription` with 0 remaining while billing), so it may veto and never grant — and the
+  accounts are re-read every 30 s past 95% used (`rates.next_delay`). **A subscription is free only for
   the models it covers**: `quota_state` consults the covered list, and a model outside it
   (kimi-k3 on NanoGPT) bills the balance even with allowance left. The operator's
   `pricing:` table beats a fetched card for the models it lists. An override that depends on

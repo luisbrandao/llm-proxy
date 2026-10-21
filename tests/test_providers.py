@@ -160,6 +160,24 @@ def test_an_exhausted_quota_is_not_available_when_nano_says_paygo():
     assert q.remaining == 0 and q.available is False and q.mode == "paygo"
 
 
+def test_a_stale_verdict_cannot_make_an_empty_allowance_available():
+    """The payload NanoGPT actually returned on 2026-10-21 14:16 BRT: the allowance was gone
+    and every request was already being billed, yet the verdict still said `subscription`."""
+    observed = {**NANO_USAGE,
+                "weeklyInputTokens": {"used": 60001719, "remaining": 0, "percentUsed": 1.00002865,
+                                      "resetAt": 1792972800000},
+                "routing": {"recommendedMode": "subscription", "reason": "included_quota_available",
+                            "subscriptionQuotaAvailable": True, "paidOverageEnabled": True}}
+    q = nanogpt.parse_quota(observed)
+    assert q.remaining == 0 and q.used > q.limit
+    assert q.available is False
+
+
+def test_the_verdict_can_still_veto_an_allowance_that_has_tokens_left():
+    q = nanogpt.parse_quota({**NANO_USAGE, "routing": {"recommendedMode": "paygo"}})
+    assert q.remaining > 0 and q.available is False
+
+
 def test_without_a_verdict_available_means_something_is_left():
     bare = {**NANO_USAGE, "routing": {}}
     assert nanogpt.parse_quota(bare).available is True

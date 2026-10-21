@@ -198,6 +198,27 @@ def test_once_the_allowance_is_gone_the_backend_bills_or_refuses(vendors):
     assert rates.quota_state("nano", "m") == "refused"
 
 
+def test_the_accounts_are_read_faster_while_a_subscription_is_nearly_spent(vendors):
+    assert rates.next_delay() == rates.ACCOUNTS_EVERY                       # nothing to watch
+    rates._quotas["nano"] = _quota(used=50, limit=100, remaining=50)
+    assert rates.next_delay() == rates.ACCOUNTS_EVERY                       # half used
+    rates._quotas["nano"] = _quota(used=96, limit=100, remaining=4)
+    assert rates.next_delay() == rates.ACCOUNTS_EVERY_NEAR_LIMIT            # 96%: every half minute
+    rates._quotas["nano"] = _quota(used=100, limit=100, remaining=0, available=False)
+    assert rates.next_delay() == rates.ACCOUNTS_EVERY, "once it is gone there is nothing left to catch"
+
+
+async def test_the_real_exhausted_payload_makes_the_backend_billed_end_to_end(vendors):
+    """From NanoGPT's response to the state the ranking sees: used up means billed."""
+    exhausted = {**NANO_USAGE,
+                 "weeklyInputTokens": {"used": 60001719, "remaining": 0, "resetAt": 1792972800000},
+                 "routing": {"recommendedMode": "subscription", "reason": "included_quota_available"}}
+    vendors.override["subscription/v1/usage"] = lambda r: httpx.Response(200, json=exhausted)
+    await rates.refresh_catalogs()
+    await rates.refresh_accounts()
+    assert rates.quota_state("nano", "z-ai/glm-5.3") == "billed"
+
+
 # ── the accounts ────────────────────────────────────────────────────────────
 
 async def test_quota_and_balances_are_read_and_shown_without_a_key(vendors):

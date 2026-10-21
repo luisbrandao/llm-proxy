@@ -76,8 +76,11 @@ def parse_quota(payload) -> Optional[Quota]:
         return None
     remaining, used, limit, reset_at = min(counters, key=lambda c: c[0])
     mode = (payload.get("routing") or {}).get("recommendedMode")
-    # NanoGPT's own verdict when it gives one; "something is left" when it does not.
-    available = (mode == "subscription") if mode in ("subscription", "paygo", "unavailable") else remaining > 0
+    # Allowance left is the counter's own word, and the verdict can only veto it. The
+    # verdict is advisory and lags: on 2026-10-21 NanoGPT reported used 60001719 of
+    # 60000000, remaining 0, and still said `subscription` / `included_quota_available`
+    # while it was already billing every request. Trusting it priced a dead quota as free.
+    available = remaining > 0 and mode not in ("paygo", "unavailable")
     return Quota(
         used=used, limit=limit, remaining=int(remaining), reset_at=reset_at,
         allow_overage=bool(payload.get("allowOverage")), available=available, mode=mode,

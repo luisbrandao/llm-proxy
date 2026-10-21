@@ -54,6 +54,11 @@ routing.billingMode               both
   tokens for the same window against nano's 58.92M.
 - `resetAt` `1792972800000` is Monday 00:00 UTC, which is Sunday 21:00 BRT.
 - A null counter with `degraded: true` means unknown, never "full allowance".
+- **Do not trust `routing.recommendedMode` as proof of allowance.** On 2026-10-21 at 14:16 BRT the
+  response read `used 60001719`, `remaining 0`, and still `recommendedMode: subscription`,
+  `reason: included_quota_available`, while requests were already being billed (the first billed
+  request was at 17:12:50 UTC). The counter is right; the verdict lags. The proxy treats
+  allowance as left only when `remaining > 0`, and uses the verdict only to veto.
 - A management-scoped variant exists at `https://nano-gpt.com/api/management/v1/subscription/usage`
   with a separate token (`usage:read`); it is not needed for reading quota with the inference key.
 

@@ -46,6 +46,10 @@ logger = logging.getLogger("llm-proxy")
 
 CATALOG_EVERY = 3600.0
 ACCOUNTS_EVERY = 120.0
+# While a subscription is nearly spent, "free" can flip to "billed" within a minute, and
+# every request sent in the meantime is priced as free. Read it faster then.
+ACCOUNTS_EVERY_NEAR_LIMIT = 30.0
+NEAR_LIMIT = 0.95
 # One warning per (provider, what) per window, whatever the refresh cadence.
 WARN_EVERY = 900.0
 
@@ -260,13 +264,21 @@ async def cycle(last_catalog: Optional[float], last_signature) -> tuple:
     return last_catalog, last_signature
 
 
+def next_delay() -> float:
+    """Seconds until the accounts are read again: sooner while any subscription is
+    within `NEAR_LIMIT` of its allowance, because that is when the answer changes."""
+    if any(q.available and q.percent >= NEAR_LIMIT for q in _quotas.values()):
+        return ACCOUNTS_EVERY_NEAR_LIMIT
+    return ACCOUNTS_EVERY
+
+
 async def refresh_loop() -> None:
     """The lifespan task: catalogs hourly (and on a config change), accounts every
-    couple of minutes."""
+    couple of minutes, every half minute while a subscription is nearly spent."""
     last_catalog, last_signature = None, None
     while True:
         last_catalog, last_signature = await cycle(last_catalog, last_signature)
-        await asyncio.sleep(ACCOUNTS_EVERY)
+        await asyncio.sleep(next_delay())
 
 
 def accounts_snapshot() -> dict:

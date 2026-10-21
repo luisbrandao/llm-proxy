@@ -186,7 +186,7 @@ vendors. A background task (`app/rates.py`) reads, per backend whose vendor it r
 | every | what | from |
 |---|---|---|
 | hour | the vendor's price list, filtered to the models you use, and which models a subscription covers | OpenRouter `/models`, NanoGPT `/api/v1/models?detailed=true` |
-| 2 minutes | subscription allowance left and its reset time | NanoGPT `/api/subscription/v1/usage` |
+| 2 minutes, 30 seconds past 95% used | subscription allowance left and its reset time | NanoGPT `/api/subscription/v1/usage` |
 | 2 minutes | account balance | OpenRouter `/credits`, NanoGPT `/api/check-balance`, DeepSeek `/user/balance` |
 
 The vendor is worked out from the host of `base_url` (`openrouter.ai`, `nano-gpt.com`,
@@ -200,8 +200,10 @@ A vendor that fails leaves its last good data and logs one warning per window, s
 can age the numbers but never empty them or fail a request. The Costs tab shows each
 backend's balance and allowance meter, and `GET /admin/accounts` returns the same.
 
-NanoGPT's allowance counts **input tokens only, cached input included**, and covers only some
-models: one outside the subscription bills the balance even while allowance remains, which is
+NanoGPT's allowance counts **input tokens only, cached input included**. It counts as left only
+while the counter's `remaining` is above zero: nano's own `recommendedMode` verdict keeps saying
+`subscription` for a while after the allowance is gone and requests are already being billed, so
+it can veto but never grant. The allowance covers only some models: one outside the subscription bills the balance even while allowance remains, which is
 why the covered list is read too.
 
 ### Smart routing
