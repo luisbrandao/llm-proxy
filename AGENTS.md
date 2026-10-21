@@ -478,8 +478,8 @@ Clients only ever see/send **canonical** names; native (provider-specific) ids n
 
 - Model ids can contain `:` (e.g. `local.qwen-medium:low`). `provider:model` splits on the
   **first** `:` only, and only treats the prefix as explicit if it matches a known provider.
-  Canonical names are colon-free by convention, so a native id like `zai-org/glm-5.2:thinking`
-  maps cleanly to a canonical `glm-5.2`.
+  Canonical names are colon-free by convention, so a native id like `deepseek/deepseek-v4-pro-0813:thinking`
+  maps cleanly to a canonical `deepseek-v4-pro`.
 - `priority` lower = preferred; defaults to config order. Within a tie tier, admission
   round-robins across the tied backends that currently have a free slot (`slots._pick_free`).
 - `queue_timeout: 0` means wait forever (the current default).

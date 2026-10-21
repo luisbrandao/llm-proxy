@@ -411,10 +411,10 @@ providers:
     api_key: "sk-or-..."
     require_permission: true
     base_url: "https://openrouter.ai/api"
-    enabled_models: [z-ai/glm-5.2]            # native ids
+    enabled_models: [deepseek/deepseek-v4-pro-0813]  # native ids
     slots: 10
     model_map:                                # native -> canonical
-      z-ai/glm-5.2: glm-5.2
+      deepseek/deepseek-v4-pro-0813: deepseek-v4-pro
       deepseek/deepseek-v4-flash: deepseek-v4-flash
     provider_routing:                         # pin OpenRouter's upstream (native key)
       deepseek/deepseek-v4-flash: [deepseek]
@@ -476,13 +476,13 @@ the console quotes them on write:
 providers:
   - name: nanoGPT
     model_map:
-      z-ai/glm-5.2: glm-5.2
+      "deepseek/deepseek-v4-pro-0813:thinking": deepseek-v4-pro
       "qwen3.8-max:thinking": qwen-max
 ```
 
 > Short version, since this is the part everyone forgets: a **canonical name** is what
-> clients send (`glm-5.2`) and a **native id** is what one backend calls that same model
-> on the wire (`zai-org/glm-5.2` on nanoGPT, `z-ai/glm-5.2` on openRouter). `model_map`
+> clients send (`deepseek-v4-pro`) and a **native id** is what one backend calls that same model
+> on the wire (`deepseek/deepseek-v4-pro-0813:thinking` on nanoGPT, `deepseek/deepseek-v4-pro-0813` on openRouter). `model_map`
 > translates between them, per provider. The console's Config tab has the same
 > explanation behind a (?) next to each section.
 
@@ -705,9 +705,9 @@ A built-in, dependency-free dashboard served by the proxy itself — open
     and points at Name mapping, because that mistake used to be accepted verbatim as an
     id that could never match anything.
   - Each section has a **(?)** panel explaining the concepts in place — including a
-    walkthrough of the same model's name at each hop (backend reports `zai-org/glm-5.2`
-    → `model_map` renames it → client asks for `glm-5.2` → proxy sends
-    `zai-org/glm-5.2`), which is the thing worth having on screen while you are staring
+    walkthrough of the same model's name at each hop (backend reports `deepseek/deepseek-v4-pro-0813:thinking`
+    → `model_map` renames it → client asks for `deepseek-v4-pro` → proxy sends
+    `deepseek/deepseek-v4-pro-0813:thinking`), which is the thing worth having on screen while you are staring
     at a list of native ids.
   - `api_key` values are never sent to the browser; a provider shows only whether one is
     set. Editing secrets and adding/removing whole providers stay file-side for now.
@@ -892,7 +892,7 @@ Every completed request — success **or** error — emits exactly one structure
 [logfmt](https://brandur.org/logfmt) line on stdout:
 
 ```
-ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=z-ai/glm-5.2 asked=glm-5.2 status=200 stream=true in=5524 out=890 cached=5000 reasoning=120 cost=0.00037 dur=0:00:26 speed_tps=34.91 client_ip=192.168.1.50 client_host=workstation.lan svc=OpenWebUI ua="OpenWebUI/0.5"
+ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=deepseek/deepseek-v4-pro-0813 asked=deepseek-v4-pro status=200 stream=true in=5524 out=890 cached=5000 reasoning=120 cost=0.00037 dur=0:00:26 speed_tps=34.91 client_ip=192.168.1.50 client_host=workstation.lan svc=OpenWebUI ua="OpenWebUI/0.5"
 ```
 
 | Field | Meaning |

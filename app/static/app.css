@@ -646,7 +646,7 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
 }
 .cfgadd { display: flex; gap: 8px; }
 
-/* "→ glm-5.2  group" next to a native id: what clients actually send. */
+/* "→ deepseek-v4-pro  group" next to a native id: what clients actually send. */
 /* Always its own indented line under the id. Sharing the line would let flexbox
    shrink the id (it is ellipsised, so it yields first) and the native id is the
    thing you came to read. */

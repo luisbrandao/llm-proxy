@@ -810,24 +810,24 @@ function helpNative() {
     return d;
   };
   flow.append(
-    step("backend reports", "zai-org/glm-5.2"),
+    step("backend reports", "deepseek/deepseek-v4-pro-0813:thinking"),
     el("span", "cfgflowarrow", "→"),
-    step("model_map renames it", "glm-5.2"),
+    step("model_map renames it", "deepseek-v4-pro"),
     el("span", "cfgflowarrow", "→"),
-    step("client asks for", "glm-5.2"),
+    step("client asks for", "deepseek-v4-pro"),
     el("span", "cfgflowarrow", "→"),
-    step("proxy sends", "zai-org/glm-5.2"),
+    step("proxy sends", "deepseek/deepseek-v4-pro-0813:thinking"),
   );
   return [
     helpLine("Every model has two names, and this page shows both."),
     helpLine(
       "A ", el("b", null, "native id"), " is what one backend calls the model on the wire — ",
-      code("zai-org/glm-5.2"), " on nanoGPT, ", code("z-ai/glm-5.2"), " on openRouter. ",
+      code("deepseek/deepseek-v4-pro-0813:thinking"), " on nanoGPT, ", code("deepseek/deepseek-v4-pro-0813"), " on openRouter. ",
       "The checkboxes below are native ids, read straight from the backend's ",
       code("/v1/models"), ", which is why they carry vendor prefixes and look messy.",
     ),
     helpLine(
-      "A ", el("b", null, "canonical name"), " is what your clients send — ", code("glm-5.2"),
+      "A ", el("b", null, "canonical name"), " is what your clients send — ", code("deepseek-v4-pro"),
       " — and stays the same whichever backend serves it.",
     ),
     flow,
@@ -1142,7 +1142,7 @@ function catalogPicker(p, chosen, redraw) {
     const v = input.value.trim();
     if (!v) return;
     // This field pins ONE native id. People reach for it to write a mapping
-    // ("z-ai/glm-5.2 -> glm-5.2"), which used to be accepted verbatim as an id
+    // ("deepseek/deepseek-v4-pro-0813 -> deepseek-v4-pro"), which used to be accepted verbatim as an id
     // that could never match anything. Say where mappings live instead.
     if (/->|=>|\s/.test(v)) {
       toast("One native id only — no spaces or arrows. To rename an id for clients, "
@@ -1231,11 +1231,11 @@ function nameMapBlock(p) {
       const row = el("div", "cfgmaprow");
       const native = el("input");
       native.type = "text"; native.className = "cfginput mono"; native.value = r.native;
-      native.placeholder = "native id, e.g. z-ai/glm-5.2";
+      native.placeholder = "native id, e.g. deepseek/deepseek-v4-pro-0813";
       native.onchange = () => { r.native = native.value.trim(); };
       const canon = el("input");
       canon.type = "text"; canon.className = "cfginput mono"; canon.value = r.canon;
-      canon.placeholder = "name clients send, e.g. glm-5.2";
+      canon.placeholder = "name clients send, e.g. deepseek-v4-pro";
       canon.onchange = () => { r.canon = canon.value.trim(); };
       const del = el("button", "mini", "✕");
       del.title = "remove this mapping";
