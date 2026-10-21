@@ -308,6 +308,44 @@ def test_history_row_tokens_per_second_is_the_logged_number(client, upstreams, e
             "running_for", "chunks", "req_bytes"} <= set(row)
 
 
+# ── Moving a conversation between backends ──────────────────────────────────
+
+def _history_from_nano():
+    """What opencode sends after a turn nano answered: the assistant's tool call carries
+    nano's `reasoning`, not the `reasoning_content` DeepSeek insists on."""
+    return {"model": "grouped", "messages": [
+        {"role": "user", "content": "weather in Curitiba?"},
+        {"role": "assistant", "content": None, "reasoning": "I should call the weather tool.",
+         "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "22C and sunny"},
+    ]}
+
+
+def test_a_deepseek_backend_is_sent_the_reasoning_key_its_api_requires(client, upstreams, monkeypatch):
+    monkeypatch.setattr(conf.PROVIDERS_BY_NAME["first"], "vendor", "deepseek")
+    r = client.post("/v1/chat/completions", json=_history_from_nano())
+    assert r.status_code == 200
+    sent = upstreams.body(upstreams.requests[0])["messages"][1]
+    assert sent["reasoning_content"] == "I should call the weather tool."
+    assert idle() == {"first": 0, "second": 0}
+
+
+def test_a_backend_of_another_vendor_gets_the_clients_history_untouched(client, upstreams):
+    client.post("/v1/chat/completions", json=_history_from_nano())
+    assert upstreams.body(upstreams.requests[0])["messages"][1] == _history_from_nano()["messages"][1]
+
+
+def test_failing_over_from_a_deepseek_backend_does_not_leak_the_repair_to_the_next(client, upstreams, monkeypatch):
+    """The payload is shared between attempts; only the DeepSeek attempt may see the key."""
+    monkeypatch.setattr(conf.PROVIDERS_BY_NAME["first"], "vendor", "deepseek")
+    upstreams.set(lambda r: mock_response(503, json={"error": "busy"}) if upstreams.host(r) == "first.invalid"
+                  else mock_response(200, json=completion()))
+    client.post("/v1/chat/completions", json=_history_from_nano())
+    first, second = (upstreams.body(q)["messages"][1] for q in upstreams.requests[:2])
+    assert "reasoning_content" in first and "reasoning_content" not in second
+    assert idle() == {"first": 0, "second": 0}
+
+
 # ── Smart routing ───────────────────────────────────────────────────────────
 
 def _smart(monkeypatch, **routing):

@@ -244,3 +244,77 @@ def test_a_mistyped_vendor_fails_the_load(load_config):
         load_config("providers:\n  - {name: a, base_url: 'http://a.invalid', vendor: opnrouter}\n")
     load_config("providers:\n  - {name: a, base_url: 'http://a.invalid', vendor: OpenRouter}\n")
     assert conf.PROVIDERS_BY_NAME["a"].vendor == "openrouter"
+
+
+# ── DeepSeek: reasoning has to come back under its own name ─────────────────
+
+def _tool_turn(**extra):
+    return {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function",
+            "function": {"name": "get_weather", "arguments": "{}"}}], **extra}
+
+
+def _chat(*messages):
+    return {"model": "deepseek-flash", "messages": list(messages), "stream": True}
+
+
+USER = {"role": "user", "content": "weather?"}
+TOOL = {"role": "tool", "tool_call_id": "c1", "content": "22C"}
+
+
+def test_a_tool_turn_from_nano_gets_its_reasoning_under_deepseeks_name():
+    """The case that killed opencode: nano wrote the turn, so it says `reasoning`."""
+    payload = _chat(USER, _tool_turn(reasoning="I should call the weather tool."), TOOL)
+    out = deepseek.adapt_request(payload)
+    assert out["messages"][1]["reasoning_content"] == "I should call the weather tool."
+    assert out["messages"][1]["reasoning"] == "I should call the weather tool.", "nothing is removed"
+
+
+def test_openrouters_structured_reasoning_is_carried_across_too():
+    turn = _tool_turn(reasoning_details=[{"type": "reasoning.text", "text": "Need weather. "},
+                                         {"type": "reasoning.text", "text": "Call the tool."}])
+    out = deepseek.adapt_request(_chat(USER, turn, TOOL))
+    assert out["messages"][1]["reasoning_content"] == "Need weather. Call the tool."
+
+
+def test_a_turn_that_carries_no_reasoning_at_all_still_gets_the_key():
+    """DeepSeek checks the key, not its content: an empty string is accepted."""
+    out = deepseek.adapt_request(_chat(USER, _tool_turn(), TOOL))
+    assert out["messages"][1]["reasoning_content"] == ""
+
+
+def test_a_turn_that_already_has_the_key_is_left_alone_even_when_it_is_empty():
+    payload = _chat(USER, _tool_turn(reasoning_content=""), TOOL)
+    assert deepseek.adapt_request(payload) is payload
+    payload = _chat(USER, _tool_turn(reasoning_content="kept", reasoning="other"), TOOL)
+    assert deepseek.adapt_request(payload) is payload
+
+
+def test_only_tool_call_assistant_turns_are_touched():
+    plain = {"role": "assistant", "content": "Hi!", "reasoning": "greeting"}
+    payload = _chat({"role": "user", "content": "hi"}, plain, USER, _tool_turn(reasoning="r"), TOOL)
+    out = deepseek.adapt_request(payload)
+    assert out["messages"][1] == plain, "plain answers are not checked by DeepSeek"
+    assert out["messages"][0] is payload["messages"][0] and out["messages"][4] is payload["messages"][4]
+    assert out["messages"][3]["reasoning_content"] == "r"
+
+
+def test_every_tool_turn_in_a_long_conversation_is_repaired():
+    payload = _chat(USER, _tool_turn(reasoning="one"), TOOL, _tool_turn(reasoning="two"), TOOL)
+    out = deepseek.adapt_request(payload)
+    assert [m.get("reasoning_content") for m in out["messages"] if m["role"] == "assistant"] == ["one", "two"]
+
+
+def test_the_shared_payload_is_never_mutated():
+    """It is also what the failover targets still to be tried will send."""
+    turn = _tool_turn(reasoning="r")
+    payload = _chat(USER, turn, TOOL)
+    out = deepseek.adapt_request(payload)
+    assert out is not payload and "reasoning_content" not in turn and "reasoning_content" not in payload["messages"][1]
+
+
+@pytest.mark.parametrize("payload", [
+    {"model": "m"}, {"model": "m", "messages": None}, {"model": "m", "messages": "text"},
+    {"model": "m", "messages": [None, 3, "x", {"role": "assistant"}, {"role": "assistant", "tool_calls": []}]},
+])
+def test_a_malformed_body_passes_through_untouched(payload):
+    assert deepseek.adapt_request(payload) is payload

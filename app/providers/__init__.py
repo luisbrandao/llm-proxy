@@ -8,6 +8,11 @@ functions, all taking the shared `httpx.AsyncClient` and the `Provider` they ser
     fetch_quota(client, provider)    -> Quota | None               subscription allowance left
     fetch_balance(client, provider)  -> Balance | None             money left
 
+A vendor module may also define `adapt_request(payload) -> payload`, applied by
+`proxy._build_body` to the request on its way to a backend of that vendor, for the
+differences between OpenAI-compatible APIs that break a conversation moved between them
+(see `deepseek`).
+
 A vendor omits a function it has no API for (DeepSeek publishes no rates), and the
 caller asks with `getattr`. The fetchers only talk and parse; what to do with the
 numbers lives in `app/rates.py`. The parsers are pure functions of a decoded JSON

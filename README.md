@@ -206,6 +206,17 @@ while the counter's `remaining` is above zero: nano's own `recommendedMode` verd
 it can veto but never grant. The allowance covers only some models: one outside the subscription bills the balance even while allowance remains, which is
 why the covered list is read too.
 
+### Moving a conversation between backends
+
+Smart routing and failover can move a conversation from one backend to another mid-way, and
+OpenAI-compatible APIs are not interchangeable about history. The known break: DeepSeek's own API
+rejects (`400 The reasoning_content in the thinking mode must be passed back`) a conversation
+whose earlier tool-call turns were written by nano or OpenRouter, because they name the model's
+reasoning `reasoning` and DeepSeek requires the key `reasoning_content` (its content is not
+checked). The proxy adds the key, carrying the reasoning text over, on the way to a DeepSeek
+backend only — the other backends still get your client's history untouched, and moving *to*
+nano or OpenRouter needs nothing. Details and the measurements: [`docs/providers/deepseek.md`](docs/providers/deepseek.md).
+
 ### Smart routing
 
 `priority` is a decision made once, in the config — usually "the cheap quota first".

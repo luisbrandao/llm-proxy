@@ -23,6 +23,26 @@ billed at the Flash price.
 `completion_tokens`, `completion_tokens_details.reasoning_tokens`. **No cost field**, so the
 proxy prices each request itself from the table above.
 
+## Thinking mode: reasoning must come back, under DeepSeek's name
+In thinking mode the reply carries the model's reasoning as `reasoning_content`, and a client sends
+it back on the assistant message that made tool calls. Measured against the live API on 2026-10-21:
+
+| history the client sends | result on DeepSeek direct |
+|---|---|
+| a tool-call turn DeepSeek wrote, with or without `reasoning_content` | 200 either way |
+| a tool-call turn **nano or OpenRouter wrote**, with their `reasoning` field only | **400** `The reasoning_content in the thinking mode must be passed back to the API` |
+| the same, with nothing at all | **400** |
+| the same, with `reasoning_content` set to the reasoning text | 200 |
+| the same, with `reasoning_content` set to an empty string | 200 |
+| a plain assistant answer (no tool call) without the field | 200 |
+
+So the key has to be present on tool-call assistant messages; its content is not checked. OpenRouter
+and NanoGPT call the same thing `reasoning` (OpenRouter also sends `reasoning_details`), and the other
+direction is harmless: both accept DeepSeek's history with or without `reasoning_content`.
+
+The proxy repairs this on the way to a DeepSeek backend (`app/providers/deepseek.py`,
+`adapt_request`), because smart routing and failover both move a conversation between backends.
+
 ## Balance: `GET /user/balance`, Bearer. *Verified*
 ```
 is_available                        true

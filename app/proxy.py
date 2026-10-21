@@ -26,6 +26,7 @@ from app.metrics import (
     TOKENS_INPUT_TOTAL,
     TOKENS_OUTPUT_TOTAL,
 )
+from app.providers import get_vendor
 from app.usage import Usage, format_cost
 from app.usage import parse as parse_usage
 
@@ -715,6 +716,13 @@ def _build_body(payload: dict, provider: Provider, model: str):
     """
     p = dict(payload)
     p["model"] = model
+    # Repairs this vendor's API needs on a conversation another backend started (see
+    # app/providers/). Per target: the shared payload is never touched, so a failover
+    # to a different vendor still gets the client's own history.
+    vendor = conf.vendor_of(provider)
+    adapt = getattr(get_vendor(vendor), "adapt_request", None) if vendor else None
+    if adapt is not None:
+        p = adapt(p)
     if "provider" not in p:
         routing = _routing_for(provider, model)
         if routing is not None:
