@@ -445,6 +445,16 @@ mark.hl { background: #f5c451; color: #15110a; border-radius: 2px; padding: 0 1p
 .ctablewrap { overflow-x: auto; }
 .cgrid .ctablewrap { max-height: 460px; overflow-y: auto; }
 .cgrid .ctable th { position: sticky; top: 0; z-index: 1; }
+/* Side by side, By model is as tall as By backend + Days beside it, and scrolls inside that.
+   `contain: size` stops its own (longer) table from setting the row height, so the right
+   column does, and the card stretches to match — no gap under it. Only where the two sit
+   in separate columns: stacked, the card has no neighbour to stretch to and would
+   collapse to nothing. */
+@media (min-width: 1101px) {
+  .cgrid { align-items: stretch; }
+  .cgrid > .ccard { display: flex; flex-direction: column; contain: size; margin-bottom: 0; }
+  .cgrid > .ccard .ctablewrap { flex: 1 1 0; min-height: 0; max-height: none; }
+}
 .ctable { width: 100%; border-collapse: collapse; font-size: 12px; }
 .ctable th {
   text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
