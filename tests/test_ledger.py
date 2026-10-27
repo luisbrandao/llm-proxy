@@ -224,7 +224,7 @@ async def test_priced_tokens_exclude_requests_that_carried_no_price():
 async def test_ollama_hosts_are_one_backend_in_the_views_but_not_in_the_rows():
     await add(provider="ollamaCitrine", model="local.glm", asked="local.glm")
     await add(provider="ollamaGW", model="local.glm", asked="local.glm")
-    await add(provider="ollamaLuis", model="local.glm", asked="local.glm")
+    await add(provider="ollamaFireopal", model="local.glm", asked="local.glm")
     await add(provider="nano", usage=Usage(prompt=1, completion=1, cost=0.5, currency="USD"))
 
     s = await ledger.summary()
@@ -234,7 +234,7 @@ async def test_ollama_hosts_are_one_backend_in_the_views_but_not_in_the_rows():
     local = next(m for m in s["by_model"] if m["model"] == "local.glm")
     assert [(p["provider"], p["requests"]) for p in local["providers"]] == [("ollama", 3)]
     # The request list keeps the real host, so which box answered is not lost.
-    assert {r["provider"] for r in s["requests"]} == {"ollamaCitrine", "ollamaGW", "ollamaLuis", "nano"}
+    assert {r["provider"] for r in s["requests"]} == {"ollamaCitrine", "ollamaGW", "ollamaFireopal", "nano"}
 
     # Filtering on the group takes every host in it; a real name stays exact.
     assert (await ledger.summary(provider="ollama"))["totals"]["requests"] == 3

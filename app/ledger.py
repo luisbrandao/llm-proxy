@@ -120,7 +120,7 @@ _AGG_COLUMNS = (
 
 
 # Backends that are one machine's worth of the same thing report under one name:
-# every `ollama*` provider (ollamaCitrine, ollamaGW, ollamaLuis) is "ollama" in the
+# every `ollama*` provider (ollamaCitrine, ollamaGW, ollamaFireopal) is "ollama" in the
 # backend views and filter, because "how much did the local boxes do" is the
 # question, not which of three identical hosts did it. Only the *views* group —
 # each ledger row keeps the real provider name, so the request list still says

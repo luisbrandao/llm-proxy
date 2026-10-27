@@ -232,9 +232,9 @@ async def test_only_successful_priced_requests_with_tokens_count():
 
 async def test_prices_are_per_real_provider_not_per_ollama_group():
     await _row(provider="ollamaGW", usage=Usage(prompt=1_000_000, cost=0.0, currency="USD"))
-    await _row(provider="ollamaLuis", usage=Usage(prompt=1_000_000, cost=0.0, currency="USD"))
+    await _row(provider="ollamaFireopal", usage=Usage(prompt=1_000_000, cost=0.0, currency="USD"))
     got = await ledger.observed_prices(7)
-    assert set(got) == {("m", "ollamaGW"), ("m", "ollamaLuis")}
+    assert set(got) == {("m", "ollamaGW"), ("m", "ollamaFireopal")}
 
 
 async def test_the_window_bounds_what_is_read():
