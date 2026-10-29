@@ -178,11 +178,31 @@ def test_the_verdict_can_still_veto_an_allowance_that_has_tokens_left():
     assert q.remaining > 0 and q.available is False
 
 
-def test_without_a_verdict_available_means_something_is_left():
+def test_without_a_verdict_available_means_enough_is_left():
     bare = {**NANO_USAGE, "routing": {}}
     assert nanogpt.parse_quota(bare).available is True
     bare["weeklyInputTokens"] = {"used": 60000000, "remaining": 0, "resetAt": 1792972800000}
     assert nanogpt.parse_quota(bare).available is False
+
+
+def test_a_counter_parked_just_under_the_limit_is_used_up():
+    """What NanoGPT returned on 2026-10-28 from 19:04 BRT on: a request that does not fit
+    is billed and not counted, so the counter stopped 821 tokens short of the limit, the
+    verdict still said `subscription`, and every request was billed. 821 tokens is no
+    allowance: no request is that small."""
+    parked = {**NANO_USAGE,
+              "weeklyInputTokens": {"used": 59999179, "remaining": 821, "resetAt": 1793577600000},
+              "routing": {"recommendedMode": "subscription", "reason": "included_quota_available"}}
+    q = nanogpt.parse_quota(parked)
+    assert q.remaining == 821 and q.available is False
+
+
+@pytest.mark.parametrize("remaining,available", [
+    (599_999, False), (600_000, True), (1_079_274, True),
+])
+def test_the_allowance_counts_as_left_from_one_percent_of_the_limit(remaining, available):
+    counter = {"used": 60_000_000 - remaining, "remaining": remaining, "resetAt": 1793577600000}
+    assert nanogpt.parse_quota({**NANO_USAGE, "weeklyInputTokens": counter}).available is available
 
 
 def test_the_tighter_of_the_daily_and_weekly_counters_rules():

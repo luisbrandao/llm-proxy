@@ -83,8 +83,9 @@ class RateCard:
 class Quota:
     """A subscription allowance, in the vendor's own unit (input tokens, for nano).
 
-    `available` is the vendor's verdict where it gives one — NanoGPT's
-    `recommendedMode` — and "something is left" where it does not. A quota that is
+    `available` means a request will actually be covered: enough left to fit one
+    (NanoGPT: at least `nanogpt.SPENT_BELOW` of the limit), and no veto from the
+    vendor's verdict where it gives one — NanoGPT's `recommendedMode`. A quota that is
     used up and does not allow overage is a backend that will refuse the request."""
     used: int
     limit: int

@@ -376,8 +376,11 @@ independent rules. If you add process-local state, add it to the reset list in
   numbers only. **Units are the trap**: every parser converts to USD per million tokens;
   OpenRouter prices per token and NanoGPT's `cacheReadInputPer1kTokens` is per thousand,
   whatever its `unit` field says — a slip is a silent 1000x. **A subscription counts as left
-  only while `remaining > 0`** — NanoGPT's `recommendedMode` verdict lags (it still said
-  `subscription` with 0 remaining while billing), so it may veto and never grant — and the
+  only while at least 1% of it remains** (`nanogpt.SPENT_BELOW`) — never "while `remaining > 0`":
+  a request that does not fit is billed and not counted, so the counter can park a few hundred
+  tokens under the limit for the rest of the week (2026-10-28, 821 left, every request billed).
+  NanoGPT's `recommendedMode` verdict lags too (it still said `subscription` with 0 remaining
+  while billing), so it may veto and never grant — and the
   accounts are re-read every 30 s past 95% used (`rates.next_delay`). **A subscription is free only for
   the models it covers**: `quota_state` consults the covered list, and a model outside it
   (kimi-k3 on NanoGPT) bills the balance even with allowance left. The operator's

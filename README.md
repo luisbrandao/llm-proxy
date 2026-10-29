@@ -201,7 +201,9 @@ can age the numbers but never empty them or fail a request. The Costs tab shows 
 backend's balance and allowance meter, and `GET /admin/accounts` returns the same.
 
 NanoGPT's allowance counts **input tokens only, cached input included**. It counts as left only
-while the counter's `remaining` is above zero: nano's own `recommendedMode` verdict keeps saying
+while at least 1% of it remains (600K of 60M, more than any single request): a request that does
+not fit is billed and not counted, so the counter can stop a few hundred tokens short of the limit
+and stay there until the reset. Nano's own `recommendedMode` verdict keeps saying
 `subscription` for a while after the allowance is gone and requests are already being billed, so
 it can veto but never grant. The allowance covers only some models: one outside the subscription bills the balance even while allowance remains, which is
 why the covered list is read too.

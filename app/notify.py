@@ -98,7 +98,7 @@ def _conditions() -> Dict[Tuple[str, str], Notice]:
                     f"{name}: balance is low",
                     f"{name} has {amount} left, under the {_money(conf.NOTIFY.threshold(name), b['currency'])} warning level.",
                     "default", ("warning", "moneybag"))
-        if q is not None and (not q["available"]) and q["remaining"] <= 0:
+        if q is not None and not q["available"]:
             billing = (f"requests now bill the balance"
                        + (f" ({_money(b['amount'], b['currency'])} left)" if b else "")
                        + " at list prices") if q["allow_overage"] else "requests are refused until it resets"

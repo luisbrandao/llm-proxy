@@ -49,6 +49,12 @@ def parse_included(payload) -> Set[str]:
     return {m["id"] for m in (payload or {}).get("data") or [] if isinstance(m, dict) and m.get("id")}
 
 
+# Allowance under this fraction of the limit counts as used up: less than any request
+# we send (1% of 60M is 600K tokens; the largest request in two weeks was 274K), so a
+# counter parked just under the limit reads as spent, at a cost of at most 1% of a week.
+SPENT_BELOW = 0.01
+
+
 def parse_quota(payload) -> Optional[Quota]:
     """The tightest of the weekly and daily input-token counters, or None when there is
     no active subscription or no counter is reported."""
@@ -80,7 +86,10 @@ def parse_quota(payload) -> Optional[Quota]:
     # verdict is advisory and lags: on 2026-10-21 NanoGPT reported used 60001719 of
     # 60000000, remaining 0, and still said `subscription` / `included_quota_available`
     # while it was already billing every request. Trusting it priced a dead quota as free.
-    available = remaining > 0 and mode not in ("paygo", "unavailable")
+    # And "something left" is not enough: a request that does not fit is billed and not
+    # counted, so the counter can stop short of the limit for good — on 2026-10-28 it sat
+    # at 821 remaining for the rest of the week while every 70K-token request was billed.
+    available = remaining >= limit * SPENT_BELOW and mode not in ("paygo", "unavailable")
     return Quota(
         used=used, limit=limit, remaining=int(remaining), reset_at=reset_at,
         allow_overage=bool(payload.get("allowOverage")), available=available, mode=mode,

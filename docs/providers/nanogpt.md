@@ -57,8 +57,13 @@ routing.billingMode               both
 - **Do not trust `routing.recommendedMode` as proof of allowance.** On 2026-10-21 at 14:16 BRT the
   response read `used 60001719`, `remaining 0`, and still `recommendedMode: subscription`,
   `reason: included_quota_available`, while requests were already being billed (the first billed
-  request was at 17:12:50 UTC). The counter is right; the verdict lags. The proxy treats
-  allowance as left only when `remaining > 0`, and uses the verdict only to veto.
+  request was at 17:12:50 UTC). The counter is right; the verdict lags. The proxy uses the verdict only to veto.
+- **The counter does not always reach the limit.** A request that does not fit in what is left is
+  billed and not counted, so the counter can park just under the limit until the reset: on
+  2026-10-28 from 19:04 BRT it read `used 59999179`, `remaining 821`, verdict `subscription`,
+  while every ~70K-token request was billed. The proxy therefore treats the allowance as spent
+  once less than 1% of the limit is left (`nanogpt.SPENT_BELOW`; 600K tokens, above the largest
+  request seen).
 - A management-scoped variant exists at `https://nano-gpt.com/api/management/v1/subscription/usage`
   with a separate token (`usage:read`); it is not needed for reading quota with the inference key.
 

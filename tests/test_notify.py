@@ -189,6 +189,17 @@ async def test_a_subscription_used_up_is_announced_with_what_happens_next(ntfy):
     assert "bill the balance" in body and "$15.99" in body and "Mon 26 Oct 00:00 BRT" not in body and "BRT" in body
 
 
+async def test_a_counter_parked_under_the_limit_is_announced_as_used_up(ntfy):
+    """The counter can stop short of the limit for good (2026-10-28: 821 left); what makes
+    the allowance spent is `available`, not a remaining of zero."""
+    balance("nano", 15.75)
+    rates._quotas["nano"] = quota()
+    await notify.run_once(0.0)
+    rates._quotas["nano"] = quota(used=59999179, limit=60000000, remaining=821, available=False)
+    assert await notify.run_once(60.0) == 1
+    assert ntfy.titles() == ["nano: subscription allowance used up"]
+
+
 async def test_without_overage_a_spent_subscription_says_requests_are_refused(ntfy):
     balance("nano", 15.99)
     rates._quotas["nano"] = quota()
