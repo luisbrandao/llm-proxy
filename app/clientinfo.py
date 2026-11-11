@@ -77,6 +77,11 @@ def cached_host(ip: str) -> Optional[str]:
     return None
 
 
+def user_agent(request: Request) -> Optional[str]:
+    """The caller's User-Agent, or None when it sent none (or a blank one)."""
+    return (request.headers.get("user-agent") or "").strip() or None
+
+
 def service_from_ua(ua: Optional[str]) -> Optional[str]:
     """Short service token from the User-Agent's leading product, e.g.
     'OpenWebUI/0.5 (extra)' -> 'OpenWebUI'. Heuristic, best-effort."""

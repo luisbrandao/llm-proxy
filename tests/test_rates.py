@@ -4,7 +4,6 @@ failing can age the data but never empty it or reach a request.
 Upstream is an `httpx.MockTransport` on the shared account client, answering with
 payloads shaped like the live ones (fixtures in test_providers.py).
 """
-import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -80,7 +79,6 @@ def vendors(load_config, monkeypatch):
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     monkeypatch.setattr(upstream, "account_client", lambda: client)
-    monkeypatch.setattr(rates, "_warned", {})
 
     class Harness:
         pass

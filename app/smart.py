@@ -65,6 +65,7 @@ from typing import Dict, List, Optional, Tuple
 
 from app import config as conf
 from app import ledger, rates
+from app.throttle import Throttle
 
 logger = logging.getLogger("llm-proxy")
 
@@ -83,7 +84,8 @@ _prices: Dict[Tuple[str, str], Tuple[float, int]] = {}
 # (asked model, provider) -> (cache share, output share, requests). Observed.
 _shares: Dict[Tuple[str, str], Tuple[float, float, int]] = {}
 _refreshed_at: Optional[float] = None
-_warned_at: Optional[float] = None
+# A ledger that cannot be read is logged once per five minutes, not once per refresh.
+_warn_gate = Throttle(300.0)
 
 _INF = float("inf")
 
@@ -216,16 +218,14 @@ async def refresh() -> None:
     """Re-read the ledger snapshots. Never raises: on a failure the previous snapshot
     stands, so a broken ledger can only make routing fall back to rates alone or to the
     configured order, never fail a request."""
-    global _prices, _shares, _refreshed_at, _warned_at
+    global _prices, _shares, _refreshed_at
     try:
         prices = await ledger.observed_prices(conf.ROUTING.smart_window_days)
         shares = await ledger.observed_shares(SHARES_DAYS)
     except asyncio.CancelledError:
         raise
     except Exception as e:  # noqa: BLE001 - a broken ledger must not break routing
-        now = time.monotonic()
-        if _warned_at is None or now - _warned_at >= 300:
-            _warned_at = now
+        if _warn_gate.ready():
             logger.warning("Smart routing: could not read the ledger (%s: %s) — "
                            "keeping the last snapshot", type(e).__name__, e)
         return

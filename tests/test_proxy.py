@@ -20,7 +20,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import config as conf
-from app import clientinfo, registry, slots, upstream
+from app import clientinfo, registry, router, slots, upstream
 
 
 def mock_response(status=200, *, json=None, content=None, headers=None):
@@ -147,6 +147,17 @@ def events(caplog):
 
 def idle():
     return {name: slots.in_use(name) for name in ("first", "second")}
+
+
+def counter(client, name, **labels):
+    """One series' current value, read from /metrics (0 before it first counts).
+
+    The counters are process-global and never reset between tests, so a test
+    reads the value before and after and asserts on the difference.
+    """
+    series = name + "{" + ",".join(f'{k}="{v}"' for k, v in sorted(labels.items())) + "}"
+    match = re.search(re.escape(series) + r" (\S+)", client.get("/metrics").text)
+    return float(match.group(1)) if match else 0.0
 
 
 # ── Context guardrail ───────────────────────────────────────────────────────
@@ -739,6 +750,70 @@ def test_timeout_maps_to_504(client, upstreams):
     assert r.json()["error"]["type"] == "upstream_timeout"
 
 
+def test_an_unreachable_only_backend_is_an_error_not_a_failover(client, upstreams):
+    """Nothing was failed over to, so the 502 the client got is counted as one."""
+    def handler(request):
+        raise httpx.ConnectError("down", request=request)
+
+    def counts():
+        return (
+            counter(client, "llm_proxy_errors_total", provider="first",
+                    model="vendor/First-Native", status_code="502"),
+            counter(client, "llm_proxy_failovers_total", provider="first"),
+        )
+
+    upstreams.set(handler)
+    errors, failovers = counts()
+    r = client.post("/v1/chat/completions", json={"model": "first:grouped"})
+    assert r.status_code == 502
+    assert counts() == (errors + 1, failovers)
+    # Still marked down, so a model it shares with others skips it next time.
+    assert registry.is_down("first") is True
+    assert idle() == {"first": 0, "second": 0}
+
+
+def test_when_every_backend_is_unreachable_the_last_one_is_the_error(client, upstreams):
+    """`first` failed over to `second`; `second` had nowhere to go."""
+    def handler(request):
+        raise httpx.ConnectError("down", request=request)
+
+    def counts():
+        return (
+            counter(client, "llm_proxy_failovers_total", provider="first"),
+            counter(client, "llm_proxy_failovers_total", provider="second"),
+            counter(client, "llm_proxy_errors_total", provider="second",
+                    model="vendor/Second-Native", status_code="502"),
+        )
+
+    upstreams.set(handler)
+    first, second, errors = counts()
+    r = client.post("/v1/chat/completions", json={"model": "grouped"})
+    assert r.status_code == 502
+    assert counts() == (first + 1, second, errors + 1)
+
+
+def test_a_provider_removed_while_the_request_waited_is_a_clean_502(client, upstreams, monkeypatch):
+    """The console can delete a backend a request is queued for. With no target
+    left there is no provider to name, and that used to be a 500."""
+    async def resolve(model):
+        return [conf.Target("removed", "m", 1)]
+
+    monkeypatch.setattr(router, "resolve", resolve)
+    r = client.post("/v1/chat/completions", json={"model": "grouped"})
+    assert r.status_code == 502
+    assert r.json()["error"]["type"] == "upstream_unavailable"
+    assert upstreams.requests == []
+    assert slots.in_use("removed") == 0
+
+
+def test_no_providers_at_all_is_an_openai_shaped_503(client, load_config):
+    load_config("providers: []\n")
+    for body in ({"model": "grouped"}, {"input": "no model"}):
+        r = client.post("/v1/chat/completions", json=body)
+        assert r.status_code == 503
+        assert r.json()["error"]["type"] == "no_providers"
+
+
 # ── Streaming ───────────────────────────────────────────────────────────────
 
 SSE = (
@@ -747,6 +822,22 @@ SSE = (
     b'data: {"model":"m","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}\n\n'
     b"data: [DONE]\n\n"
 )
+
+
+class _Chunks(httpx.AsyncByteStream):
+    def __init__(self, parts):
+        self.parts = parts
+
+    async def __aiter__(self):
+        for part in self.parts:
+            yield part
+
+
+def sse_in_chunks(*parts):
+    """A stream that arrives as these network chunks, one read each."""
+    return httpx.Response(
+        200, stream=_Chunks(parts), headers={"content-type": "text/event-stream"}
+    )
 
 
 def test_stream_releases_its_slot_when_the_body_finishes(client, upstreams):
@@ -795,6 +886,52 @@ def test_stream_history_row_tokens_per_second_is_the_logged_number(client, upstr
     assert row["tps"] == logged > 0
 
 
+def test_an_event_the_proxy_cannot_read_does_not_cut_the_stream(client, upstreams, events):
+    """The proxy only reads the events to count tokens. One it cannot make sense
+    of used to end the client's stream, with everything after it lost."""
+    parts = (
+        b'data: {"model":"m","choices":[{"delta":{"content":"He"}}]}\n\n',
+        b'data: [1, 2]\n\n',
+        b'data: "keep-alive"\n\n',
+        b'data: {"model":"m","choices":[null]}\n\n',
+        b'data: {"model":"m","choices":"nonsense"}\n\n',
+        # One event split across two reads.
+        b'data: {"model":"m","choices":[{"delta":',
+        b'{"content":"llo"}}]}\n\n',
+        b'data: {"model":"m","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}\n\n',
+        b"data: [DONE]\n\n",
+    )
+    upstreams.set(lambda r: sse_in_chunks(*parts))
+    errors = counter(client, "llm_proxy_errors_total", provider="first",
+                     model="vendor/First-Native", status_code="200")
+    r = client.post("/v1/chat/completions", json={"model": "grouped", "stream": True})
+    assert r.status_code == 200
+    assert r.content == b"".join(parts)
+    # It kept reading past the odd events: the usage that followed was counted.
+    line = next(l for l in events() if "event=request" in l)
+    assert "in=5" in line and "out=2" in line
+    assert counter(client, "llm_proxy_errors_total", provider="first",
+                   model="vendor/First-Native", status_code="200") == errors
+    assert idle() == {"first": 0, "second": 0}
+
+
+def test_stream_content_sent_as_parts_is_read_as_text(client, upstreams):
+    """A few backends stream `content` as a list of parts instead of a string."""
+    parts = (
+        b'data: {"choices":[{"delta":{"content":[{"type":"text","text":"He"}]}}]}\n\n',
+        b'data: {"choices":[{"delta":{"content":[{"type":"text","text":"llo"},{"type":"other"}]}}]}\n\n',
+        b"data: [DONE]\n\n",
+    )
+    upstreams.set(lambda r: sse_in_chunks(*parts))
+    r = client.post("/v1/chat/completions", json={"model": "grouped", "stream": True})
+    assert r.content == b"".join(parts)
+    row = client.get("/admin/inflight").json()["requests"][0]
+    # No usage came, so the two deltas are the estimate.
+    assert row["out_tokens"] == 2 and row["estimated"] is True
+    body = client.get(f"/admin/inflight/{row['id']}/body").json()
+    assert body["response"] == "Hello"
+
+
 def test_stream_error_before_first_byte_fails_over(client, upstreams):
     """Failover is impossible mid-stream, so the pre-flight has to catch it."""
     def handler(request):
@@ -806,6 +943,43 @@ def test_stream_error_before_first_byte_fails_over(client, upstreams):
     r = client.post("/v1/chat/completions", json={"model": "grouped", "stream": True})
     assert r.status_code == 200
     assert [upstreams.host(x) for x in upstreams.requests] == ["first.invalid", "second.invalid"]
+    assert idle() == {"first": 0, "second": 0}
+
+
+def test_a_slot_is_released_once_when_an_error_body_breaks_off(client, upstreams, monkeypatch):
+    """The stream handler gives the slot back when it finishes with an error
+    response, and the dispatcher gives it back when the attempt raises. A read
+    that fails halfway through the error body is both, and releasing twice would
+    free a slot another request holds."""
+    class Broken(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"error": '
+            raise httpx.ReadError("connection dropped")
+
+    released = []
+    real_release = slots.release
+
+    async def counting_release(provider, model=None):
+        released.append(provider)
+        await real_release(provider, model)
+
+    monkeypatch.setattr(slots, "release", counting_release)
+    upstreams.set(lambda r: httpx.Response(503, stream=Broken()))
+    r = client.post("/v1/chat/completions", json={"model": "first:grouped", "stream": True})
+    assert r.status_code == 502
+    assert released == ["first"]
+    assert idle() == {"first": 0, "second": 0}
+
+
+def test_a_slot_is_released_when_forwarding_fails_in_an_unexpected_way(client, upstreams):
+    """Not a connection error and not a cancellation: a bug. It surfaces as a
+    500, and it must not also cost the backend a slot until the next restart."""
+    def handler(request):
+        raise RuntimeError("not an httpx error")
+
+    upstreams.set(handler)
+    with pytest.raises(RuntimeError):
+        client.post("/v1/chat/completions", json={"model": "grouped"})
     assert idle() == {"first": 0, "second": 0}
 
 

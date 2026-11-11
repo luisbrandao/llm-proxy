@@ -36,11 +36,11 @@ import asyncio
 import logging
 import sqlite3
 import threading
-import time
 from datetime import date, datetime, timedelta
 from typing import Optional
 
 from app import config as conf
+from app.throttle import Throttle
 from app.usage import Usage
 
 logger = logging.getLogger("llm-proxy")
@@ -50,13 +50,10 @@ _conn: Optional[sqlite3.Connection] = None
 _path: Optional[str] = None
 # The local day the last retention prune ran for; a write on a new day re-prunes.
 _pruned_for: Optional[str] = None
-# When a write failure was last logged (monotonic), None until the first — one
-# warning per WARN_EVERY seconds, not one per request, when the disk is full or
-# the file unwritable. None rather than 0.0 on purpose: monotonic time counts
-# from boot, so on a freshly started host a 0.0 baseline would swallow every
-# failure in the first five minutes — which is exactly when a bad mount shows up.
-_warned_at: Optional[float] = None
+# A write failure is logged once per WARN_EVERY seconds, not once per request,
+# when the disk is full or the file unwritable.
 WARN_EVERY = 300.0
+_warn_gate = Throttle(WARN_EVERY)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS requests (
@@ -144,6 +141,12 @@ def local_day(now: Optional[datetime] = None) -> str:
     return (now or datetime.now().astimezone()).date().isoformat()
 
 
+def _window_start(days: int, today: Optional[str] = None) -> str:
+    """The first local date of the `days`-day window that ends today."""
+    end = date.fromisoformat(today or local_day())
+    return (end - timedelta(days=max(1, days) - 1)).isoformat()
+
+
 def _connect() -> Optional[sqlite3.Connection]:
     """The shared connection, opened on first use (and re-opened if LEDGER_PATH
     changed, which only tests do). None when the ledger is disabled. Caller
@@ -207,7 +210,6 @@ async def record(
     """Append one finished request. Never raises: the response is already on its
     way, and a ledger that cannot be written is a warning, not a failed request.
     `when` is the completion time, now by default (tests place rows on other days)."""
-    global _warned_at
     if not conf.LEDGER_PATH:
         return
     now = when or datetime.now().astimezone()
@@ -225,9 +227,7 @@ async def record(
     except asyncio.CancelledError:
         raise
     except Exception as e:  # noqa: BLE001 - a broken ledger must not break requests
-        now_mono = time.monotonic()
-        if _warned_at is None or now_mono - _warned_at >= WARN_EVERY:
-            _warned_at = now_mono
+        if _warn_gate.ready():
             logger.warning(
                 "Cost ledger write failed (%s): %s: %s — requests are not being recorded",
                 conf.LEDGER_PATH, type(e).__name__, e,
@@ -262,17 +262,19 @@ def _summary(days: int, day: Optional[str], model: Optional[str],
             # replaces the "last N days" one. Either end may be left open.
             until = until or today
         elif days > 0:
-            since = (date.fromisoformat(today) - timedelta(days=days - 1)).isoformat()
+            since = _window_start(days, today)
             until = today
         else:
             until = today
 
-        # The window every view shares: the range plus the model/provider filters.
-        scope, params = [], []
+        # The date range alone: what the filter options below are listed over.
+        ranged, rparams = [], []
         if since:
-            scope.append("day >= ?"); params.append(since)
+            ranged.append("day >= ?"); rparams.append(since)
         if until:
-            scope.append("day <= ?"); params.append(until)
+            ranged.append("day <= ?"); rparams.append(until)
+        # The window every view shares: the range plus the model/provider filters.
+        scope, params = list(ranged), list(rparams)
         if model:
             scope.append("asked = ?"); params.append(model)
         if provider:
@@ -325,16 +327,11 @@ def _summary(days: int, day: Optional[str], model: Optional[str],
             requests.append(item)
 
         # Filter options: everything in the range, regardless of the current filter.
-        range_only, rparams = [], []
-        if since:
-            range_only.append("day >= ?"); rparams.append(since)
-        if until:
-            range_only.append("day <= ?"); rparams.append(until)
         models = [r[0] for r in conn.execute(
-            f"SELECT DISTINCT asked FROM requests{_where(range_only)} ORDER BY asked", rparams
+            f"SELECT DISTINCT asked FROM requests{_where(ranged)} ORDER BY asked", rparams
         )]
         providers = [r[0] for r in conn.execute(
-            f"SELECT DISTINCT {_BACKEND_SQL} AS backend FROM requests{_where(range_only)} ORDER BY backend", rparams
+            f"SELECT DISTINCT {_BACKEND_SQL} AS backend FROM requests{_where(ranged)} ORDER BY backend", rparams
         )]
         currencies = [r[0] for r in conn.execute(
             f"SELECT DISTINCT currency FROM requests{_where(focus + ['cost IS NOT NULL'])} "
@@ -380,13 +377,12 @@ def _observed_prices(days: int) -> dict:
         conn = _connect()
         if conn is None:
             return {}
-        since = (date.fromisoformat(local_day()) - timedelta(days=max(1, days) - 1)).isoformat()
         rows = conn.execute(
             "SELECT asked, provider, SUM(cost), "
             "SUM(prompt_tokens + completion_tokens), COUNT(*) FROM requests "
             "WHERE day >= ? AND cost IS NOT NULL AND status < 400 "
             "AND prompt_tokens + completion_tokens > 0 GROUP BY asked, provider",
-            (since,),
+            (_window_start(days),),
         ).fetchall()
     return {
         (asked, provider): (cost / tokens * 1e6, int(n))
@@ -412,13 +408,12 @@ def _observed_shares(days: int) -> dict:
         conn = _connect()
         if conn is None:
             return {}
-        since = (date.fromisoformat(local_day()) - timedelta(days=max(1, days) - 1)).isoformat()
         rows = conn.execute(
             "SELECT asked, provider, SUM(prompt_tokens), SUM(cached_tokens), "
             "SUM(completion_tokens), COUNT(*) FROM requests "
             "WHERE day >= ? AND status < 400 AND prompt_tokens + completion_tokens > 0 "
             "GROUP BY asked, provider",
-            (since,),
+            (_window_start(days),),
         ).fetchall()
     out = {}
     for asked, provider, prompt, cached, completion, n in rows:

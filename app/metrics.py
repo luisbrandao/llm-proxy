@@ -42,14 +42,15 @@ TOKENS_CACHED_TOTAL = Counter(
     ["provider", "model"],
 )
 
-# What the backends themselves say they charged (`usage.cost`, OpenRouter and
-# NanoGPT), summed in USD. A backend that reports no price adds nothing — so this
-# is a floor on spend, not the bill. The durable per-request record is the cost
+# What each request cost, summed in USD: the backend's own `usage.cost`
+# (OpenRouter and NanoGPT), or the estimate from the provider's `pricing:` table
+# when it reports none. An unpriced request adds nothing — so this is a floor on
+# spend, not the bill. The durable per-request record is the cost
 # ledger (app/ledger.py); this counter resets on restart like every other.
 COST_TOTAL = Counter(
     "llm_proxy_cost_total",
-    "Cumulative cost in USD as reported by the backend in usage.cost; "
-    "backends that report no price contribute nothing",
+    "Cumulative cost in USD: what the backend reported in usage.cost, or the "
+    "estimate from the provider's pricing table; unpriced requests contribute nothing",
     ["provider", "model"],
 )
 
@@ -62,7 +63,8 @@ REQUEST_DURATION = Histogram(
 
 ERRORS_TOTAL = Counter(
     "llm_proxy_errors_total",
-    "Total errors",
+    "Upstream error responses by status, plus requests whose last backend "
+    "could not be reached (502/504)",
     ["provider", "model", "status_code"],
 )
 

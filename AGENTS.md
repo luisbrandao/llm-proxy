@@ -42,8 +42,10 @@ CONFIG_PATH=config.yaml uvicorn app.main:app --port 8000
 
 | File | Responsibility |
 |---|---|
-| `app/main.py` | ASGI entry. Logging setup (everything to stdout, uvicorn's loggers re-pointed), the lifespan (ledger open and close, the config watcher, the `smart` / `rates` / `notify` background tasks, pool shutdown), the public routes (`/health`, `/metrics`, `/logging`, `/v1/models`), the `/admin/*` API on the `admin` router, the `/ui` static mount, and the catch-all that calls `proxy.proxy_request`. `_provider_view`, `_serialize_targets` and `_config_snapshot` are the only serializers the admin views use. |
-| `app/proxy.py` | The request lifecycle: `proxy_request` (parse, open the in-flight entry) → `_route` (resolve, gate, filter, order, trim) → `_dispatch` (acquire a slot, `_build_body`, forward, fail over) → `_handle_non_stream` / `_handle_stream`. Also `_emit_request_log` (the `event=request` line and the ledger row), `_apply_pricing`, `_record_metrics`, `_error` (the one OpenAI-shaped error envelope), `_decompress`, `_relay_headers`. |
+| `app/main.py` | ASGI entry. Logging setup (everything to stdout, uvicorn's loggers re-pointed), the lifespan (ledger open and close, the config watcher, the `smart` / `rates` / `notify` background tasks, pool shutdown), the public routes (`/health`, `/metrics`, `/logging`, `/v1/models`), the mount of the admin router, the `/ui` static mount, and the catch-all that calls `proxy.proxy_request`. |
+| `app/admin.py` | The `/admin/*` API behind the console, all of it on `router`, which carries the auth gate. `_provider_view`, `_serialize_targets` and `_config_snapshot` are the only serializers the views use. A config edit ends in `_persisted`; `_bad` (422) and `_not_found` (404) are the error replies. |
+| `app/hotreload.py` | What follows a config change in the running process: `apply` (reload, drop the discovery cache, wake slot waiters), `after_console_edit` (called by `admin._persisted`), `watch` (the polling loop the lifespan starts). |
+| `app/proxy.py` | The request lifecycle: `proxy_request` (parse, open the in-flight entry) → `_route` (resolve, gate, filter, order, trim) or `_passthrough` → `_dispatch` (acquire a slot, `_build_body`, forward, fail over) → `_handle_non_stream` / `_handle_stream`. A response read whole ends in `_buffered_response`; a stream is relayed by `_relay_stream`, with `_StreamTally` reading usage and text off the SSE events. Also `_emit_request_log` (the `event=request` line and the ledger row), `_apply_pricing`, `_record_metrics`, `_error` (the one OpenAI-shaped error envelope), `_decompress`, `_relay_headers`. |
 | `app/router.py` | `resolve(model) -> [Target]`: alias → `provider:model` → `models:` logical model → auto-group. `_allow_listed` runs only with `auto_group: false`. Returns `[]` when nothing serves the model. |
 | `app/registry.py` | Live model discovery per backend (cached for `cache_ttl`, single-flight, last good catalog kept for `STALE_GRACE`), backend health (`mark_down` / `is_down` / `clear_down`), and `list_models` for `/v1/models`. |
 | `app/slots.py` | Per-backend concurrency: `acquire(targets, timeout, on_skip)`, `release(provider, model)`, `poke()`. Priority admission with round-robin inside a tie tier, then an explicit queue of `_Waiter` futures reordered by model affinity. `in_use` / `resident_model` / `queue_depth` for introspection. |
@@ -57,10 +59,11 @@ CONFIG_PATH=config.yaml uvicorn app.main:app --port 8000
 | `app/ledger.py` | The cost ledger: one SQLite row per completed request. `record(...)` (never raises), `summary(...)` for `/admin/costs`, `observed_prices` / `observed_shares` for `smart.refresh`, `startup()` / `close()`. |
 | `app/inflight.py` | The request feed behind the In-flight tab: `begin()`, `Entry.wait / run / record / finish / cancel`, a bounded history ring, a separately bounded body store, `snapshot()`. |
 | `app/configwrite.py` | Console edits persisted to `CONFIG_PATH` through a ruamel round-trip: `persist_model_priorities`, `set_enabled_models`, `set_model_map`, `set_aliases`, `set_logical_model`, `delete_logical_model`, `set_smart`. Each returns `(ok, reason)`. Also `config_writable()` and `config_detached()`. |
-| `app/config.py` | Loads `config.yaml` and the environment into dataclasses (`Provider`, `Target`, `LogicalModel`, `Routing`, `Trim`, `Notify`, `Pricing` / `Rate` / `Peak`). Globals `PROVIDERS`, `PROVIDERS_BY_NAME`, `ALIASES`, `LOGICAL_MODELS`, `ROUTING`, `AUTH_KEYS`, `TRIM`, `NOTIFY`, rebound by `reload_if_changed()`. Helpers `native_for`, `vendor_of`, `strip_prefix`. |
+| `app/config.py` | Loads `config.yaml` and the environment into dataclasses (`Provider`, `Target`, `LogicalModel`, `Routing`, `Trim`, `Notify`, `Pricing` / `Rate` / `Peak`). `_load` parses a file into a `_Loaded`, one `_load_<section>` function per section, and `_install` rebinds the globals `PROVIDERS`, `PROVIDERS_BY_NAME`, `ALIASES`, `LOGICAL_MODELS`, `ROUTING`, `AUTH_KEYS`, `TRIM`, `NOTIFY`, at boot and from `reload_if_changed()`. A default lives on its dataclass and nowhere else. Helpers `native_for`, `vendor_of`, `strip_prefix`. |
 | `app/auth.py` | `is_authorized(request)` (a bearer key in `AUTH_KEYS`; no keys configured means the gate is off) and `restricted(provider)`. |
 | `app/upstream.py` | The three shared `httpx.AsyncClient`s and their timeouts: `forward_client` (600 s read, 5 s connect), `probe_client` (5 s, 3 s connect), `account_client` (30 s, 5 s connect). |
-| `app/clientinfo.py` | Who called, for the log: `client_ip`, `client_host` (cached reverse DNS, off the loop, time-bounded), `service_from_ua`. |
+| `app/clientinfo.py` | Who called, for the log: `client_ip`, `client_host` (cached reverse DNS, off the loop, time-bounded), `user_agent`, `service_from_ua`. |
+| `app/throttle.py` | `Throttle(every).ready(key)`: true at most once per interval. Behind every "warn, but not on every failure" line (`ledger`, `rates`, `notify`, `smart`). |
 | `app/metrics.py` | The Prometheus series, all prefixed `llm_proxy_`. |
 | `app/logbuffer.py` | Ring buffer of the last 2000 log lines, sequence-stamped, for `/admin/logs`. |
 | `app/version.py` | Build identity from `APP_VERSION` / `APP_REVISION`; `dev` outside a CI image. Never hot-reloaded. |
@@ -81,7 +84,8 @@ Outside `app/`:
 
 ## Request lifecycle
 
-Any path that is not a route declared in `main.py` reaches `proxy.proxy_request`.
+Any path that is not a route declared in `main.py` or `admin.py` reaches
+`proxy.proxy_request`.
 
 1. **Parse** the body once and read `model` and `stream`. Open the in-flight entry
    (`inflight.begin`).
@@ -104,44 +108,46 @@ Any path that is not a route declared in `main.py` reaches `proxy.proxy_request`
 8. **Dispatch** (`_dispatch`), looping over the candidates that remain:
    `slots.acquire` → `_build_body` (native model id, the vendor's `adapt_request`,
    `provider_routing`, `stream_options.include_usage`, `strip_fields`) → handler.
-   It fails over on an `httpx.RequestError`, or on a response whose status is in
-   `routing.failover_statuses` while another target remains: release the slot,
-   `mark_down`, drop that provider, loop. A 402 also calls `notify.payment_required`.
-   When the candidates run out, connection failures become `_backend_error` (502, or 504
-   for a timeout) and an upstream error is relayed verbatim with its real status and
-   body. `clear_down` runs only on a status below 400.
-9. **After the response is delivered** (a background task, or the stream generator's
+   While another target remains, it fails over on an `httpx.RequestError` or on a
+   response whose status is in `routing.failover_statuses`: release the slot, then
+   `_fail_over` (`mark_down`, count, log), drop that provider, loop. A 402 also calls
+   `notify.payment_required`. The last target's failure is the client's answer: a
+   connection failure becomes `_backend_error` (502, or 504 for a timeout) and an
+   upstream error is relayed verbatim with its real status and body. `clear_down`
+   runs only on a status below 400.
+9. **After the response is delivered** (a background task, or `_relay_stream`'s
    `finally`): the handler's single `usage.parse` result, priced by `_apply_pricing` when
    the backend reported no cost, feeds `_record_metrics`, `Entry.record` and
    `_emit_request_log`, which writes the `event=request` line and the ledger row. Only the
    attempt that answered the client reaches this step, so a request is one line and one
    row however many backends it tried.
 
-Errors the proxy generates itself go through `proxy._error`: 401 `unauthorized`,
+Errors the proxy generates itself all go through `proxy._error`: 401 `unauthorized`,
 404 `model_not_found`, 502 `upstream_unavailable`, 504 `upstream_timeout`,
-503 `slot_timeout`, 503 `cancelled`. The one exception is a plain-text 503 when no
-providers are configured at all.
+503 `slot_timeout`, 503 `cancelled`, 503 `no_providers`.
 
 ## Layering
 
 Imports only point downward, so there are no cycles.
 
 ```
-main                               routes, the /admin router, the lifespan
+main                               logging, the lifespan, public routes, the mounts
+ ├─ admin                          the /admin API
+ │   └─ configwrite · logbuffer · hotreload → registry, slots
  └─ proxy                          request lifecycle, failover
      ├─ router → registry          name → targets; discovery and health
      ├─ smart → ledger, rates      ordering, from the snapshots
      ├─ notify → rates             warnings
      ├─ rates → providers/         vendor account reads
      └─ slots · inflight · trim · claude_cli · auth · clientinfo · ledger
- main also uses: configwrite · logbuffer
- leaves: config · upstream · usage · metrics · version
+ admin also reads: inflight · ledger · rates · registry · slots · smart
+ leaves: config · upstream · usage · metrics · version · throttle
 ```
 
 `config.py` is the one module everything depends on, and it is read **per operation**
 (`conf.X`), never snapshotted at import. That is the whole mechanism behind hot reload:
-`reload_if_changed()` rebinds the module globals with no `await` between the rebinds, so
-a request sees either the old config or the new one and never a mix.
+`reload_if_changed()` rebinds the module globals (`_install`) with no `await` between
+the rebinds, so a request sees either the old config or the new one and never a mix.
 
 ## Where state lives
 
@@ -152,7 +158,7 @@ load-bearing and why a restart is a real reset.
 | Tier | What | Why |
 |---|---|---|
 | **Dropped on every config reload** | `registry._cache`, `registry._last_good` | A changed `base_url` points somewhere else, so a catalog from the previous endpoint is worse than none. |
-| **Survives a reload, lost on restart** | `slots._in_use` / `_running` / `_last_model` / `_waiters` / `_rr`, `registry._down_until`, `inflight._active` / `_recent` / `_bodies`, `logbuffer`, `smart._prices` / `_shares`, `rates._cards` / `_included` / `_quotas` / `_balances`, `notify._sent` / `_seeded` / `_payment_at`, `clientinfo._dns_cache`, the loaded tokenizer (`trim._loaded`), the Prometheus counters | Keyed by provider *name*, so a request holding a slot still holds it after an edit. |
+| **Survives a reload, lost on restart** | `slots._in_use` / `_running` / `_last_model` / `_waiters` / `_rr`, `registry._down_until`, `inflight._active` / `_recent` / `_bodies`, `logbuffer`, `smart._prices` / `_shares`, `rates._cards` / `_included` / `_quotas` / `_balances`, `notify._sent` / `_seeded` / `_payment_at`, `clientinfo._dns_cache`, the loaded tokenizer (`trim._loaded`), each module's `_warn_gate`, the Prometheus counters | Keyed by provider *name*, so a request holding a slot still holds it after an edit. |
 | **Durable, outside the process** | `config.yaml` (written in place by the console), the cost ledger (`ledger.sqlite`), Loki (one `event=request` line per request), Prometheus (scraped counters) | The durable copy of a request is its log line and its ledger row, which is why the in-memory history may be lossy. |
 
 If you add process-local state, add it to `reset_state` in `tests/conftest.py`, or it
@@ -194,9 +200,10 @@ never leak.
 - **Read config as `conf.X` at use time.** Never `from app.config import PROVIDERS`
   (a snapshot that goes stale after a reload) and never cache config values across
   requests. Importing the dataclasses and helpers (`Provider`, `Target`, `native_for`) is
-  fine. After a reload, both the watcher and `main._apply_config_change` (run after a
-  console edit) call `registry.clear_cache()` and `slots.poke()`. A file that fails to
-  parse leaves the running config in place.
+  fine. Every reload goes through `hotreload.apply` (the watcher, and
+  `after_console_edit` once a console edit is written), which also calls
+  `registry.clear_cache()` and `slots.poke()`. A file that fails to parse leaves the
+  running config in place.
 - **Async primitives are created lazily** so they bind to uvicorn's running loop:
   `registry._lock_for`, each `slots._Waiter.future`, `configwrite._lock_for`, the clients
   in `upstream` and `claude_cli`. Do not move them to module-level construction.
@@ -212,10 +219,12 @@ never leak.
 
 ### Admission (`slots.py`)
 
-- **Every acquired slot is released exactly once.** Non-stream: in `_dispatch`, after the
-  handler returns. Stream: in the generator's `finally`, through the `on_complete`
-  callback, because the handler returns before streaming finishes. A new code path must
-  guarantee release on every exit, including errors and client disconnect.
+- **Every acquired slot is released exactly once.** Each attempt gets one idempotent
+  releaser (`proxy._release_once`), and every path calls it: `_dispatch` after a
+  buffered response and on any exception, the stream's own `close` when its body ends
+  (the handler returns long before that). A new code path must call that releaser on
+  every exit, including errors and client disconnect, and never `slots.release`
+  directly: a second release frees a slot another request is holding.
 - **Admission is a synchronous handoff and needs no lock.** A release decrements, then
   `_drain()` picks the best waiter and resolves its future, all in one synchronous step.
   That is what stops a newly arrived request from barging past the queue. **Never put an
@@ -229,8 +238,9 @@ never leak.
   order is the only thing stopping a hot model from starving a cold one.
 - **Cancellation must not strand a slot.** The Kill button cancels the task serving a
   request, so `CancelledError` can surface at any `await` in the request path.
-  `_dispatch` releases the slot in an `except asyncio.CancelledError` branch. Any new
-  `await` that holds a slot needs the same treatment. `Entry.cancel` prefers
+  `_dispatch` releases the slot in its `except BaseException` branch, which covers a
+  cancellation and a bug alike. Any new `await` that holds a slot needs the same
+  treatment. `Entry.cancel` prefers
   `Entry.stream_task` (bound inside the SSE generator) over the request task, because
   cancelling the request task mid-stream unwinds through Starlette's disconnect listener
   and uvicorn logs a traceback for a deliberate action.
@@ -277,10 +287,18 @@ never leak.
   let `httpx.RequestError` propagate and return a buffered `Response` carrying the
   upstream status for HTTP errors. `_dispatch` owns both failover triggers and is the
   only place that turns errors into terminal client responses.
+- **A failover is counted only when the request had somewhere to go.** `_fail_over`
+  runs while another target remains. The last target's failure is an error instead:
+  an HTTP error counts in `llm_proxy_errors_total` with its status, a connection
+  failure with 502 or 504. Either way the backend is marked down.
 - **Streaming fails over only before the first byte.** `_handle_stream` pre-flights the
   connection (`stream_cm.__aenter__`) so `_dispatch` can try the next target before a
   `StreamingResponse` commits its 200. An upstream 4xx/5xx on a stream is buffered and
   returned as a plain response. Do not move error handling inside the body generator.
+- **Reading a stream never interrupts it.** `_relay_stream` yields each chunk before
+  `_StreamTally.feed` sees it, and `feed` never raises: an event it cannot read is
+  skipped. Anything added to the per-event bookkeeping must keep that property, or an
+  odd chunk from a backend ends the client's stream.
 - **`_build_body` runs per target and never mutates the shared payload.** A vendor's
   `adapt_request` is copy-on-write, so a failover to another vendor still gets the
   client's own history.
@@ -292,8 +310,8 @@ never leak.
 ### Observability
 
 - **The in-flight registry has exactly one closer per entry.** `proxy_request` closes
-  the entry for every response except a `StreamingResponse`; that one is closed by the
-  stream generator's `finally`, in the leading synchronous block before any `await`.
+  the entry for every response except a `StreamingResponse`; that one is closed by
+  `_relay_stream`'s `finally`, in the leading synchronous block before any `await`.
   `record()` comes before `finish()`, or the history row loses its status and tokens.
   `finish()` is idempotent. Keep the registry write-only from the request path: nothing
   in admission, routing or failover may read it. `Entry.cancel`, driven from the admin
@@ -363,14 +381,14 @@ never leak.
 
 ### Admin API and config write-back
 
-- **The admin gate is structural.** Every `/admin/*` route is declared on the `admin`
-  `APIRouter`, which carries `Depends(require_admin)`. Declare new admin routes on that
+- **The admin gate is structural.** Every `/admin/*` route is declared on `admin.router`,
+  an `APIRouter` that carries `Depends(require_admin)`. Declare new admin routes on that
   router, never on `app`. The 403 body is `{"error": "unauthorized"}`; the console and
   scripts read that shape.
 - **`api_key` never leaves the process.** `_provider_view` and `_config_snapshot` emit
   `has_api_key`, never the value, and `configwrite` writes key lines back verbatim
   without returning one.
-- **Routes declared in `main.py` sit above the catch-all.** That includes
+- **Every declared route sits above the catch-all in `main.py`.** That includes
   `/favicon.ico` and `/robots.txt`: without them a browser's automatic favicon request
   falls into the proxy path, 401s, and shows up in the request feed as a failed request
   on every page load. Any other well-known browser path belongs there too.
@@ -454,9 +472,9 @@ never leak.
 
 | To add | Touch |
 |---|---|
-| A `Provider` field | The dataclass and `_load` in `config.py`; `main._provider_view` if the console shows it; the provider table in `README.md`; `config.example.yaml`. |
-| A config section | A dataclass and its parsing in `config._load`; the tuple `_load` returns, unpacked in **two** places (the module-level `… = _boot()` and `reload_if_changed`, plus its `global` line); a `conftest` fixture if tests need a neutral default; `README.md`; `config.example.yaml`. |
-| An `/admin` endpoint | Declare it on the `admin` router. If `app.js` reads its fields, list them in `tests/test_admin_contract.py`. Add it to the endpoint table in `README.md`. |
+| A `Provider` field | The dataclass and `_load_providers` in `config.py`; `admin._provider_view` if the console shows it; the provider table in `README.md`; `config.example.yaml`. |
+| A config section | In `config.py`: a dataclass holding the defaults, a `_load_<section>` function, a field on `_Loaded`, and a global rebound in `_install`. Then a `conftest` fixture if tests need a neutral default; `README.md`; `config.example.yaml`. |
+| An `/admin` endpoint | Declare it on `admin.router`. If `app.js` reads its fields, list them in `tests/test_admin_contract.py`. Add it to the endpoint table in `README.md`. |
 | A console config edit | A `configwrite.set_*` built from `mutate(doc)` and `check(parsed)` passed to `_edit`; the endpoint finishes with `_persisted(ok, error, what)`. Test the byte-identical resave. |
 | A vendor | `app/providers/<vendor>.py` with the fetchers it has; the name in `config.VENDORS` and its hosts in `_VENDOR_HOSTS`; parser tests against a real payload in `tests/test_providers.py`; a page in `docs/providers/`. |
 | Process-local state | A module-level dict keyed by provider name; `conftest.reset_state`; the state table above. |
@@ -484,7 +502,7 @@ above are invisible in review. Each file guards a specific set:
 |---|---|
 | `test_slots.py` | Priority admission, round-robin in a tie tier, queueing, the synchronous handoff (no barging), affinity reordering, the `affinity_max_skips` bound, and no slot stranded by timeout or cancellation. |
 | `test_router.py` | Resolution order, inherited versus pinned native ids, an unknown model resolving to `[]` and never to `PROVIDERS[0]`, and `_auto_group` subsuming `_allow_listed`. |
-| `test_proxy.py` | The full lifecycle through `httpx.MockTransport`: both failover triggers, error relay, streaming, decompression, the request log, trimming on the wire, smart routing and rate-driven ranking, price tables, empty balances and 402s, the ledger and cost counter. Every test asserts slot occupancy returns to zero. |
+| `test_proxy.py` | The full lifecycle through `httpx.MockTransport`: both failover triggers and what each counts, error relay, streaming (including events the proxy cannot read, which must not cut the stream), decompression, the request log, trimming on the wire, smart routing and rate-driven ranking, price tables, empty balances and 402s, the ledger and cost counter. Every test asserts slot occupancy returns to zero. |
 | `test_gate.py` | Catalog visibility with and without a key, the 401/404 distinction, admin gating, and `api_key` never appearing in a response. |
 | `test_admin_contract.py` | The exact fields `app/static/app.js` dereferences from each admin view. The console is untyped, so a dropped field shows as a blank cell instead of an error. |
 | `test_configwrite.py` | Formatting fidelity (comments, key order, quotes, block versus flow), two identical saves leaving the file byte-identical, every refusal path, and `set_smart`. |
@@ -499,6 +517,7 @@ above are invisible in review. Each file guards a specific set:
 | `test_trim.py` | The guardrail: a no-op unless `num_ctx` is present and exceeded, system messages survive, tool calls and results never separated, excerpts before drops, the newest turn always sent; with a hand-built byte-per-token tokenizer, that the count follows what the template prints. |
 | `test_claude_cli.py` | The claude-cli backend through the real subprocess path with a fake CLI script: translation, lockdown flags, a keyless caller never reaching the CLI, CLI errors as HTTP statuses, emulated function calling, and no process outliving its slot. |
 | `test_version.py` | The build-identity chain: blank args mean `dev`, a CI build reports its tag and sha, `/health` and `llm_proxy_build_info` carry them. |
+| `test_throttle.py` | The once-per-interval gate: open the first time whatever the clock says, per key, and again after the interval. |
 
 What matters when adding tests:
 
@@ -556,6 +575,7 @@ facts that shape day-to-day work:
 - A failed-over attempt that got an HTTP error still increments
   `llm_proxy_errors_total`, so a request that failed over on a 503 and then succeeded
   counts one error and one request. A connection failure that failed over counts only in
-  `llm_proxy_failovers_total`.
+  `llm_proxy_failovers_total`; one with no target left counts only in
+  `llm_proxy_errors_total`, as a 502 or 504.
 - A request killed from the console may lose its `event=request` line: the cancellation
   can interrupt the task that emits it. The kill itself is logged at WARNING.

@@ -58,6 +58,7 @@ def reset_state(monkeypatch):
     monkeypatch.setattr(conf, "LEDGER_PATH", ":memory:")
     yield
     ledger.close()
+    ledger._warn_gate.reset()
     slots._in_use.clear()
     slots._running.clear()
     slots._last_model.clear()
@@ -70,6 +71,7 @@ def reset_state(monkeypatch):
     smart._prices = {}
     smart._shares = {}
     smart._refreshed_at = None
+    smart._warn_gate.reset()
     rates.reset()
     notify.reset()
     inflight._active.clear()

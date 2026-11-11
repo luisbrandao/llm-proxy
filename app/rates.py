@@ -35,12 +35,13 @@ backend that is usually first stays first.
 import asyncio
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict, Optional, Tuple
 
 from app import config as conf
 from app import upstream
 from app.providers import Balance, Override, Quota, RateCard, get_vendor
+from app.throttle import Throttle
 
 logger = logging.getLogger("llm-proxy")
 
@@ -62,7 +63,7 @@ _balances: Dict[str, Balance] = {}
 _account_at: Dict[str, float] = {}     # provider -> epoch of the last successful account read
 _catalog_at: Dict[str, float] = {}
 _errors: Dict[Tuple[str, str], str] = {}   # (provider, "rates"|"quota"|"balance") -> last error
-_warned: Dict[Tuple[str, str], float] = {}
+_warn_gate = Throttle(WARN_EVERY)
 
 
 # ── what a request reads ────────────────────────────────────────────────────
@@ -190,10 +191,7 @@ def _vendor_providers():
 def _warn(provider: str, what: str, exc: BaseException) -> None:
     text = f"{type(exc).__name__}: {exc}"
     _errors[(provider, what)] = text
-    now = time.monotonic()
-    last = _warned.get((provider, what))
-    if last is None or now - last >= WARN_EVERY:
-        _warned[(provider, what)] = now
+    if _warn_gate.ready((provider, what)):
         logger.warning("Rates: could not read %s for '%s' (%s) — keeping the last data", what, provider, text)
 
 
@@ -343,5 +341,6 @@ def accounts_snapshot() -> dict:
 
 def reset() -> None:
     """Forget everything (tests)."""
-    for d in (_cards, _included, _quotas, _balances, _account_at, _catalog_at, _errors, _warned):
+    for d in (_cards, _included, _quotas, _balances, _account_at, _catalog_at, _errors):
         d.clear()
+    _warn_gate.reset()

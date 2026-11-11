@@ -24,13 +24,11 @@ converts to the one unit used everywhere else here: **USD per million tokens**.
 """
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 from app.config import Rate
 
 _DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
-# Price keys an override may set, mapped to the field of `Rate` they replace.
-_KEYS = {"prompt": "input", "input_cache_read": "cached", "completion": "output"}
 
 
 @dataclass(frozen=True)

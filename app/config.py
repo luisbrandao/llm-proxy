@@ -3,7 +3,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 from urllib.parse import urlparse
 
 import yaml
@@ -140,6 +140,10 @@ def _pricing(raw, where: str) -> Optional[Pricing]:
     return Pricing(rates=rates, peak=peak)
 
 
+# Seconds a backend's live model list is cached (`cache_ttl`) unless it says otherwise.
+DEFAULT_CACHE_TTL = 60
+
+
 @dataclass
 class Provider:
     name: str
@@ -159,7 +163,7 @@ class Provider:
     # by resolved NATIVE model id; value is a list of upstream slugs (strict pin)
     # or a dict passed through verbatim. A "*" key applies to unlisted models.
     provider_routing: Dict[str, object] = field(default_factory=dict)
-    cache_ttl: int = 60
+    cache_ttl: int = DEFAULT_CACHE_TTL
     # Max concurrent in-flight requests this backend will handle. None means
     # unlimited (no slot gating). Shared across every model the backend serves.
     slots: Optional[int] = None
@@ -407,14 +411,20 @@ def _stat_sig():
     return (st.st_mtime_ns, st.st_size)
 
 
-def _load(text: bytes):
-    raw = yaml.safe_load(text) or {}
+class _Loaded(NamedTuple):
+    """One parsed config file: everything `_install` makes live."""
+    providers: List[Provider]
+    aliases: Dict[str, str]
+    logical_models: Dict[str, LogicalModel]
+    routing: Routing
+    auth_keys: set
+    trim: Trim
+    notify: Notify
 
-    # Global aliases: simple name -> "provider:model" target.
-    aliases = {str(k): str(v) for k, v in (raw.get("aliases") or {}).items()}
 
+def _load_providers(raw: dict) -> List[Provider]:
     providers = []
-    for idx, item in enumerate(raw.get("providers", []) or []):
+    for idx, item in enumerate(raw.get("providers") or []):
         slots = item.get("slots")
         kind = str(item.get("kind") or KIND_HTTP)
         if kind not in KINDS:
@@ -433,8 +443,10 @@ def _load(text: bytes):
                 enabled_models=item.get("enabled_models") or [],
                 model_map=item.get("model_map") or {},
                 provider_routing=item.get("provider_routing") or {},
-                cache_ttl=int(item.get("cache_ttl", 60)),
+                cache_ttl=int(item.get("cache_ttl", DEFAULT_CACHE_TTL)),
                 slots=(int(slots) if slots is not None else None),
+                # Position in the file, not the dataclass default: the first
+                # backend listed is the preferred one unless the config says so.
                 priority=int(item.get("priority", idx)),
                 require_permission=bool(item.get("require_permission", False)),
                 strip_path_prefix=str(item.get("strip_path_prefix", "")),
@@ -444,23 +456,29 @@ def _load(text: bytes):
                 vendor=_vendor(item.get("vendor"), item["name"]),
             )
         )
+    return providers
 
-    # Explicit logical models: client-facing name -> prioritized targets.
+
+def _load_logical_models(raw: dict) -> Dict[str, LogicalModel]:
+    """Explicit logical models: client-facing name -> prioritized targets."""
     logical = {}
     for name, spec in (raw.get("models") or {}).items():
-        targets = []
-        for t in (spec.get("targets") or []):
-            targets.append(
-                Target(
-                    provider=t["provider"],
-                    model=t.get("model"),  # None => inherit native via model_map
-                    priority=int(t.get("priority", 100)),
-                )
+        targets = [
+            Target(
+                provider=t["provider"],
+                model=t.get("model"),  # None => inherit native via model_map
+                priority=int(t.get("priority", Target.priority)),  # the dataclass default
             )
+            for t in (spec.get("targets") or [])
+        ]
         targets.sort(key=lambda x: x.priority)
         logical[str(name)] = LogicalModel(name=str(name), targets=targets)
+    return logical
 
+
+def _load_routing(raw: dict) -> Routing:
     r = raw.get("routing") or {}
+    d = Routing()  # the defaults live on the dataclass, and only there
     modes = {}
     for name, mode in (r.get("backend_modes") or {}).items():
         mode = str(mode).strip().lower()
@@ -471,64 +489,76 @@ def _load(text: bytes):
                 f"routing.backend_modes[{name!r}]: {mode!r} is not one of {', '.join(BACKEND_MODES)}"
             )
         modes[str(name)] = mode
-    fos = r.get("failover_statuses")
-    routing = Routing(
-        queue_timeout=float(r.get("queue_timeout", 0) or 0),
-        failover=bool(r.get("failover", True)),
-        auto_group=bool(r.get("auto_group", True)),
-        down_backoff=float(r.get("down_backoff", 15)),
-        queue_affinity=bool(r.get("queue_affinity", True)),
-        affinity_max_skips=max(0, int(r.get("affinity_max_skips", 3))),
-        smart_routing=bool(r.get("smart_routing", False)),
-        smart_window_days=max(1, int(r.get("smart_window_days", 7))),
-        smart_min_requests=max(1, int(r.get("smart_min_requests", 5))),
+    statuses = r.get("failover_statuses")
+    return Routing(
+        queue_timeout=float(r.get("queue_timeout", d.queue_timeout) or 0),
+        failover=bool(r.get("failover", d.failover)),
+        auto_group=bool(r.get("auto_group", d.auto_group)),
+        down_backoff=float(r.get("down_backoff", d.down_backoff)),
+        queue_affinity=bool(r.get("queue_affinity", d.queue_affinity)),
+        affinity_max_skips=max(0, int(r.get("affinity_max_skips", d.affinity_max_skips))),
+        smart_routing=bool(r.get("smart_routing", d.smart_routing)),
+        smart_window_days=max(1, int(r.get("smart_window_days", d.smart_window_days))),
+        smart_min_requests=max(1, int(r.get("smart_min_requests", d.smart_min_requests))),
         backend_modes=modes,
         failover_statuses=(
-            frozenset(int(s) for s in fos)
-            if fos is not None
-            else frozenset({402, 429, 500, 502, 503, 504})
+            d.failover_statuses if statuses is None else frozenset(int(s) for s in statuses)
         ),
     )
 
+
+def _load_notify(raw: dict) -> Notify:
     nt = raw.get("notify") or {}
+    d = Notify()
     try:
-        notify = Notify(
+        return Notify(
             url=_interpolate(str(nt.get("ntfy") or "")).strip(),
             token=_interpolate(str(nt.get("token") or "")).strip(),
-            low_balance=max(0.0, float(nt.get("low_balance", 1.0))),
+            low_balance=max(0.0, float(nt.get("low_balance", d.low_balance))),
             low_balance_by={str(k): max(0.0, float(v)) for k, v in (nt.get("low_balance_by") or {}).items()},
-            reminder_hours=max(0.1, float(nt.get("reminder_hours", 12.0))),
+            reminder_hours=max(0.1, float(nt.get("reminder_hours", d.reminder_hours))),
         )
     except (TypeError, ValueError) as e:
         raise ValueError(f"notify: thresholds must be numbers ({e})")
 
+
+def _load_trim(raw: dict) -> Trim:
     tr = raw.get("trim") or {}
-    trim = Trim(
-        enabled=bool(tr.get("enabled", True)),
-        tokenizer=_tokenizer_path(tr.get("tokenizer", DEFAULT_TOKENIZER)),
-        chars_per_token=max(0.5, float(tr.get("chars_per_token", 3.0))),
-        response_headroom=max(0, int(tr.get("response_headroom", 4000))),
-        max_tool_result_tokens=max(0, int(tr.get("max_tool_result_tokens", 4000))),
-        protect_recent=max(0, int(tr.get("protect_recent", 10))),
+    d = Trim()
+    return Trim(
+        enabled=bool(tr.get("enabled", d.enabled)),
+        tokenizer=_tokenizer_path(tr.get("tokenizer", d.tokenizer)),
+        chars_per_token=max(0.5, float(tr.get("chars_per_token", d.chars_per_token))),
+        response_headroom=max(0, int(tr.get("response_headroom", d.response_headroom))),
+        max_tool_result_tokens=max(0, int(tr.get("max_tool_result_tokens", d.max_tool_result_tokens))),
+        protect_recent=max(0, int(tr.get("protect_recent", d.protect_recent))),
     )
 
-    # Accepted proxy keys gate the `require_permission` backends. Sourced from
-    # the PROXY_API_KEYS env var (comma-separated) and/or `auth.keys` in config
-    # (which supports ${ENV_VAR} interpolation). Empty => gate disabled.
-    auth_keys = set()
-    for k in (raw.get("auth") or {}).get("keys") or []:
-        v = _interpolate(str(k)).strip()
-        if v:
-            auth_keys.add(v)
-    for k in os.environ.get("PROXY_API_KEYS", "").split(","):
-        k = k.strip()
-        if k:
-            auth_keys.add(k)
 
-    return providers, aliases, logical, routing, auth_keys, trim, notify
+def _load_auth_keys(raw: dict) -> set:
+    """Accepted proxy keys, which gate the `require_permission` backends. Sourced
+    from the PROXY_API_KEYS env var (comma-separated) and/or `auth.keys` in the
+    config (which supports ${ENV_VAR} interpolation). Empty => gate disabled."""
+    listed = [_interpolate(str(k)) for k in (raw.get("auth") or {}).get("keys") or []]
+    from_env = os.environ.get("PROXY_API_KEYS", "").split(",")
+    return {k.strip() for k in listed + from_env if k.strip()}
 
 
-def _boot():
+def _load(text: bytes) -> _Loaded:
+    raw = yaml.safe_load(text) or {}
+    return _Loaded(
+        providers=_load_providers(raw),
+        # Global aliases: simple name -> "provider:model" target.
+        aliases={str(k): str(v) for k, v in (raw.get("aliases") or {}).items()},
+        logical_models=_load_logical_models(raw),
+        routing=_load_routing(raw),
+        auth_keys=_load_auth_keys(raw),
+        trim=_load_trim(raw),
+        notify=_load_notify(raw),
+    )
+
+
+def _boot() -> _Loaded:
     global _last_sig, _loaded_digest
     # Stat before read: if the file changes in between, the next reload tick
     # sees a signature mismatch and re-checks — a wasted read, never a miss.
@@ -538,8 +568,36 @@ def _boot():
     return _load(text)
 
 
-PROVIDERS, ALIASES, LOGICAL_MODELS, ROUTING, AUTH_KEYS, TRIM, NOTIFY = _boot()
-PROVIDERS_BY_NAME = {p.name: p for p in PROVIDERS}
+# The live config. Always read as `conf.X` at use time and never from-imported:
+# `_install` rebinds these names on every reload.
+PROVIDERS: List[Provider]
+PROVIDERS_BY_NAME: Dict[str, Provider]
+ALIASES: Dict[str, str]
+LOGICAL_MODELS: Dict[str, LogicalModel]
+ROUTING: Routing
+AUTH_KEYS: set
+TRIM: Trim
+NOTIFY: Notify
+
+
+def _install(loaded: _Loaded) -> None:
+    """Make a parsed config the live one, at boot and on every reload.
+
+    A plain rebind of the module globals with no await between the rebinds, so a
+    request sees the old config or the new one and never a mix.
+    """
+    global PROVIDERS, PROVIDERS_BY_NAME, ALIASES, LOGICAL_MODELS, ROUTING, AUTH_KEYS, TRIM, NOTIFY
+    PROVIDERS = loaded.providers
+    PROVIDERS_BY_NAME = {p.name: p for p in loaded.providers}
+    ALIASES = loaded.aliases
+    LOGICAL_MODELS = loaded.logical_models
+    ROUTING = loaded.routing
+    AUTH_KEYS = loaded.auth_keys
+    TRIM = loaded.trim
+    NOTIFY = loaded.notify
+
+
+_install(_boot())
 
 
 def reload_if_changed() -> bool:
@@ -549,18 +607,17 @@ def reload_if_changed() -> bool:
     Cheap when idle — one os.stat per call. The file is read only when
     mtime/size move, and re-parsed only when the bytes actually differ (a
     touch or deploy re-sync flips mtime without changing content). The swap
-    is a plain rebind of the module globals: every module reads config as
-    `conf.X` per operation (never a from-import snapshot), and since there is
-    no await between the rebinds, a request can't observe a half-applied
-    config. Requests already in flight keep the Provider objects they
-    resolved — they finish under the old settings.
+    is `_install`'s plain rebind of the module globals: every module reads
+    config as `conf.X` per operation (never a from-import snapshot), and since
+    there is no await between the rebinds, a request can't observe a
+    half-applied config. Requests already in flight keep the Provider objects
+    they resolved — they finish under the old settings.
 
     A parse error propagates to the caller with the running config fully
     intact. The failed signature is still recorded, so broken content is
     parsed (and logged by the caller) once, not on every tick; the next real
     edit triggers a retry.
     """
-    global PROVIDERS, ALIASES, LOGICAL_MODELS, ROUTING, AUTH_KEYS, TRIM, NOTIFY, PROVIDERS_BY_NAME
     global _last_sig, _loaded_digest
     sig = _stat_sig()
     if sig == _last_sig:
@@ -570,15 +627,7 @@ def reload_if_changed() -> bool:
     digest = hashlib.sha256(text).hexdigest()
     if digest == _loaded_digest:
         return False
-    providers, aliases, logical, routing, auth_keys, trim, notify = _load(text)
-    PROVIDERS = providers
-    ALIASES = aliases
-    LOGICAL_MODELS = logical
-    ROUTING = routing
-    AUTH_KEYS = auth_keys
-    TRIM = trim
-    NOTIFY = notify
-    PROVIDERS_BY_NAME = {p.name: p for p in providers}
+    _install(_load(text))
     _loaded_digest = digest
     return True
 
@@ -590,11 +639,10 @@ def _flag(key: str, default: str) -> bool:
 # Runtime flags come from environment variables (set via docker-compose).
 LOG_INPUT = _flag("LOG_INPUT", "false")
 LOG_OUTPUT = _flag("LOG_OUTPUT", "false")
-PORT = int(os.environ.get("PORT", "8000"))
 
 # Hot reload: seconds between config-file change checks (0 disables). Polling,
-# not inotify — the config is a bind-mounted single file, where host-side edits
-# don't reliably raise inotify events inside the container, and a few stats per
+# not inotify — the config sits on a bind mount, where host-side edits don't
+# reliably raise inotify events inside the container, and a few stats per
 # minute cost nothing.
 CONFIG_RELOAD_INTERVAL = float(os.environ.get("CONFIG_RELOAD_INTERVAL", "3"))
 

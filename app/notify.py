@@ -43,6 +43,7 @@ from typing import Dict, List, Optional, Tuple
 
 from app import config as conf
 from app import rates, upstream
+from app.throttle import Throttle
 
 logger = logging.getLogger("llm-proxy")
 
@@ -58,7 +59,7 @@ _sent: Dict[Tuple[str, str], float] = {}      # (provider, kind) -> monotonic ti
 _seeded = False
 _payment_at: Dict[str, float] = {}
 _tasks: set = set()
-_warned_at: Optional[float] = None
+_warn_gate = Throttle(WARN_EVERY)
 
 
 @dataclass(frozen=True)
@@ -99,7 +100,7 @@ def _conditions() -> Dict[Tuple[str, str], Notice]:
                     f"{name} has {amount} left, under the {_money(conf.NOTIFY.threshold(name), b['currency'])} warning level.",
                     "default", ("warning", "moneybag"))
         if q is not None and not q["available"]:
-            billing = (f"requests now bill the balance"
+            billing = ("requests now bill the balance"
                        + (f" ({_money(b['amount'], b['currency'])} left)" if b else "")
                        + " at list prices") if q["allow_overage"] else "requests are refused until it resets"
             out[(name, "quota_used")] = Notice(
@@ -148,7 +149,6 @@ def evaluate(now: Optional[float] = None) -> List[Tuple[Optional[Tuple[str, str]
 
 async def send(notice: Notice) -> bool:
     """Publish one message. True only when ntfy accepted it. Never raises."""
-    global _warned_at
     cfg = conf.NOTIFY
     if not cfg.enabled:
         return False
@@ -164,9 +164,7 @@ async def send(notice: Notice) -> bool:
     except asyncio.CancelledError:
         raise
     except Exception as e:  # noqa: BLE001 - a warning that cannot be delivered must not break anything
-        now = time.monotonic()
-        if _warned_at is None or now - _warned_at >= WARN_EVERY:
-            _warned_at = now
+        if _warn_gate.ready():
             logger.warning("Notify: could not reach ntfy at %s (%s: %s)", cfg.url, type(e).__name__, e)
         return False
 
@@ -224,6 +222,7 @@ def payment_required(provider: str, model: Optional[str] = None) -> None:
 
 def reset() -> None:
     """Forget everything (tests)."""
-    global _seeded, _warned_at
+    global _seeded
     _sent.clear(); _payment_at.clear(); _tasks.clear()
-    _seeded, _warned_at = False, None
+    _seeded = False
+    _warn_gate.reset()

@@ -60,7 +60,6 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import httpx
 
-from app import config as conf
 from app import upstream
 
 # The binary, as argv. A list so the tests can run a stand-in via the interpreter.

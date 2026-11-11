@@ -47,7 +47,6 @@ the document holds them, and no function here returns one to a caller.
 """
 import asyncio
 import io
-import logging
 import os
 
 import yaml as pyyaml
@@ -56,8 +55,6 @@ from ruamel.yaml.comments import CommentedMap, CommentedSeq
 from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 
 from app import config as conf
-
-logger = logging.getLogger("llm-proxy")
 
 
 def _yaml() -> YAML:

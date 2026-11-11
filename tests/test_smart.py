@@ -7,7 +7,6 @@ ever moved (an unknown price must not read as cheap), that a tie tier stays a ti
 tier, that `first`/`last` really are strict, and that the whole thing is inert
 unless switched on. `test_proxy.py` closes the loop through the real lifecycle.
 """
-import dataclasses
 import logging
 
 import pytest
@@ -258,7 +257,6 @@ async def test_a_failed_refresh_keeps_the_last_snapshot_and_never_raises(monkeyp
         raise RuntimeError("disk gone")
 
     monkeypatch.setattr(ledger, "observed_prices", boom)
-    monkeypatch.setattr(smart, "_warned_at", None)
     caplog.set_level(logging.WARNING, logger="llm-proxy")
     await smart.refresh()
     await smart.refresh()

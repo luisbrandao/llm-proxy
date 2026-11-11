@@ -174,8 +174,9 @@ When the chosen backend fails, the proxy releases the slot, marks the backend do
 
 Other 4xx responses (bad request, auth) are relayed as they are, since every backend
 would reject them the same way. When all candidates have failed, the client gets the
-last upstream error verbatim, with its real status and body. A streaming request can
-fail over until the first byte; after that the HTTP status is already committed.
+last one's failure: an upstream error verbatim, with its real status and body, or a
+502 / 504 when that backend could not be reached. A streaming request can fail over
+until the first byte; after that the HTTP status is already committed.
 
 A backend marked down is skipped while another candidate is up, and is tried again when
 it is the only one left.
@@ -186,10 +187,11 @@ Errors the proxy generates itself use the OpenAI error shape:
 |---|---|---|
 | 401 | `unauthorized` | The model lives only on gated backends and the caller sent no valid key |
 | 404 | `invalid_request_error` (`code: model_not_found`) | No backend serves the model |
-| 502 | `upstream_unavailable` | Every candidate failed to connect |
+| 502 | `upstream_unavailable` | The last candidate could not be reached |
 | 504 | `upstream_timeout` | The last candidate timed out |
 | 503 | `slot_timeout` | `queue_timeout` passed with no free slot |
 | 503 | `cancelled` | The request was killed from the console |
+| 503 | `no_providers` | The config lists no providers |
 
 ### Smart routing
 
@@ -754,8 +756,8 @@ Scrape `http://<host>:8000/metrics`:
 | `llm_proxy_tokens_cached_total` | Counter | `provider`, `model` | Prompt tokens served from the backend's prompt cache (a subset of input) |
 | `llm_proxy_cost_total` | Counter | `provider`, `model` | Cost in USD: what the backend reported, or the [price table](#price-tables) estimate. A backend with neither adds nothing, so this is a floor on spend |
 | `llm_proxy_request_duration_seconds` | Histogram | `provider`, `model` | Request latency (0.1 to 600 s) |
-| `llm_proxy_errors_total` | Counter | `provider`, `model`, `status_code` | Failed requests |
-| `llm_proxy_failovers_total` | Counter | `provider` | Failovers away from a backend |
+| `llm_proxy_errors_total` | Counter | `provider`, `model`, `status_code` | Upstream error responses by status, plus requests whose last backend could not be reached (`502` / `504`) |
+| `llm_proxy_failovers_total` | Counter | `provider` | Requests moved off this backend, after it failed them, to another one |
 | `llm_proxy_slots_in_use` | Gauge | `provider` | In-flight requests holding a slot |
 | `llm_proxy_queue_waiting` | Gauge | | Requests waiting for a slot |
 | `llm_proxy_queue_affinity_grants_total` | Counter | `provider` | Times the queue admitted a request ahead of an earlier one to avoid a model swap |

@@ -190,9 +190,7 @@ async def list_models(authorized: bool = True) -> dict:
     logical_target_natives = set()
     for lm in conf.LOGICAL_MODELS.values():
         for t in lm.targets:
-            p = conf.PROVIDERS_BY_NAME.get(t.provider)
-            native = t.model if t.model is not None else (p.to_native(lm.name) if p else lm.name)
-            logical_target_natives.add((t.provider, native))
+            logical_target_natives.add((t.provider, conf.native_for(lm.name, t.provider, t.model)))
 
     # Probe only the backends visible to this caller, concurrently.
     live_providers = [p for p in conf.PROVIDERS if p.lists_all and visible(p.name)]

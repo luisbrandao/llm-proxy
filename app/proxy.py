@@ -80,15 +80,9 @@ def _decompress(raw: bytes, encoding: str) -> bytes:
 
     Handles exactly what `_build_headers` advertises — gzip and deflate, both
     stdlib. Keep the two aligned: asking for an encoding we cannot decode means a
-    backend may answer with a body we can only pass through compressed.
-
-    There used to be `br` and `zstd` branches here. They could not work: the
-    forwarded `Accept-Encoding` is capped at `gzip, deflate`, so they only fired
-    if a backend ignored the header, and `brotli`/`zstandard` are not
-    dependencies — so they raised ImportError, got swallowed, and returned the
-    still-compressed bytes. The code read as a capability and behaved as a
-    fallback. To genuinely support one, add the library to requirements.txt, add
-    the branch, *and* advertise it in `_build_headers`.
+    backend may answer with a body we can only pass through compressed. To
+    support another one, add the library to requirements.txt, add the branch
+    here, *and* advertise it in `_build_headers`.
 
     Unknown or empty encodings are returned unchanged, and a decompression failure
     returns the raw bytes, so this never crashes the proxy on an odd body.
@@ -114,6 +108,14 @@ def _decompress(raw: bytes, encoding: str) -> bytes:
     return raw
 
 
+def _pretty_json(text: str) -> str:
+    """`text` re-indented for the log when it is JSON, unchanged when it is not."""
+    try:
+        return json.dumps(json.loads(text), indent=2, ensure_ascii=False)
+    except ValueError:
+        return text
+
+
 def _log_curl(method: str, url: str, headers: dict, body: str) -> None:
     cmd = f"{method} {url}"
     for k, v in headers.items():
@@ -122,12 +124,7 @@ def _log_curl(method: str, url: str, headers: dict, body: str) -> None:
         else:
             cmd += f"\n  -H '{k}: {v}'"
     if body:
-        try:
-            parsed = json.loads(body)
-            pretty = json.dumps(parsed, indent=2, ensure_ascii=False)
-            cmd += f"\n  -d '{pretty}'"
-        except (json.JSONDecodeError, ValueError):
-            cmd += f"\n  -d '{body}'"
+        cmd += f"\n  -d '{_pretty_json(body)}'"
     logger.info(f"Request:\n{cmd}")
 
 
@@ -183,10 +180,9 @@ def _op_kind(path: str, model: str):
 
 
 async def _emit_request_log(
-    request: Request, provider: str, model: str, status: int,
+    request: Request, provider: str, model: Optional[str], status: int,
     usage: Usage, duration: float, stream: bool,
-    asked: Optional[str] = None, trimmed: Optional[dict] = None,
-    served: Optional[str] = None, route: Optional[str] = None,
+    entry: Optional[inflight.Entry] = None, served: Optional[str] = None,
 ) -> None:
     """Emit the single, always-on, parseable line summarizing one request, and
     append the same record to the cost ledger.
@@ -207,7 +203,8 @@ async def _emit_request_log(
 
     `model` is the **native** id that went on the wire, and stays that way for
     compatibility with existing dashboards and recording rules. `asked` is the
-    name the *client* sent, emitted as its own `asked=` field, because those two
+    name the *client* sent (the in-flight `entry` carries it, along with what the
+    guardrail and the router did), emitted as its own `asked=` field, because those two
     routinely differ and only one of them is a stable thing to group by: a
     logical model spanning three backends resolves to three different native ids
     via each provider's model_map, so `model=` alone splits one model's traffic
@@ -223,22 +220,25 @@ async def _emit_request_log(
     version that answered (`claude-opus-5-5`) is recorded. Omitted when the
     backend echoes the id it was sent, so most lines are unchanged.
 
-    A model-less passthrough (non-chat / multipart body, nothing to resolve) is
-    logged as `event=passthrough` keyed by request path — never as a bogus
-    `model=unknown`, which would pollute the per-model view.
+    A model-less passthrough (`model` is None: a non-chat or multipart body,
+    nothing to resolve) is logged as `event=passthrough` keyed by request path,
+    so it never pollutes the per-model view.
 
-    `trimmed` is what the context guardrail did to this request (app/trim.py),
-    emitted as `trimmed=<messages dropped>` and `trim_capped=<tool results cut>`
-    so a trimmed request is greppable in Loki; absent when nothing was trimmed.
+    What the context guardrail did to this request (app/trim.py) is emitted as
+    `trimmed=<messages dropped>` and `trim_capped=<tool results cut>` so a
+    trimmed request is greppable in Loki; absent when nothing was trimmed.
     """
+    asked = entry.model if entry is not None else None
+    trimmed = entry.trimmed if entry is not None else None
+    route = entry.routed["by"] if entry is not None and entry.routed else None
     ip = clientinfo.client_ip(request)
     host = await clientinfo.client_host(ip)
-    ua = (request.headers.get("user-agent") or "").strip() or None
+    ua = clientinfo.user_agent(request)
     fields = {
         "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
         "level": "info",
     }
-    if model == "unknown":
+    if model is None:
         fields.update({
             "event": "passthrough",
             "provider": provider,
@@ -284,7 +284,7 @@ async def _emit_request_log(
             "trimmed": trimmed["dropped"] if trimmed else None,
             "trim_capped": trimmed["capped"] if trimmed else None,
             # Present only when smart routing or a first/last override reordered
-            # the backends for this request: `smart` or `pinned`.
+            # the backends for this request: `smart`, `pinned` or `smart+pinned`.
             "route": route,
         })
     svc = clientinfo.service_from_ua(ua)
@@ -296,7 +296,7 @@ async def _emit_request_log(
         "err": _err_kind(status),
     })
     event_logger.info(_logfmt(fields))
-    if model != "unknown":
+    if model is not None:
         # The durable copy the console can read back (Loki holds the line above).
         await ledger.record(
             provider=provider, model=model, asked=asked, served=served, status=status,
@@ -305,25 +305,21 @@ async def _emit_request_log(
         )
 
 
-def _log_upstream_error(provider: str, model: str, status: int, body: str) -> None:
+def _log_upstream_error(provider: str, model: Optional[str], status: int, body: str) -> None:
     """Log an upstream error response with its body, always.
 
     LOG_OUTPUT only gates successful-response logging; a backend rejecting a
     request (bad param, auth, overload) must be diagnosable from the proxy log
     alone — the body is where Google/OpenRouter/ollama say *why*.
     """
-    snippet = body.strip()
-    try:
-        snippet = json.dumps(json.loads(snippet), indent=2, ensure_ascii=False)
-    except (json.JSONDecodeError, ValueError):
-        pass
+    snippet = _pretty_json(body.strip())
     if len(snippet) > 4000:
         snippet = snippet[:4000] + "... [truncated]"
-    qualifier = "passthrough" if model == "unknown" else f"model: {model}"
+    qualifier = "passthrough" if model is None else f"model: {model}"
     logger.warning(f"Upstream error {status} from '{provider}' ({qualifier}):\n{snippet}")
 
 
-def _apply_pricing(provider: Provider, model: str, usage: Usage, started: float) -> None:
+def _apply_pricing(provider: Provider, model: Optional[str], usage: Usage, started: float) -> None:
     """Price a request from the provider's `pricing:` table when the backend did not.
 
     A price the backend reported always wins, and a request with no token counts
@@ -390,7 +386,7 @@ def _relay_headers(headers: dict) -> dict:
     return out
 
 
-def _backend_error(provider: Provider, model: str, exc: Exception) -> Response:
+def _backend_error(provider: Provider, model: Optional[str], exc: Exception) -> Response:
     """Build a clean OpenAI-style error when an upstream backend is unreachable.
 
     Backends come and go, so a connection failure is an expected condition, not
@@ -403,50 +399,44 @@ def _backend_error(provider: Provider, model: str, exc: Exception) -> Response:
         status, kind = 502, "upstream_unavailable"
 
     logger.warning(f"Backend '{provider.name}' unreachable: {type(exc).__name__}: {exc}")
-    if model != "unknown":
+    if model is not None:
         ERRORS_TOTAL.labels(provider=provider.name, model=model, status_code=str(status)).inc()
 
     return _error(status, f"Upstream backend '{provider.name}' is unavailable: {exc}", kind)
 
 
-async def _handle_non_stream(
-    request: Request, provider: Provider, path: str, body: bytes, body_str: str, model: str,
-    entry=None,
-) -> Response:
+def _outbound(request: Request, provider: Provider, path: str, body_str: str):
+    """The method, URL and headers of the request about to go upstream, logged as
+    a curl-like block when LOG_INPUT is on."""
+    method = request.method.upper()
     url = _build_url(provider, path)
     headers = _build_headers(provider, request)
-    method = request.method.upper()
-    pname = provider.name
-    # The name the client sent, for the log's `asked=` field. The in-flight entry
-    # already carries it, so nothing extra has to be threaded down here.
-    asked = entry.model if entry is not None else None
-    trimmed = entry.trimmed if entry is not None else None
-    route = entry.routed["by"] if entry is not None and entry.routed else None
-
     if conf.LOG_INPUT:
         _log_curl(method, url, headers, body_str)
+    return method, url, headers
 
-    start = time.time()
 
-    # Connection failures propagate as httpx.RequestError so the dispatcher can
-    # fail over to the next backend; the response is fully buffered here. The
-    # client is process-wide (see app/upstream.py) so the connection is reused —
-    # never close it here.
-    client = _client_for(provider)
-    async with client.stream(method, url, headers=headers, content=body) as resp:
-        # Read the raw, undecoded bytes so we control decompression ourselves
-        # (httpx cannot decode brotli/zstd without extra libs and would
-        # otherwise pass compressed bytes straight through).
-        raw = b"".join([chunk async for chunk in resp.aiter_raw()])
-        status_code = resp.status_code
-        is_error = resp.is_error
-        resp_headers = dict(resp.headers)
-        content_encoding = resp.headers.get("content-encoding", "")
+async def _read_body(resp: httpx.Response) -> str:
+    """A whole upstream body as text. Reads the raw, undecoded bytes so the
+    decompression is ours (see `_decompress`) rather than httpx's."""
+    raw = b"".join([chunk async for chunk in resp.aiter_raw()])
+    encoding = resp.headers.get("content-encoding", "")
+    return _decompress(raw, encoding).decode("utf-8", errors="replace")
 
-    duration = time.time() - start
 
-    resp_bytes = _decompress(raw, content_encoding)
-    resp_body = resp_bytes.decode("utf-8", errors="replace")
+def _buffered_response(
+    request: Request, provider: Provider, model: Optional[str], resp: httpx.Response,
+    resp_body: str, started: float, stream: bool, entry: inflight.Entry,
+) -> Response:
+    """Account for an upstream response that was read whole, and relay it: every
+    non-stream answer, and the error a streaming request got instead of a stream.
+
+    An upstream error keeps its real status and its body, verbatim, so the
+    backend's own explanation reaches the client.
+    """
+    duration = time.time() - started
+    status = resp.status_code
+    pname = provider.name
 
     usage = Usage()
     served = None
@@ -457,56 +447,208 @@ async def _handle_non_stream(
             served = data["model"]
     except ValueError:
         pass
-    if not is_error:
-        _apply_pricing(provider, model, usage, start)
 
-    if is_error:
-        _log_upstream_error(pname, model, status_code, resp_body)
-    elif conf.LOG_OUTPUT:
-        pretty_body = resp_body
-        try:
-            parsed = json.loads(resp_body)
-            pretty_body = json.dumps(parsed, indent=2, ensure_ascii=False)
-        except (json.JSONDecodeError, ValueError):
-            pass
-        logger.info(f"Response ({status_code}):\n{pretty_body}")
+    if resp.is_error:
+        _log_upstream_error(pname, model, status, resp_body)
+    else:
+        _apply_pricing(provider, model, usage, started)
+        if conf.LOG_OUTPUT:
+            logger.info(f"Response ({status}):\n{_pretty_json(resp_body)}")
 
-    if model != "unknown":
-        if is_error:
-            ERRORS_TOTAL.labels(provider=pname, model=model, status_code=str(status_code)).inc()
+    if model is not None:
+        if resp.is_error:
+            ERRORS_TOTAL.labels(provider=pname, model=model, status_code=str(status)).inc()
         else:
             _record_metrics(pname, model, usage, duration)
 
-    if entry is not None:
-        entry.record(status_code, usage, duration)
-        entry.add_response(resp_body)
+    entry.record(status, usage, duration)
+    entry.add_response(resp_body)
 
     return Response(
         content=resp_body,
-        status_code=status_code,
-        headers=_relay_headers(resp_headers),
+        status_code=status,
+        headers=_relay_headers(dict(resp.headers)),
         background=BackgroundTask(
-            _emit_request_log, request, pname, model, status_code,
-            usage, duration, False, asked, trimmed, served, route,
+            _emit_request_log, request, pname, model, status, usage, duration,
+            stream, entry, served,
         ),
     )
 
 
-async def _handle_stream(
-    request: Request, provider: Provider, path: str, body: bytes, body_str: str, model: str,
-    on_complete=None, entry=None,
-) -> Union[Response, StreamingResponse]:
-    url = _build_url(provider, path)
-    headers = _build_headers(provider, request)
-    method = request.method.upper()
-    pname = provider.name
-    # See _handle_non_stream: the client-facing name for the log's `asked=` field.
-    asked = entry.model if entry is not None else None
-    trimmed = entry.trimmed if entry is not None else None
-    route = entry.routed["by"] if entry is not None and entry.routed else None
+async def _handle_non_stream(
+    request: Request, provider: Provider, path: str, body: bytes, body_str: str,
+    model: Optional[str], entry: inflight.Entry,
+) -> Response:
+    method, url, headers = _outbound(request, provider, path, body_str)
+    start = time.time()
+    # Connection failures propagate as httpx.RequestError so the dispatcher can
+    # fail over to the next backend; the response is fully buffered here. The
+    # client is process-wide (see app/upstream.py) so the connection is reused —
+    # never close it here.
+    async with _client_for(provider).stream(method, url, headers=headers, content=body) as resp:
+        resp_body = await _read_body(resp)
+    return _buffered_response(request, provider, model, resp, resp_body, start, False, entry)
 
-    if conf.LOG_INPUT:
-        _log_curl(method, url, headers, body_str)
+
+def _delta_text(value) -> str:
+    """The text of one streamed delta field. A string on every OpenAI-style
+    backend; a list of content parts on a few, whose `text` fields are joined."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(
+            part["text"] for part in value
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        )
+    return ""
+
+
+class _StreamTally:
+    """What a streamed response said about itself, read off its SSE events as
+    they pass: the usage block, the model that answered, and the text.
+
+    Strictly an observer. The bytes have already gone to the client by the time
+    `feed` sees them, and nothing a backend sends may end the relay, so `feed`
+    never raises: an event it cannot read is skipped.
+    """
+
+    def __init__(self, model: Optional[str], entry: inflight.Entry, keep_text: bool):
+        self.usage = Usage()
+        # What the backend says ran: the id we sent, until an event names another.
+        self.model = model
+        self._entry = entry
+        self._buffer = ""
+        self._final_event = None  # the event that carried `usage`
+        # Kept only for LOG_OUTPUT; the In-flight row gets its text from `entry`.
+        self._text = [] if keep_text else None
+        self._reasoning = [] if keep_text else None
+
+    def feed(self, chunk: bytes) -> None:
+        self._buffer += chunk.decode("utf-8", errors="replace")
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                continue
+            self._entry.chunk()
+            try:
+                self._event(json.loads(payload))
+            except Exception:  # noqa: BLE001 - an event we cannot read is not the client's problem
+                pass
+
+    def _event(self, data) -> None:
+        if not isinstance(data, dict):
+            return
+        if isinstance(data.get("model"), str):
+            self.model = data["model"]
+        if data.get("usage"):
+            # Usually the final chunk; last one wins either way.
+            self.usage = parse_usage(data) or self.usage
+            self._final_event = data
+        choices = data.get("choices") or []
+        delta = (choices[0].get("delta") or {}) if choices else {}
+        content = _delta_text(delta.get("content"))
+        reasoning = _delta_text(delta.get("reasoning_content"))
+        if content or reasoning:
+            # One delta carrying text == one generation step. The only live
+            # token signal there is; see Entry.token.
+            self._entry.token()
+            self._entry.add_response(content)
+            self._entry.add_response(reasoning, reasoning=True)
+        if self._text is not None:
+            if content:
+                self._text.append(content)
+            if reasoning:
+                self._reasoning.append(reasoning)
+
+    def log_output(self, status: int) -> None:
+        """The LOG_OUTPUT record of a finished stream: its final event (or a
+        stand-in when no event carried usage) with the assembled text added."""
+        if self._text is None:
+            return
+        record = self._final_event or {
+            "model": self.model,
+            "usage": {"prompt_tokens": self.usage.prompt, "completion_tokens": self.usage.completion},
+        }
+        record["_assembled_content"] = "".join(self._text)
+        reasoning = "".join(self._reasoning)
+        if reasoning:
+            record["_reasoning_content"] = reasoning
+        logger.info(
+            f"Stream response ({status}):\n{json.dumps(record, indent=2, ensure_ascii=False)}"
+        )
+
+
+async def _relay_stream(
+    request: Request, provider: Provider, model: Optional[str], resp: httpx.Response,
+    started: float, entry: inflight.Entry, close,
+):
+    """The body of a streaming response: relay the upstream's bytes as they
+    arrive, and account for the request when the stream ends, however it ends.
+
+    `close` returns the upstream connection to the pool and releases the slot.
+    """
+    # Runs in Starlette's body task, not the request task — bind it so a kill
+    # cancels the generator rather than the disconnect listener above it.
+    entry.bind_stream()
+    tally = _StreamTally(model, entry, keep_text=conf.LOG_OUTPUT)
+    pname = provider.name
+    status = resp.status_code
+    error = False
+
+    try:
+        async for chunk in resp.aiter_bytes():
+            yield chunk
+            tally.feed(chunk)
+    except asyncio.CancelledError:
+        # Killed from the console. The 200 was committed with the first chunk,
+        # so there is no status code left to send the client — ending the SSE
+        # stream here is all a kill can mean. Returning instead of propagating
+        # keeps uvicorn from logging a deliberate operator action as an
+        # "Exception in ASGI application" traceback. `error` is set so the
+        # truncated generation isn't recorded as throughput metrics.
+        error = True
+        if not entry.cancelled:
+            # Shutdown, or the client vanished — not ours to swallow.
+            raise
+        logger.info(
+            f"Stream for request #{entry.id} cut after {entry.chunks} chunk(s) — cancelled"
+        )
+    except Exception as e:
+        error = True
+        logger.error(f"Stream error from '{pname}' (model: {model}): {type(e).__name__}: {e}")
+    finally:
+        # Bookkeeping first, and all of it sync, so none of it can be skipped
+        # by an await below raising. This is the stream's single close point
+        # for the in-flight entry: proxy_request hands it off to us, since the
+        # handler returns long before the body is done. record-then-finish, so
+        # the history row carries the outcome and not just "it ended".
+        duration = time.time() - started
+        usage = tally.usage
+        if not error:
+            _apply_pricing(provider, model, usage, started)
+        entry.record(status, usage, duration)
+        entry.finish()
+        await close()
+        if model is not None:
+            if error:
+                ERRORS_TOTAL.labels(provider=pname, model=model, status_code=str(status)).inc()
+            else:
+                _record_metrics(pname, model, usage, duration)
+        await _emit_request_log(
+            request, pname, model, status, usage, duration, True, entry, tally.model,
+        )
+        tally.log_output(status)
+
+
+async def _handle_stream(
+    request: Request, provider: Provider, path: str, body: bytes, body_str: str,
+    model: Optional[str], entry: inflight.Entry, on_complete=None,
+) -> Union[Response, StreamingResponse]:
+    method, url, headers = _outbound(request, provider, path, body_str)
 
     # Pre-flight the connection: a StreamingResponse commits its status code
     # before the body generator runs, so we must learn whether the backend is
@@ -520,9 +662,7 @@ async def _handle_stream(
     # spends all its time before the first byte — timing only the body read
     # would yield near-zero durations and absurd tokens/sec.
     start = time.time()
-    stream_cm = _client_for(provider).stream(
-        method, url, headers=headers, content=body
-    )
+    stream_cm = _client_for(provider).stream(method, url, headers=headers, content=body)
     # A failure here — RequestError (the dispatcher fails over on it) or
     # cancellation (an operator kill landing while we connect) — propagates
     # unchanged. There is nothing to clean up: __aenter__ raising means the
@@ -530,157 +670,29 @@ async def _handle_stream(
     # is process-wide, so closing it here would break every other request.
     resp = await stream_cm.__aenter__()
 
+    async def close():
+        # Closes the response and returns its connection to the shared pool —
+        # the client is process-wide, never aclose() it — then gives the slot
+        # back, even when closing the response raised.
+        try:
+            await stream_cm.__aexit__(None, None, None)
+        finally:
+            if on_complete is not None:
+                await on_complete()
+
     # Upstream rejected the request outright (4xx/5xx). A StreamingResponse
     # commits a 200 before its generator runs, which would bury the error in a
     # bogus SSE stream the client can't interpret. Buffer the (small) error
     # body instead and relay it verbatim with the upstream's real status.
     if resp.is_error:
         try:
-            raw = b"".join([chunk async for chunk in resp.aiter_raw()])
-            status_code = resp.status_code
-            resp_headers = dict(resp.headers)
-            content_encoding = resp.headers.get("content-encoding", "")
+            resp_body = await _read_body(resp)
         finally:
-            # Closes the response and returns its connection to the shared
-            # pool. The client is process-wide — never aclose() it here.
-            await stream_cm.__aexit__(None, None, None)
-            if on_complete is not None:
-                await on_complete()
-
-        resp_body = _decompress(raw, content_encoding).decode("utf-8", errors="replace")
-        if entry is not None:
-            entry.record(status_code)
-            entry.add_response(resp_body)
-        _log_upstream_error(pname, model, status_code, resp_body)
-        if model != "unknown":
-            ERRORS_TOTAL.labels(provider=pname, model=model, status_code=str(status_code)).inc()
-
-        return Response(
-            content=resp_body,
-            status_code=status_code,
-            headers=_relay_headers(resp_headers),
-            background=BackgroundTask(
-                _emit_request_log, request, pname, model, status_code, Usage(), 0.0,
-                True, asked, trimmed, None, route,
-            ),
-        )
-
-    async def generate():
-        # Runs in Starlette's body task, not the request task — bind it so a kill
-        # cancels the generator rather than the disconnect listener above it.
-        if entry is not None:
-            entry.bind_stream()
-        usage = Usage()
-        buffer = ""
-        delta_contents = [] if conf.LOG_OUTPUT else None
-        reasoning_contents = [] if conf.LOG_OUTPUT else None
-        final_chunk = None
-        resp_model = model
-        status_code = resp.status_code
-        error = resp.is_error
-
-        try:
-            async for chunk in resp.aiter_bytes():
-                yield chunk
-                text = chunk.decode("utf-8", errors="replace")
-                buffer += text
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
-                        continue
-                    if entry is not None:
-                        entry.chunk()
-                    try:
-                        data = json.loads(payload)
-                        resp_model = data.get("model", resp_model)
-                        if data.get("usage"):
-                            # Usually the final chunk; last one wins either way.
-                            usage = parse_usage(data) or usage
-                            final_chunk = data
-                        choices = data.get("choices") or []
-                        delta = choices[0].get("delta") or {} if choices else {}
-                        content = delta.get("content") or ""
-                        reasoning = delta.get("reasoning_content") or ""
-                        if entry is not None and (content or reasoning):
-                            # One delta carrying text == one generation step. The
-                            # only live token signal there is; see Entry.token.
-                            entry.token()
-                            entry.add_response(content)
-                            entry.add_response(reasoning, reasoning=True)
-                        if delta_contents is not None:
-                            if content:
-                                delta_contents.append(content)
-                            if reasoning:
-                                reasoning_contents.append(reasoning)
-                    except json.JSONDecodeError:
-                        pass
-        except asyncio.CancelledError:
-            # Killed from the console. The 200 was committed with the first chunk,
-            # so there is no status code left to send the client — ending the SSE
-            # stream here is all a kill can mean. Returning instead of propagating
-            # keeps uvicorn from logging a deliberate operator action as an
-            # "Exception in ASGI application" traceback. `error` stays True so the
-            # truncated generation isn't recorded as throughput metrics.
-            error = True
-            if entry is None or not entry.cancelled:
-                # Shutdown, or the client vanished — not ours to swallow.
-                raise
-            logger.info(
-                f"Stream for request #{entry.id} cut after {entry.chunks} chunk(s) — cancelled"
-            )
-        except Exception as e:
-            error = True
-            logger.error(f"Stream error from '{pname}' (model: {model}): {type(e).__name__}: {e}")
-        finally:
-            # Bookkeeping first, and all of it sync, so none of it can be skipped
-            # by an await below raising. This is the stream's single close point
-            # for the in-flight entry: proxy_request hands it off to us, since the
-            # handler returns long before the body is done. record-then-finish, so
-            # the history row carries the outcome and not just "it ended".
-            duration = time.time() - start
-            if not error:
-                _apply_pricing(provider, model, usage, start)
-            if entry is not None:
-                entry.record(status_code, usage, duration)
-                entry.finish()
-            # Closes the response and returns its connection to the shared
-            # pool. The client is process-wide — never aclose() it here.
-            await stream_cm.__aexit__(None, None, None)
-            if on_complete is not None:
-                await on_complete()
-            if model != "unknown":
-                if error:
-                    ERRORS_TOTAL.labels(provider=pname, model=model, status_code=str(status_code)).inc()
-                else:
-                    _record_metrics(pname, model, usage, duration)
-            await _emit_request_log(
-                request, pname, model, status_code, usage, duration,
-                True, asked, trimmed, resp_model, route,
-            )
-            if delta_contents is not None:
-                full_text = "".join(delta_contents)
-                reasoning_text = "".join(reasoning_contents) if reasoning_contents else ""
-                log_data = {}
-                if final_chunk:
-                    log_data = final_chunk
-                else:
-                    log_data = {
-                        "model": resp_model,
-                        "usage": {"prompt_tokens": usage.prompt, "completion_tokens": usage.completion},
-                    }
-                log_data["_assembled_content"] = full_text
-                if reasoning_text:
-                    log_data["_reasoning_content"] = reasoning_text
-                logger.info(
-                    f"Stream response ({status_code}):\n{json.dumps(log_data, indent=2, ensure_ascii=False)}"
-                )
+            await close()
+        return _buffered_response(request, provider, model, resp, resp_body, start, True, entry)
 
     return StreamingResponse(
-        generate(),
+        _relay_stream(request, provider, model, resp, start, entry, close),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -751,6 +763,41 @@ def _should_failover(status: int) -> bool:
     return conf.ROUTING.failover and status in conf.ROUTING.failover_statuses
 
 
+def _fail_over(target, others: list, why: str) -> None:
+    """Record that a request is leaving a backend that failed it for `others`:
+    the backend is skipped for `down_backoff`, and the move is counted and logged.
+
+    Only for a request that has somewhere else to go. One that does not is an
+    error the client receives, and is counted as that instead.
+    """
+    registry.mark_down(target.provider, conf.ROUTING.down_backoff)
+    FAILOVERS_TOTAL.labels(provider=target.provider).inc()
+    logger.warning(
+        f"Failover: '{target.provider}' {why}; "
+        f"{len(others)} target(s) left for model '{target.model}'"
+    )
+
+
+def _release_once(target):
+    """The release of one acquired slot, as a coroutine function that is safe to
+    call more than once.
+
+    A slot has several possible releasers: the dispatcher, the stream that outlives
+    it, and the error paths of both. An error raised after the stream handler has
+    already given the slot back must not release it a second time, which would
+    free a slot some other request is holding.
+    """
+    released = False
+
+    async def release():
+        nonlocal released
+        if not released:
+            released = True
+            await slots.release(target.provider, target.model)
+
+    return release
+
+
 async def _dispatch(
     request: Request, path: str, payload: dict, is_stream: bool, targets: list, entry
 ) -> Union[Response, StreamingResponse]:
@@ -758,13 +805,12 @@ async def _dispatch(
     the next-priority target when a backend errors out (when failover is enabled).
 
     Failover fires on a connection-level `httpx.RequestError` *and* on a retryable
-    upstream HTTP status (`Routing.failover_statuses`, e.g. 503). Once targets are
-    exhausted the client gets the last upstream error verbatim — its real status
-    and body, not a synthetic 502 — so the reason for the failure survives.
+    upstream HTTP status (`Routing.failover_statuses`, e.g. 503), and only while
+    another target remains. The last target's failure is what the client gets: an
+    upstream error verbatim — its real status and body, not a synthetic 502 — so
+    the reason survives, or a 502/504 when the backend could not be reached.
     """
     remaining = list(targets)
-    last_provider = None
-    last_exc = None
 
     while remaining:
         # Mark queued *before* acquiring: for a request that has to wait, this is
@@ -781,60 +827,57 @@ async def _dispatch(
                 503, "No backend slot available (queue timeout)", "slot_timeout"
             )
 
+        release = _release_once(target)
+        others = [t for t in remaining if t.provider != target.provider]
         provider = conf.PROVIDERS_BY_NAME.get(target.provider)
         if provider is None:
             # The config hot-reloaded away this provider between resolution and
-            # admission — now genuinely possible, since the console can delete a
+            # admission — genuinely possible, since the console can delete a
             # backend while a request is queued for it. Give the slot back and
             # move on rather than raising a KeyError into the client.
-            await slots.release(target.provider, target.model)
-            remaining = [t for t in remaining if t.provider != target.provider]
+            await release()
+            remaining = others
             logger.warning(
                 "Provider '%s' disappeared from the config while a request was "
                 "queued for it; %d target(s) left for model '%s'",
                 target.provider, len(remaining), target.model,
             )
             continue
-        last_provider = provider
         entry.run(target.provider, target.model)
-        body, body_str = _build_body(payload, provider, target.model)
 
         try:
+            body, body_str = _build_body(payload, provider, target.model)
             if is_stream:
-                async def _release(p=target.provider, m=target.model):
-                    await slots.release(p, m)
-
-                # Slot is released by the generator's finally once streaming ends,
-                # or — on a pre-first-byte error — via on_complete inside the handler.
+                # Slot is released by the stream's own close once it ends, or — on
+                # a pre-first-byte error — via on_complete inside the handler.
                 resp = await _handle_stream(
-                    request, provider, path, body, body_str, target.model,
-                    on_complete=_release, entry=entry,
+                    request, provider, path, body, body_str, target.model, entry,
+                    on_complete=release,
                 )
             else:
                 resp = await _handle_non_stream(
-                    request, provider, path, body, body_str, target.model, entry=entry
+                    request, provider, path, body, body_str, target.model, entry
                 )
-                await slots.release(target.provider, target.model)
-        except asyncio.CancelledError:
-            # An operator kill (or a client disconnect) while we were forwarding.
-            # Nothing has released the slot on this path: the non-stream branch
-            # never reached its release, and for a stream the generator that owns
-            # the release never ran. Release here, then keep unwinding.
-            await slots.release(target.provider, target.model)
-            raise
+                await release()
         except httpx.RequestError as e:
-            await slots.release(target.provider, target.model)
-            last_exc = e
-            if not conf.ROUTING.failover:
-                return _backend_error(provider, target.model, e)
-            registry.mark_down(target.provider, conf.ROUTING.down_backoff)
-            FAILOVERS_TOTAL.labels(provider=target.provider).inc()
-            remaining = [t for t in remaining if t.provider != target.provider]
-            logger.warning(
-                f"Failover: '{target.provider}' failed ({type(e).__name__}); "
-                f"{len(remaining)} target(s) left for model '{target.model}'"
-            )
-            continue
+            await release()
+            if conf.ROUTING.failover and others:
+                _fail_over(target, others, f"failed ({type(e).__name__})")
+                remaining = others
+                continue
+            # Nowhere else to go, so this failure is the client's answer. The
+            # backend is still marked down: the next request for a model it
+            # shares with others should not walk into the same wall.
+            if conf.ROUTING.failover:
+                registry.mark_down(target.provider, conf.ROUTING.down_backoff)
+            return _backend_error(provider, target.model, e)
+        except BaseException:
+            # An operator kill or a client disconnect while we were forwarding
+            # (CancelledError), or a bug. Whatever it is, the slot goes back
+            # before it unwinds: the non-stream branch never reached its release,
+            # and a stream that never started has no generator to do it.
+            await release()
+            raise
 
         if resp.status_code == 402:
             # Payment required: the backend's balance ran out between two reads. The
@@ -844,17 +887,10 @@ async def _dispatch(
         # The backend answered with a retryable error status (the connection was
         # fine, the response wasn't). Try the next target if any remain; otherwise
         # fall through and relay this error to the client verbatim.
-        if _should_failover(resp.status_code):
-            others = [t for t in remaining if t.provider != target.provider]
-            if others:
-                registry.mark_down(target.provider, conf.ROUTING.down_backoff)
-                FAILOVERS_TOTAL.labels(provider=target.provider).inc()
-                remaining = others
-                logger.warning(
-                    f"Failover: '{target.provider}' returned {resp.status_code}; "
-                    f"{len(others)} target(s) left for model '{target.model}'"
-                )
-                continue
+        if _should_failover(resp.status_code) and others:
+            _fail_over(target, others, f"returned {resp.status_code}")
+            remaining = others
+            continue
 
         # A genuinely good response clears any down-mark; an error we're relaying
         # (terminal, no targets left) must not — the backend is still unhealthy.
@@ -862,10 +898,13 @@ async def _dispatch(
             registry.clear_down(target.provider)
         return resp
 
-    # Every candidate failed with a connection error.
-    if last_exc is None:
-        last_exc = httpx.ConnectError("no backends available")
-    return _backend_error(last_provider, "unknown", last_exc)
+    # Only reachable when every candidate's provider left the config while this
+    # request waited for it: there is no backend to name, and no upstream answer
+    # to relay.
+    return _error(
+        502, "No backend is left to serve this request (its provider was removed "
+        "from the configuration)", "upstream_unavailable",
+    )
 
 
 def _cancelled_response() -> Response:
@@ -884,12 +923,11 @@ def _model_not_found(model: str, request: Request) -> Response:
     question is always *who* asked for a name the proxy doesn't have — a typo, a
     stale client-side model list, or a backend that dropped out of discovery.
     """
-    ip = clientinfo.client_ip(request)
-    ua = (request.headers.get("user-agent") or "").strip() or None
     logger.warning(
         "Model '%s' is not available — no backend serves it (client %s, svc %s). "
         "Returning 404 rather than guessing a backend.",
-        model, ip, clientinfo.service_from_ua(ua),
+        model, clientinfo.client_ip(request),
+        clientinfo.service_from_ua(clientinfo.user_agent(request)),
     )
     return _error(
         404,
@@ -914,37 +952,36 @@ async def proxy_request(request: Request, path: str) -> Union[Response, Streamin
 
     The in-flight entry is closed here for anything that returns a finished
     response. A `StreamingResponse` is the one exception: it is still in flight
-    when we return it, so `_handle_stream`'s generator closes the entry in its
-    `finally` — the same place the slot is released.
+    when we return it, so `_relay_stream` closes the entry in its `finally` — the
+    same place the slot is released.
     """
     body = await request.body()
     body_str = body.decode("utf-8", errors="replace")
 
     payload = None
-    raw_model = None
+    model = None
     is_stream = False
     try:
         payload = json.loads(body_str)
-        raw_model = payload.get("model")
-        is_stream = payload.get("stream", False)
+        model = payload.get("model") or None
+        is_stream = bool(payload.get("stream", False))
     except (json.JSONDecodeError, AttributeError):
         # Not a JSON object (or not JSON at all): treated as a passthrough below.
         payload = None
 
-    ua = (request.headers.get("user-agent") or "").strip() or None
     entry = inflight.begin(
-        model=raw_model or None,
-        stream=bool(is_stream),
-        op=_op_kind(request.url.path, raw_model or ""),
+        model=model,
+        stream=is_stream,
+        op=_op_kind(request.url.path, model or ""),
         method=request.method,
         path=request.url.path,
         req_bytes=len(body),
         client_ip=clientinfo.client_ip(request),
-        svc=clientinfo.service_from_ua(ua),
+        svc=clientinfo.service_from_ua(clientinfo.user_agent(request)),
     )
     entry.set_request(body_str)
     try:
-        resp = await _route(request, path, body, body_str, payload, entry)
+        resp = await _route(request, path, body, body_str, payload, model, is_stream, entry)
     except asyncio.CancelledError:
         entry.finish()
         if not entry.cancelled:
@@ -968,63 +1005,65 @@ async def proxy_request(request: Request, path: str) -> Union[Response, Streamin
     return resp
 
 
-async def _route(
-    request: Request, path: str, body: bytes, body_str: str, payload, entry
+async def _passthrough(
+    request: Request, path: str, body: bytes, body_str: str, is_stream: bool,
+    authorized: bool, entry,
 ) -> Union[Response, StreamingResponse]:
-    """Resolve the model, apply the auth gate and dispatch. `payload` is the
-    already-parsed JSON body (a dict, or None for a non-JSON passthrough)."""
+    """Forward a request that names no model (not a chat body, nothing to
+    resolve) untouched, with no slot and no failover.
+
+    It goes to the first backend the caller is *permitted* to use, not the first
+    configured one: picking `PROVIDERS[0]` blindly gave an unauthenticated caller
+    "Authentication required" whenever the config happened to list a paid backend
+    first — a 401 about a backend they never chose. HTTP backends only: an
+    arbitrary path is forwarded as it came, and the CLI answers nothing but chat
+    completions.
+    """
+    provider = next(
+        (
+            p for p in conf.PROVIDERS
+            if (authorized or not p.require_permission) and p.kind == conf.KIND_HTTP
+        ),
+        None,
+    )
+    if provider is None:
+        return _unauthorized("")
+    # No slot is taken on this path, so it is never queued — running from the
+    # moment it is forwarded.
+    entry.run(provider.name, None)
+    handler = _handle_stream if is_stream else _handle_non_stream
+    try:
+        return await handler(request, provider, path, body, body_str, None, entry)
+    except httpx.RequestError as e:
+        return _backend_error(provider, None, e)
+
+
+async def _route(
+    request: Request, path: str, body: bytes, body_str: str, payload,
+    model: Optional[str], is_stream: bool, entry,
+) -> Union[Response, StreamingResponse]:
+    """Resolve the model, apply the auth gate, pick the order and dispatch.
+    `payload` is the already-parsed JSON body (None for a non-JSON passthrough)
+    and `model` the name it asked for (None when it names none)."""
+    if not conf.PROVIDERS:
+        return _error(503, "No providers configured", "no_providers")
     authorized = auth.is_authorized(request)
-    raw_model = payload.get("model") if payload is not None else None
-    is_stream = payload.get("stream", False) if payload is not None else False
+    if not model:
+        return await _passthrough(request, path, body, body_str, is_stream, authorized, entry)
 
-    # No JSON model (e.g. non-chat passthrough): forward to the first provider
-    # the caller is actually allowed to use, untouched and without slot gating.
-    # First *permitted*, not first configured: picking PROVIDERS[0] blindly meant
-    # an unauthenticated caller got "Authentication required" whenever the config
-    # happened to list a paid backend first — another 401 about a backend they
-    # never chose. HTTP backends only: a passthrough forwards an arbitrary path
-    # untouched, and the CLI answers nothing but chat completions.
-    if not raw_model:
-        if not conf.PROVIDERS:
-            return Response(content="No providers configured", status_code=503)
-        provider = next(
-            (
-                p for p in conf.PROVIDERS
-                if (authorized or not p.require_permission) and p.kind == conf.KIND_HTTP
-            ),
-            None,
-        )
-        if provider is None:
-            return _unauthorized("")
-        # No slot is taken on this path, so it is never queued — running from the
-        # moment it is forwarded.
-        entry.run(provider.name, None)
-        try:
-            if is_stream:
-                return await _handle_stream(
-                    request, provider, path, body, body_str, "unknown", entry=entry
-                )
-            return await _handle_non_stream(
-                request, provider, path, body, body_str, "unknown", entry=entry
-            )
-        except httpx.RequestError as e:
-            return _backend_error(provider, "unknown", e)
-
-    targets = await router.resolve(raw_model)
+    # Nothing serves this model: say so — never fall back to an arbitrary
+    # backend, which is how a local-model request used to surface as a 401
+    # from a paid one.
+    targets = await router.resolve(model)
     if not targets:
-        if not conf.PROVIDERS:
-            return Response(content="No providers configured", status_code=503)
-        # Nothing serves this model. Say so — never fall back to an arbitrary
-        # backend, which is how a local-model request used to surface as a 401
-        # from a paid one.
-        return _model_not_found(raw_model, request)
+        return _model_not_found(model, request)
 
     # Gate: unauthenticated callers can only reach open backends. If the model
     # lives solely behind permission-required backends, reject with 401.
     if not authorized:
         targets = [t for t in targets if not auth.restricted(t.provider)]
         if not targets:
-            return _unauthorized(raw_model)
+            return _unauthorized(model)
 
     # Prefer backends that are up and have money, but keep the rest as a last resort: a
     # backend marked down may have recovered, and a balance is only as fresh as the last
@@ -1037,7 +1076,7 @@ async def _route(
     # the operator's `first`/`last` overrides, always. A reorder of the candidates
     # already chosen above — it cannot add a backend the gate or the resolver
     # left out — and a no-op unless one of those is in force.
-    candidates, routed = smart.order(candidates, raw_model)
+    candidates, routed = smart.order(candidates, model)
     if routed is not None:
         entry.mark_routed(routed)
 
@@ -1047,7 +1086,7 @@ async def _route(
     # In a thread: tokenizing an agent's whole history takes tens of ms (more on
     # the first, which loads the tokenizer), and the single event loop is
     # relaying every other stream meanwhile. The tokenizer runs without the GIL.
-    trimmed = await asyncio.to_thread(trim.trim_request, payload, body_str, raw_model, entry.id)
+    trimmed = await asyncio.to_thread(trim.trim_request, payload, body_str, model, entry.id)
     if trimmed is not None:
         payload = trimmed.payload
         entry.mark_trimmed(trimmed.as_dict())
