@@ -1,380 +1,371 @@
 # LLM Proxy
 
-OpenAI-compatible reverse proxy for **multiple LLM backends**, with **priority-based
-load balancing**, per-backend **concurrency limits (slots)**, automatic **failover**,
-a bearer-key **permission gate**, **Prometheus metrics**, **token counting**, and
-**structured logging**.
-
-Drop it between your LLM clients (Open WebUI, OpenCode, LangChain, any OpenAI SDK, …)
-and any number of upstream backends (DeepSeek, Ollama hosts, OpenRouter, …). Clients
-request a **clean model name** — the proxy decides *which* backend actually serves it.
+An OpenAI-compatible reverse proxy for **several LLM backends**. Put it between your
+clients (Open WebUI, OpenCode, LangChain, any OpenAI SDK) and any number of upstreams
+(DeepSeek, OpenRouter, NanoGPT, Google, Ollama hosts). Clients ask for a clean model
+name and the proxy decides which backend serves it.
 
 ## Highlights
 
-- **Transparent routing** — clients use a plain model name (`deepseek-v4-flash`,
-  `local.qwen-medium:low`); no need to know which server runs it.
-- **Priority + slots** — prefer your fast/cheap backend, cap concurrency per backend,
-  and **queue** requests when every candidate is busy.
-- **Swap-aware queueing** — when a local backend frees up, the queue prefers a request
-  for the model it *already has loaded*, so it isn't made to swap out a model it is
-  about to need again.
-- **Failover** — if a backend errors, the request retries the next one; offline
-  backends drop out of the model list and are skipped.
-- **Smart routing** — an optional switch that tries a model's backends cheapest-first,
-  ranked by what each has actually charged (from the cost ledger), plus a per-backend
-  override to force one first or last when it is giving you trouble.
-- **In-flight visibility** — the console's In-flight tab lists every request currently
-  running or queued, what each one is waiting on, and how long it has waited.
-- **Cost tracking** — the price each backend reports (`usage.cost`, as OpenRouter and
-  NanoGPT send it), or a list price from a per-provider `pricing:` table for backends
-  that report none (DeepSeek), and its prompt-cache hits are recorded per request in a
-  small SQLite ledger that survives restarts; the console's Costs tab breaks it down by
-  model, by day and by request.
-- **Permission gate** — mark paid backends `require_permission: true`; only callers
-  with a valid `Authorization: Bearer` key see or use them.
-- **OpenRouter provider routing** — pin which upstream OpenRouter uses (e.g. force
-  DeepSeek-official instead of whatever's cheapest).
-- **Claude on your subscription** — a `kind: claude-cli` backend runs the official
-  Claude Code CLI headless inside the container, so Claude routes like any other
-  backend and draws from your Claude plan instead of an API key.
-- **Response decompression** — transparently decodes gzip/deflate/brotli upstream
-  bodies that a client couldn't otherwise read.
-
-## Architecture
+- **Transparent routing.** Clients use a plain model name (`deepseek-v4-flash`,
+  `local.qwen-medium:low`) and never need to know which server runs it.
+- **Priority and slots.** Prefer one backend over another, cap concurrency per backend,
+  and queue requests when every candidate is busy.
+- **Swap-aware queueing.** When a local backend frees up, the queue prefers a request
+  for the model it already has loaded, so it is not made to swap out a model it is about
+  to need again.
+- **Failover.** A backend that errors or cannot be reached is skipped and the request
+  moves to the next one.
+- **Smart routing.** An optional switch that tries a model's backends cheapest-first,
+  priced from subscription quota, published rates and observed cost, plus a per-backend
+  override to force one first or last.
+- **Cost tracking.** What each request cost, by model, backend and day, in a small
+  SQLite ledger that survives restarts.
+- **Balance and quota awareness.** Reads each vendor's balance and subscription
+  allowance, skips an account that is empty, and can warn you on ntfy.
+- **Context guardrail.** Shrinks a chat that cannot fit the context size its client
+  declared, instead of forwarding it to a paid backend.
+- **Permission gate.** Paid backends sit behind a bearer key; open backends work for
+  everyone.
+- **Claude on your subscription.** A `kind: claude-cli` backend runs the official Claude
+  Code CLI headless, so Claude routes like any other backend.
+- **Web console.** Live logs, in-flight requests with a Kill button, costs, routing and
+  a config editor, at `/ui/`.
+- **Observability.** Prometheus metrics and one logfmt line per request.
 
 ```
-Your App (OpenAI client)
+Your app (OpenAI client)
        │  POST /v1/chat/completions   { "model": "deepseek-v4-flash" }
        ▼
 ┌──────────────────────────────────────────────┐
-│                  llm-proxy                     │
-│  resolve model → ordered targets               │
-│  auth gate → slot acquire (priority+queue)     │
-│  forward → failover on error → decompress      │
-│  log tokens · export metrics                   │
-└───┬─────────────┬──────────────┬───────────────┘
+│                  llm-proxy                   │
+│  resolve model → ordered targets             │
+│  auth gate → slot acquire (priority + queue) │
+│  forward → fail over on error                │
+│  log tokens and cost · export metrics        │
+└───┬─────────────┬──────────────┬─────────────┘
     ▼             ▼              ▼
  OpenRouter    DeepSeek     Ollama hosts        (any backend in config.yaml)
- (10 slots)    (10 slots)   (1 slot each, citrine preferred over gw)
 ```
+
+## Quick start
+
+```bash
+cp config.example.yaml config.yaml   # backends, slots, priorities, keys
+# set PROXY_API_KEYS in docker-compose.yml
+docker compose up -d
+```
+
+The bundled compose publishes the proxy on host port **9999**. Point any OpenAI client
+at `http://<host>:9999/v1` and request a model by its clean name. Send
+`Authorization: Bearer <key>` to reach gated backends. The console is at
+`http://<host>:9999/ui/`.
+
+The examples below use port 8000, the port the proxy listens on inside the container.
 
 ## How routing works
 
-A client sends a **canonical model name** — a clean, provider-agnostic id. Native
-(provider-specific) ids never leak to clients. The proxy resolves the canonical name to
-an ordered list of **targets** (a real native model on a real backend), then admits the
-request to the highest-priority target that has a free slot.
+### Names: canonical and native
 
-Two layers turn native ids into canonical names: a backend's `model_map` (per-provider
-native↔canonical dictionary) and the `models:` block (cross-provider routing table). They
-compose — the logical model picks the backends and order; each backend's `model_map`
-supplies the native id. See [Canonical names](#canonical-names).
+A **canonical name** is what clients send (`deepseek-v4-pro`). A **native id** is what
+one backend calls that model on the wire (`deepseek/deepseek-v4-pro-0813:thinking` on
+NanoGPT, `deepseek/deepseek-v4-pro-0813` on OpenRouter). Clients only ever see and send
+canonical names.
 
-**Resolution order:**
-1. **Alias** — a global short name → `provider:canonical` (e.g. `chat` → `deepseek:deepseek-v4-pro`).
-2. **Explicit `provider:model`** — forces one backend (the model part is canonical, rewritten to native).
-3. **Logical model** — a `models:` entry mapping one canonical name to several prioritized targets.
-4. **Auto-group** — the same canonical name served by multiple backends is load-balanced
-   automatically, ordered by each backend's `priority` (no config needed).
-5. **Allow-listed backend** — a backend whose `enabled_models` names it explicitly.
+Two config layers produce canonical names, and they compose without overlap:
 
-If none of those match, the request gets a **404 `model_not_found`** — the proxy never
-picks a backend on the client's behalf:
+- **`model_map`** (per provider) translates between native and canonical for one
+  backend. It is keyed by the native id and must be one-to-one: two native ids sharing
+  a canonical name would make one of them unreachable.
+- **`models:`** (global) is the routing table: one canonical name in front of several
+  prioritized targets. A target's native id is its explicit `model:`, or, when omitted,
+  inherited from that provider's `model_map`.
+
+`models:` decides which backends serve a name and in what order. `model_map` decides
+what each backend calls it.
+
+```yaml
+providers:
+  - name: nanoGPT
+    model_map:
+      "deepseek/deepseek-v4-pro-0813:thinking": deepseek-v4-pro
+      "qwen3.8-max:thinking": qwen-max
+```
+
+### Resolution order
+
+1. **Alias**: a global short name that expands to `provider:canonical` (`chat` →
+   `deepseek:deepseek-v4-pro`).
+2. **Explicit `provider:model`**: forces one backend. The model part is canonical and is
+   rewritten to that backend's native id.
+3. **Logical model**: a `models:` entry.
+4. **Auto-group**: the same canonical name served by several backends is load-balanced
+   with no config, ordered by each backend's `priority`. With `auto_group: false`, the
+   first backend whose `enabled_models` lists the model is used instead.
+
+If nothing matches, the request gets a **404 `model_not_found`**. The proxy never picks
+a backend on the client's behalf: a wrong backend produces an error (typically a 401
+about a model the caller never asked for) that cannot be diagnosed from the client side.
 
 ```json
 {"error": {"message": "The model 'x' does not exist or is not available on this proxy",
            "type": "invalid_request_error", "param": "model", "code": "model_not_found"}}
 ```
 
-> **This used to be a last-resort guess** — an unresolved name was sent to whichever
-> backend was listed *first* in the config. That looked like graceful degradation and was
-> a trap. If the first backend is `require_permission`, a caller with no key asking for a
-> **free local model** got `401 Model 'x' requires authentication` — an auth error about a
-> backend they never chose and cannot see. It happened in production, intermittently,
-> whenever live discovery blipped (see below), and was unexplainable from the client side.
-> A model nothing is known to serve now says exactly that.
+### Slots, priority and queueing
 
-### Slots, priority & queueing
+Each backend declares `slots` (the maximum number of in-flight requests, shared across
+all its models) and `priority` (lower is preferred). A request takes a slot from the
+highest-priority candidate that has one free. When several candidates tie on priority,
+it round-robins across the tied backends that have a free slot. If all candidates are
+full it waits, indefinitely by default or up to `routing.queue_timeout`.
 
-Each backend declares `slots` (max concurrent in-flight requests, shared across all its
-models) and `priority` (lower = preferred). When a request arrives the proxy takes a
-slot from the **highest-priority candidate that has one free**. When several candidates
-**tie on priority**, it round-robins across the tied backends that have a free slot, so
-equal-priority backends share load evenly. If all candidates are full it **waits**
-(indefinitely by default, or up to `routing.queue_timeout`) for the first slot to free.
+> `glm-4.7-flash` runs on `ollamaCitrine` (priority 1) and `ollamaGW` (priority 2).
+> Citrine is preferred until full, then gw; if both are full the request waits. Two
+> backends at the same priority would alternate per request.
 
-> Example: `glm-4.7-flash` runs on `ollamaCitrine` (fast, priority 1) and `ollamaGW`
-> (slow, priority 2). Citrine is preferred until full, then gw; if both are full the
-> request waits. Two backends at the *same* priority would instead alternate per request.
+A released slot is handed directly to a waiting request in the same step as the release,
+so a newly arrived request cannot jump the queue.
 
-A released slot is handed **directly** to a chosen waiter, in the same step as the
-release — it is never observable as free while somebody is queued for it, so a newly
-arrived request cannot barge past the queue.
+### Model affinity: the queue reorders to avoid swaps
 
-#### Model affinity: the queue reorders to avoid swaps
+Local backends (llama-swap, Ollama) hold one model in memory and swap on demand, and a
+swap usually costs more than the request itself. Strict FIFO provokes the worst case.
+Take a single-slot backend serving `modelA` and `modelB`:
 
-Local backends (llama-swap, ollama) hold one model resident and swap on demand, and a
-swap costs seconds of load time — usually far more than the request itself. Strict FIFO
-provokes the worst case. Take a single-slot `citrine` serving `modelA` and `modelB`:
-
-| | queue order served | backend model loads |
+| | queue order served | model loads |
 |---|---|---|
-| FIFO | `modelA` running → `modelB`, `modelA` | **3** — swap B in, swap A back |
-| Affinity | `modelA` running → `modelA`, `modelB` | **2** — A stays, B swaps in once |
+| FIFO | `modelA` running → `modelB`, `modelA` | **3**: swap B in, swap A back |
+| Affinity | `modelA` running → `modelA`, `modelB` | **2**: A stays, B swaps in once |
 
-So when capacity frees, admission prefers a waiter whose model that backend **already has
-resident** — running there now, or the one it just finished — over one that would force a
-swap. Measured on a synthetic backend with a 3s swap and 1s generation, that exact
-three-request scenario ran in **9.0s instead of 12.0s**, and the second `modelA` request
-finished in 3.6s instead of 10.6s. The trade is real and worth stating: `modelB` waited
-about a second longer.
+So when a slot frees, admission prefers a waiting request whose model that backend
+already has loaded. This only reorders waiting requests. It never changes which backends
+a request may use and never holds a slot idle hoping for a better match.
 
-This only reorders *waiting* requests. It never changes which backends a request may use,
-and never holds a slot idle hoping for a better match — a lone non-matching waiter is
-admitted immediately.
+Starvation is bounded: a request passed over `routing.affinity_max_skips` times
+(default 3) is admitted next regardless of what is loaded. `affinity_max_skips: 0` or
+`queue_affinity: false` gives strict FIFO.
 
-**Starvation is bounded.** A waiter passed over `routing.affinity_max_skips` times (default
-`3`) is admitted next regardless of what is loaded, so a steady stream of `modelA` cannot
-starve `modelB` indefinitely. Set `affinity_max_skips: 0` or `queue_affinity: false` for
-strict FIFO.
-
-Watch it work: `llm_proxy_queue_affinity_grants_total` counts reorderings and
-`llm_proxy_queue_starvation_yields_total` counts times the cap had to intervene (a
-consistently high ratio of yields means the cap is too tight for your traffic). The
-In-flight tab marks a passed-over row `passed over N×` and shows each backend's resident
-model on its chip.
-
-**In Grafana:** import [`grafana-queue-dashboard.json`](grafana-queue-dashboard.json)
-(Dashboards → New → Import → paste the JSON, then pick your Prometheus datasource). Or
-query it directly:
+`llm_proxy_queue_affinity_grants_total` counts reorderings and
+`llm_proxy_queue_starvation_yields_total` counts the times the cap stepped in. The
+In-flight tab marks a passed-over row `passed over N×` and shows each backend's loaded
+model. For Grafana, import [`grafana-queue-dashboard.json`](grafana-queue-dashboard.json)
+or query directly:
 
 ```promql
 # model loads avoided over the dashboard range
 sum(increase(llm_proxy_queue_affinity_grants_total[$__range])) or vector(0)
 
-# reorderings per minute, per backend
-sum by (provider) (rate(llm_proxy_queue_affinity_grants_total[$__rate_interval])) * 60
-
 # how often the starvation cap has to step in
 sum(increase(llm_proxy_queue_starvation_yields_total[$__range])) or vector(0)
 ```
 
-The `or vector(0)` is not decoration: a labelled Prometheus counter does not exist until
-its first increment, so a panel for a cap that has never fired reads **No data** rather
-than zero — which looks like a broken dashboard. Note also that a counter's first ever
-sample cannot be an `increase()`, so a freshly created series shows 0 until it moves
-again.
+Keep the `or vector(0)`: a labelled counter does not exist until its first increment, so
+a panel for a cap that has never fired reads "No data" instead of zero.
 
 ### Failover
 
-If a chosen backend errors the proxy releases the slot, marks the backend down for
-`routing.down_backoff` seconds, and retries the next-priority target. "Errors" means both
-a connection-level failure (connection refused, timeout, …) **and** an upstream HTTP
-response whose status is in `routing.failover_statuses` (default `402, 429, 500, 502,
-503, 504`) — a backend that answers `503 Service Unavailable` is failed over just like one
-that's unreachable. Deliberate 4xx (bad request, auth) are relayed to the client as-is,
-since every backend would reject them identically. Once **all** candidates fail, the
-client gets the last upstream error verbatim (its real status and body), not a synthetic
-502. Streaming requests can fail over up to the first byte (after that the HTTP status is
-already committed).
+When the chosen backend fails, the proxy releases the slot, marks the backend down for
+`routing.down_backoff` seconds, and tries the next target. A failure is either:
 
-### Rates, quota and balances
+- a **connection-level error** (refused, timed out, reset), or
+- an upstream response whose status is in `routing.failover_statuses` (default
+  `402, 429, 500, 502, 503, 504`).
 
-Smart routing needs to know what each backend charges *now*, and the people who know are the
-vendors. A background task (`app/rates.py`) reads, per backend whose vendor it recognises:
+Other 4xx responses (bad request, auth) are relayed as they are, since every backend
+would reject them the same way. When all candidates have failed, the client gets the
+last upstream error verbatim, with its real status and body. A streaming request can
+fail over until the first byte; after that the HTTP status is already committed.
 
-| every | what | from |
+A backend marked down is skipped while another candidate is up, and is tried again when
+it is the only one left.
+
+Errors the proxy generates itself use the OpenAI error shape:
+
+| Status | `error.type` | When |
 |---|---|---|
-| hour | the vendor's price list, filtered to the models you use, and which models a subscription covers | OpenRouter `/models`, NanoGPT `/api/v1/models?detailed=true` |
-| 2 minutes, 30 seconds past 95% used | subscription allowance left and its reset time | NanoGPT `/api/subscription/v1/usage` |
-| 2 minutes | account balance | OpenRouter `/credits`, NanoGPT `/api/check-balance`, DeepSeek `/user/balance` |
-
-The vendor is worked out from the host of `base_url` (`openrouter.ai`, `nano-gpt.com`,
-`api.deepseek.com`); set `vendor:` on a provider only to name one explicitly. DeepSeek
-publishes no rate API, so its prices stay in the [`pricing:` table](#price-tables), which also
-wins over a fetched catalog for any model it lists. Units differ per vendor and are converted
-to USD per million tokens; every endpoint, field and unit is written down in
-[`docs/providers/`](docs/providers/README.md).
-
-A vendor that fails leaves its last good data and logs one warning per window, so an outage
-can age the numbers but never empty them or fail a request. The Costs tab shows each
-backend's balance and allowance meter, and `GET /admin/accounts` returns the same.
-
-NanoGPT's allowance counts **input tokens only, cached input included**. It counts as left only
-while at least 1% of it remains (600K of 60M, more than any single request): a request that does
-not fit is billed and not counted, so the counter can stop a few hundred tokens short of the limit
-and stay there until the reset. Nano's own `recommendedMode` verdict keeps saying
-`subscription` for a while after the allowance is gone and requests are already being billed, so
-it can veto but never grant. The allowance covers only some models: one outside the subscription bills the balance even while allowance remains, which is
-why the covered list is read too.
-
-### Empty balances and warnings
-
-A prepaid backend that runs dry used to hand your client its raw `402 Insufficient Balance`.
-Now:
-
-- **Skipped while another can serve.** A backend whose balance was last read as empty (a cent or
-  less, with no subscription allowance left to pay for it) is moved to the end of the line, like
-  one marked down. If every backend looks empty the request is still tried, because a balance is
-  only as fresh as the last read (every couple of minutes).
-- **A 402 fails over.** `402` is in the default `failover_statuses`, so when an account empties
-  *between* two reads the request moves to the next backend instead of reaching your client, and
-  the last backend's 402 is relayed verbatim if nothing else can serve it.
-- **The Costs tab says so.** An account tile turns amber under the warning level and red when
-  empty.
-
-Set `notify:` in the config and the proxy also **warns you on ntfy**: a balance under its
-threshold (`low_balance`, default $1, per backend with `low_balance_by`), a balance empty, a
-subscription allowance used up (and what happens next), a payment refused on a live request, and
-a recovery message when you top up. One message when a condition *becomes* true, a reminder every
-`reminder_hours` (12) while it stays true. A restart does not re-announce what is already true,
-a message that ntfy did not accept is retried on the next check rather than lost, and nothing in
-it can fail or slow a request. Off until `notify.ntfy` is set; inside the docker network the topic
-is `http://ntfy:80/<topic>`, and `notify.token` is sent as a Bearer token for a server with auth.
-
-### Moving a conversation between backends
-
-Smart routing and failover can move a conversation from one backend to another mid-way, and
-OpenAI-compatible APIs are not interchangeable about history. The known break: DeepSeek's own API
-rejects (`400 The reasoning_content in the thinking mode must be passed back`) a conversation
-whose earlier tool-call turns were written by nano or OpenRouter, because they name the model's
-reasoning `reasoning` and DeepSeek requires the key `reasoning_content` (its content is not
-checked). The proxy adds the key, carrying the reasoning text over, on the way to a DeepSeek
-backend only — the other backends still get your client's history untouched, and moving *to*
-nano or OpenRouter needs nothing. Details and the measurements: [`docs/providers/deepseek.md`](docs/providers/deepseek.md).
+| 401 | `unauthorized` | The model lives only on gated backends and the caller sent no valid key |
+| 404 | `invalid_request_error` (`code: model_not_found`) | No backend serves the model |
+| 502 | `upstream_unavailable` | Every candidate failed to connect |
+| 504 | `upstream_timeout` | The last candidate timed out |
+| 503 | `slot_timeout` | `queue_timeout` passed with no free slot |
+| 503 | `cancelled` | The request was killed from the console |
 
 ### Smart routing
 
-`priority` is a decision made once, in the config — usually "the cheap quota first".
-Smart routing is the other way to make it: **per request, cheapest backend first**. It is
-**off by default**; with it off the priority order runs exactly as before. The Routing tab
-has the switch (written back to `routing.smart_routing`), or set it in the file.
+`priority` is a decision made once, in the config. Smart routing makes it per request:
+**cheapest backend first**. It is off by default, and with it off the priority order
+runs unchanged. The Routing tab has the switch (written back to
+`routing.smart_routing`), or set it in the file.
 
 Each backend that can serve the model is priced, in this order of preference:
 
-1. **A subscription with allowance left is free** — for the models it covers. Once the
-   allowance is used up the same backend is priced at its list price, or ranked last when it
-   refuses to bill past it. That is "quota first, then decide" with nobody flipping a switch.
+1. **A subscription with allowance left is free**, for the models it covers. Once the
+   allowance is used up, the same backend is priced at its list price, or ranked last
+   when it refuses to bill past the allowance.
 2. **The vendor's published rate**, read in the background (see
-   [Rates, quota and balances](#rates-quota-and-balances)), evaluated at *this instant* — so a
-   peak-hour surcharge counts when it applies — and weighted by how requests for this model
-   really behave on that backend: the share of prompt tokens its cache serves and the share
-   of tokens that are output, both from the [ledger](#cost-tracking). An unreliable cache
-   therefore shows up as a higher price, and a rate change is felt within the hour with **no
-   traffic needed**, so a backend nobody has used lately is still priced and cannot get stuck.
-3. **What it has been charged**, for a backend with no published rates: blended dollars per
+   [Rates, quota and balances](#rates-quota-and-balances)) and evaluated at the instant
+   of the request, so a peak-hour surcharge counts when it applies. It is weighted by
+   how requests for this model behave on that backend: the share of prompt tokens its
+   cache serves and the share of tokens that are output, both from the
+   [ledger](#cost-tracking). An unreliable cache shows up as a higher price, and a rate
+   change is felt within the hour with no traffic needed.
+3. **What it has been charged**, for a backend with no published rates: dollars per
    million tokens over the last `smart_window_days` (7), trusted only with
    `smart_min_requests` (5) priced requests behind it.
 
-A backend none of these can price is *unrankable* and keeps its place.
+The rules it follows:
 
-- **Only reorders.** The backends a request may reach are the ones resolution produced and
-  the auth gate left; smart routing never adds one, and failover still walks the rest.
-- **Never moves what it cannot price.** A backend with fewer than `smart_min_requests` (5)
-  priced requests for the model, or one set to `fixed`, keeps the place its `priority` gives
-  it; only the rankable ones trade places among themselves. An unknown price is never read
-  as cheap. Equal prices keep the configured order — a local box priced at 0 stays where it
-  is next to another at 0 — and each position keeps its priority value, so a tie tier stays
-  a tie tier and still round-robins.
+- **It only reorders.** The backends a request may reach are the ones resolution
+  produced and the auth gate left. Smart routing never adds one, and failover still
+  walks the rest.
+- **It never moves what it cannot price.** A backend none of the three sources can
+  price, or one set to `fixed`, keeps the place its `priority` gives it; only the
+  priced ones trade places. An unknown price is never read as cheap. Equal prices keep
+  the configured order, and a priority tie stays a tie and still round-robins.
 - **Overrides always win.** `routing.backend_modes` sets a mode per backend:
 
   | mode | meaning |
   |---|---|
   | `auto` (default) | takes part in the ranking when smart routing is on |
-  | `fixed` | never moved by the ranking — keep Google here while it is a special case |
+  | `fixed` | never moved by the ranking |
   | `first` | tried before every other backend of the model |
   | `last` | tried after every other backend of the model |
 
-  `first` / `last` are the "use X because I said so" lever for a backend that is giving
-  trouble, and apply with smart routing **off** too. They are priority, not exclusivity: the
-  other backends stay failover targets, so a forced backend that errors does not take the
-  request down with it. A `claude-cli` backend is always `fixed` — it draws from a
-  subscription seat and has no per-request price to rank.
-- **See what it is doing.** A request whose backend order was changed carries a badge in the
-  In-flight tab and `route=` in its log line, saying what moved it: `smart` (the cost ranking),
-  `pinned` (a `first`/`last` setting), or `smart+pinned`. An override that is in force but
-  already agrees with the order — `last` on a backend that is already last — moves nothing and
-  shows nothing; `pinned` means it actually changed which backend goes first (or broke a
-  priority tie). The Routing tab lists each
-  model's order *now* beside its configured one, and the price used for each backend with
-  where it came from (`quota`, `list`, `config`, `observed`).
+  `first` and `last` apply with smart routing off too. They set an order, not
+  exclusivity: the other backends stay failover targets. A `claude-cli` backend is
+  always `fixed`, since it draws from a subscription seat and has no per-request price.
+- **It shows what it did.** A request whose backend order was changed carries a badge
+  in the In-flight tab and `route=` in its log line: `smart` (the cost ranking),
+  `pinned` (a `first`/`last` setting) or `smart+pinned`. An override that already
+  agrees with the order moves nothing and shows nothing. The Routing tab lists each
+  model's order now beside its configured one, and the price used for each backend with
+  its source (`quota`, `list`, `config`, `observed`).
 
-Known limits, so they are not discovered the hard way: for OpenRouter the catalog price is the
-cheapest upstream host's, while the request goes to whichever host OpenRouter picks, so treat it
-as a lower bound; the cache and output shares come from recent traffic and are a default until a
-backend has some; and OpenRouter and NanoGPT are trusted to pick their own upstream.
+Known limits: for OpenRouter the catalog price is the cheapest upstream host's, while
+the request goes to whichever host OpenRouter picks, so treat it as a lower bound. The
+cache and output shares come from recent traffic and are a default until a backend has
+some.
+
+### Rates, quota and balances
+
+A background task reads, for each backend whose vendor it recognises:
+
+| every | what | from |
+|---|---|---|
+| hour | the vendor's price list, filtered to the models you use, and which models a subscription covers | OpenRouter `/models`, NanoGPT `/api/v1/models?detailed=true` |
+| 2 minutes (30 seconds past 95% used) | subscription allowance left and its reset time | NanoGPT `/api/subscription/v1/usage` |
+| 2 minutes | account balance | OpenRouter `/credits`, NanoGPT `/api/check-balance`, DeepSeek `/user/balance` |
+
+The vendor is worked out from the host of `base_url` (`openrouter.ai`, `nano-gpt.com`,
+`api.deepseek.com`); set `vendor:` on a provider only for a host it does not know.
+DeepSeek publishes no rate API, so its prices stay in the
+[`pricing:` table](#price-tables), which also wins over a fetched price for any model it
+lists. Every endpoint, field and unit is written down in
+[`docs/providers/`](docs/providers/README.md).
+
+A vendor that fails keeps its last good data and logs one warning per 15 minutes, so an
+outage can age the numbers but never empties them or fails a request. The Costs tab
+shows each backend's balance and allowance meter, and `GET /admin/accounts` returns the
+same.
+
+Two things about NanoGPT's subscription that the proxy accounts for:
+
+- The allowance counts **input tokens only, cached input included**, and covers only
+  some models. A model outside the subscription bills the balance even while allowance
+  remains.
+- The allowance counts as left only while at least 1% of it remains. A request that
+  does not fit is billed and not counted, so the counter can stop a little short of the
+  limit and stay there until the reset. NanoGPT's own `recommendedMode` verdict lags
+  behind the counter, so the proxy lets it veto but never grant.
+
+### Empty balances and warnings
+
+A prepaid backend that runs dry answers `402`. The proxy keeps that away from clients:
+
+- **An empty backend is skipped while another can serve.** A backend whose balance was
+  last read as a cent or less, with no subscription allowance to pay for it, is left out
+  of the candidates. If every backend looks empty the request is still tried, because a
+  balance is only as fresh as the last read.
+- **A 402 fails over.** When an account empties between two reads, the request moves to
+  the next backend. The last backend's 402 is relayed verbatim if nothing else can
+  serve.
+- **The Costs tab says so.** An account tile turns amber under the warning level and red
+  when empty.
+
+Set `notify:` in the config and the proxy also warns you on [ntfy](https://ntfy.sh): a
+balance under its threshold (`low_balance`, default $1, per backend with
+`low_balance_by`), a balance empty, a subscription allowance used up, a payment refused
+on a live request, and a recovery message when you top up. You get one message when a
+condition becomes true and a reminder every `reminder_hours` (12) while it stays true. A
+restart does not re-announce what is already true, a message ntfy did not accept is
+retried on the next check, and nothing in it can fail or slow a request.
+
+### Moving a conversation between backends
+
+Smart routing and failover can move a conversation from one backend to another, and
+OpenAI-compatible APIs are not interchangeable about history. The known break:
+DeepSeek's own API rejects (`400 The reasoning_content in the thinking mode must be
+passed back`) a conversation whose earlier tool-call turns were written by NanoGPT or
+OpenRouter, because they name the model's reasoning `reasoning` and DeepSeek requires
+the key `reasoning_content`. The proxy adds the key, carrying the reasoning text over,
+on the way to a DeepSeek backend only. Other backends get the client's history
+untouched. Details: [`docs/providers/deepseek.md`](docs/providers/deepseek.md).
 
 ### Context guardrail
 
-A chat client sends the *whole* conversation on every turn. When its own history
-management fails, a 512 KB chat goes to a paid backend verbatim — a large bill for a
-reply the model cannot ground in a context that size. The proxy is the last hop, so it
-enforces the limit the client itself declares.
+A chat client sends the whole conversation on every turn. When its own history
+management fails, a 512 KB chat goes to a paid backend verbatim. The proxy is the last
+hop, so it enforces the limit the client itself declares.
 
-It acts only when **all** of these hold: the body is a JSON chat with a `messages` list,
-it carries an integer `num_ctx` (Open WebUI sends the model's configured context size
-this way), and the estimated size exceeds `num_ctx - response_headroom`. A request that
-fits — or has no `num_ctx` — is forwarded untouched, byte for byte. Then, in order:
+It acts only when all of these hold: the body is a JSON chat with a `messages` list, it
+carries an integer `num_ctx` (Open WebUI sends the model's configured context size this
+way), and the counted size exceeds `num_ctx - response_headroom`. A request that fits,
+or has no `num_ctx`, is forwarded untouched, byte for byte. Otherwise, in order:
 
-1. **Excerpt old, oversized tool results.** A `role: tool` message deeper than
-   `protect_recent` messages from the end and above `max_tool_result_tokens` is cut to a
-   head + tail excerpt with a `…[llm-proxy cut N characters…]…` marker. One 20 KB
-   `fetch_url` dump buried in history should not force every older turn out.
-2. **Drop the oldest turns** until the rest fits. System messages are always kept. An
-   assistant message that calls tools and the `tool` results answering it are one block,
-   so the window never starts on a dangling call (which most backends reject with a 400).
-3. **Always send the newest turn**, even when it alone is over budget: there is nothing
-   smaller to send, and the backend's own error is the right answer. The log says so.
+1. **Old, oversized tool results are cut to an excerpt.** A `role: tool` message deeper
+   than `protect_recent` messages from the end and above `max_tool_result_tokens` keeps
+   its head and tail around a `…[llm-proxy cut N characters…]…` marker.
+2. **The oldest turns are dropped** until the rest fits. System messages are always
+   kept. An assistant message that calls tools and the `tool` results answering it go
+   together, so the window never starts on a dangling call.
+3. **The newest turn is always sent**, even when it alone is over budget. The backend's
+   own error is then the right answer, and the log says so.
 
 Sizes are counted with a real tokenizer: `trim.tokenizer`, a Hugging Face
-`tokenizer.json`, by default Qwen's, which the image bakes in at
-`/app/tokenizers/qwen3.8.json` (every local model is Qwen3.5 or later, and they share a
-vocabulary). Each message is counted the way the chat template prints it — the text of
-its content, reasoning and tool-call arguments as-is, not JSON-escaped, plus a few tokens
-of template markup per message, call and argument, plus the tool schemas. Sampling fields
-are not counted. Against Qwen3.8's real template that lands within ~1% on agent
-transcripts, erring high. The tokenizer loads on the first request that needs it (~0.4 s,
-~120 MB), and a 600-message session takes ~80 ms to count, off the event loop.
+`tokenizer.json`. The image bakes in Qwen's at `/app/tokenizers/qwen3.8.json`. Each
+message is counted the way the chat template prints it, plus template markup and the
+tool schemas, which lands within about 1% on agent transcripts and errs high. The
+tokenizer loads on the first request that needs it (about 0.4 s and 120 MB), and
+counting runs off the event loop.
 
-A relative `tokenizer` path is resolved against the config file's directory, so another
-`tokenizer.json` can be dropped next to `config.yaml`. Empty, or a file that will not
-load (one WARNING, then silence), falls back to the old estimate: serialized JSON
-characters divided by `chars_per_token`. That one errs both ways on agent traffic —
-1.45× over on source code, 0.8× *under* on an `ls -l` listing, where Qwen spends a token
-per digit — so it is only the fallback. Non-text content parts (images) count a flat
-~1000 tokens each either way, rather than their base64 length.
+A relative `tokenizer` path is resolved against the config file's directory. An empty
+value, or a file that will not load, falls back to an estimate: serialized JSON
+characters divided by `chars_per_token`. Images count a flat 1000 tokens each.
 
 Every trim shows up in three places with the same numbers: a `CONTEXT TRIM request #N …`
-`WARNING` with the estimate, the budget, messages dropped and tool results excerpted; the
-request's `event=request` line gains `trimmed=<dropped> trim_capped=<excerpted>`; and the
-In-flight row carries a `trimmed N msgs` badge. `llm_proxy_trims_total{model}` counts them
-(keyed by the name the client sent). Turn it off with
-`trim.enabled: false`; like the rest of `config.yaml` it hot-reloads.
+warning in the log, `trimmed=` and `trim_capped=` on the request's log line, and a
+`trimmed N msgs` badge on the In-flight row. `llm_proxy_trims_total{model}` counts them.
+Turn it off with `trim.enabled: false`.
 
-### Upstream timeouts and connection reuse
+### Timeouts and connection reuse
 
-All outbound calls share one pooled `httpx` client (`app/upstream.py`), so a request to
-a remote backend reuses an established TLS connection instead of renegotiating one.
+Outbound calls go through shared, pooled `httpx` clients, so a request to a remote
+backend reuses an established TLS connection. The forwarding timeouts are split on
+purpose:
 
-Its timeouts are split on purpose:
-
-- **read: 600s.** Generation legitimately takes minutes — a large model loading, a long
-  prompt to process, or an aggregator that buffers the whole completion before sending
-  anything. This is meant to be generous and shouldn't be shortened.
-- **connect: 5s.** A TCP handshake completes in the kernel before the request is even
-  sent, so no amount of model-loading time lands here. A backend that's down *refuses*
-  instantly; the only way to sit waiting on connect is a host that silently drops
-  packets — powered off behind a router, or a firewall `DROP` rule — and that connection
-  is never going to succeed. Since the request is holding a slot the whole time, one
-  such request to a single-slot local backend used to stall it for a full ten minutes,
-  with `down_backoff` never kicking in because nothing had failed yet.
+- **read: 600 s.** Generation takes minutes when a large model is loading or a backend
+  buffers the whole completion before sending anything.
+- **connect: 5 s.** A backend that is down refuses instantly. The only way to wait on
+  connect is a host that silently drops packets, and that connection will never
+  succeed. Since the request holds a slot while it waits, a long connect timeout would
+  let one request stall a single-slot backend for minutes.
 
 ### Claude via the Claude Code CLI
 
-A provider with `kind: claude-cli` has no URL: each request runs the official `claude`
+A provider with `kind: claude-cli` has no URL. Each request runs the official `claude`
 binary headless (`claude -p`) inside the proxy's container, logged in with your own
-Claude subscription. Usage counts against that plan's limits — the same pool your
-interactive Claude Code draws from — not against an API key.
+Claude subscription. Usage counts against that plan's limits, not against an API key.
 
 ```yaml
   - name: claude
@@ -387,77 +378,57 @@ interactive Claude Code draws from — not against an API key.
       sonnet: claude-sonnet
 ```
 
-Log the CLI in once; the login lives in the `/claude` volume and survives recreates:
+Log the CLI in once. The login lives in the `/claude` volume and survives recreates:
 
 ```bash
 docker exec -it llm-proxy claude auth login --claudeai
 ```
 
 Until then every request answers 502 `Not logged in`. The binary is baked into the image
-at a pinned, checksum-verified version (`CLAUDE_CODE_VERSION` build arg) with its
+at a pinned, checksum-verified version (the `CLAUDE_CODE_VERSION` build arg) with its
 self-updater off.
 
-`opus`, `sonnet`, … are the CLI's rolling aliases — always the newest model of the
-family, as of the CLI version in the image. The response's `model` field and the request
-log's `served=` name the concrete version that answered (`claude-opus-5-5`).
+`opus`, `sonnet` and the others are the CLI's rolling aliases: always the newest model
+of the family, as of the CLI version in the image. The response's `model` field and the
+request log's `served=` name the concrete version that answered.
 
-How it fits in: the CLI is an `httpx` transport under the normal forwarding path
-(`app/claude_cli.py`), so slots, failover, metrics, the request log and the console's
-Kill button behave exactly as for an HTTP backend. A CLI error with an HTTP status is
-relayed with that status (a usage-limit 429 fails over like any 429); Anthropic's 529
-becomes 503; a refused CLI login becomes 502 rather than a 401 the caller would read as
-their own key; a binary that will not start or runs past the 600s read timeout is a
-connection failure.
+Slots, failover, metrics, the request log and the console's Kill button behave as for
+an HTTP backend. A CLI error with an HTTP status is relayed with that status (a
+usage-limit 429 fails over like any 429). Anthropic's 529 becomes 503. A refused CLI
+login becomes 502, not a 401 the caller would read as their own key. A binary that will
+not start, or runs past the 600 s read timeout, counts as a connection failure.
 
 What it serves, and what it refuses:
 
-- **Text chat completions.** Leading system messages become the system prompt; a
-  single user message is sent as-is; longer conversations are sent as a role-tagged
-  transcript (`claude -p` takes one prompt). `reasoning_effort` maps to `--effort`.
+- **Text chat completions.** Leading system messages become the system prompt. A single
+  user message is sent as it is; a longer conversation is sent as a role-tagged
+  transcript. `reasoning_effort` maps to `--effort`.
 - **Function calling is emulated.** The request's `tools` are listed in the system
-  prompt and the model calls them as tools; the proxy catches each call in the CLI's
-  event stream, stops the run, and returns it as `tool_calls` for the client to run.
-  The results come back in the next request's transcript. Since nothing validates
-  the arguments, scalars the model types loosely (`"5"` for an integer) are converted
-  to what the function's parameter schema asks for. `tool_choice`
-  (`none`/`auto`/`required`/a named function) and `parallel_tool_calls: false` are
-  honored, the last two by asking — a call cannot be forced, only which calls go back
-  is enforced. Every request re-sends the conversation and the function list, so a
-  client with many tools (Open WebUI's native mode sends ~40) spends quota on them on
-  every turn; legacy `functions` is refused with a 400.
-- **Streaming is synthesized** — the answer (or the calls) arrives as one SSE chunk
-  when it is done.
+  prompt. When the model calls one, the proxy catches the call in the CLI's event
+  stream, stops the run, and returns it as `tool_calls` for the client to run. Loosely
+  typed arguments (`"5"` for an integer) are converted to what the function's parameter
+  schema asks for. `tool_choice` is honored: `none` offers no functions, a named
+  function makes only that one callable, and `required` is asked of the model, since a
+  call cannot be forced. `parallel_tool_calls: false` returns at most one call. Every
+  request re-sends the conversation and the function list, so a client with many tools
+  spends quota on them every turn. Legacy `functions` is refused with a 400.
+- **Streaming is synthesized.** The answer arrives as one SSE chunk when it is done.
 - **Images and audio are refused with a 400**, not silently dropped.
 - **The agent is disarmed.** Every built-in tool, MCP server, settings file and slash
   command is switched off and the process runs in an empty directory, because the
-  container also holds `config.yaml` with every other backend's API key. Emulated
-  function calling changes nothing here: the model only *asks* for a call, and the
-  client is what runs it.
-- Other OpenAI parameters (`temperature`, `max_tokens`, …) have no CLI equivalent and
-  are ignored.
+  container also holds `config.yaml` with every other backend's API key.
+- Other OpenAI parameters (`temperature`, `max_tokens`) have no CLI equivalent and are
+  ignored.
 
 The proxy never touches the CLI's credentials; it only runs the unmodified binary.
 Anthropic's terms allow your own subscription in the official CLI and forbid lifting its
-token into another client or sharing the account — hence `require_permission: true`.
+token into another client or sharing the account, hence `require_permission: true`.
 
 ## Configuration
 
-All routing config lives in `config.yaml` (see `config.example.yaml`). Provider API keys
-go inline, or optionally via `${ENV_VAR}` interpolation. Proxy auth keys and runtime
-flags come from the environment.
-
-Edits to `config.yaml` are **hot-reloaded** — the file is checked every
-`CONFIG_RELOAD_INTERVAL` seconds (default 3, `0` disables) and applied live, no restart
-needed. Requests already in flight finish under the settings they started with. A broken
-edit (YAML typo) is logged and ignored; the proxy keeps running on the previous config
-until the file parses again.
-
-> **Bind-mount gotcha:** with the default single-file mount
-> (`./config.yaml:/app/config.yaml`), edit the file **in place** on the host. Editors
-> that save by *rename-and-replace* (vim's default, `sed -i`) swap the host inode, and
-> the container keeps watching the old file — the edit never becomes visible inside.
-> `nano`, a `>` redirect, or `:set backupcopy=yes` in vim write in place. Mounting the
-> containing directory instead of the single file avoids the issue entirely.
+Routing config lives in `config.yaml` (see [`config.example.yaml`](config.example.yaml)
+for the annotated version). Provider API keys go inline or through `${ENV_VAR}`
+interpolation. Runtime flags come from the environment.
 
 ```yaml
 aliases:                          # optional short names -> provider:canonical
@@ -478,9 +449,9 @@ providers:
   - name: ollamaCitrine
     api_key: ""                   # empty -> no auth header (Ollama)
     base_url: "http://citrine.brandao:11434"
-    enabled_models: []            # empty -> expose ALL models (live-discovered)
+    enabled_models: []            # empty -> expose every model it reports
     slots: 1                      # single GPU box
-    priority: 1                   # faster -> preferred over gw
+    priority: 1                   # preferred over gw
 
   - name: ollamaGW
     base_url: "http://gw.brandao:11434"
@@ -492,12 +463,14 @@ providers:
     api_key: "sk-or-..."
     require_permission: true
     base_url: "https://openrouter.ai/api"
-    enabled_models: [deepseek/deepseek-v4-pro-0813]  # native ids
+    enabled_models:               # native ids
+      - deepseek/deepseek-v4-pro-0813
+      - deepseek/deepseek-v4-flash
     slots: 10
-    model_map:                                # native -> canonical
+    model_map:                    # native -> canonical
       deepseek/deepseek-v4-pro-0813: deepseek-v4-pro
       deepseek/deepseek-v4-flash: deepseek-v4-flash
-    provider_routing:                         # pin OpenRouter's upstream (native key)
+    provider_routing:             # pin OpenRouter's upstream (native key)
       deepseek/deepseek-v4-flash: [deepseek]
 
 # One canonical name backed by several prioritized targets. Omit `model:` to inherit
@@ -505,475 +478,346 @@ providers:
 models:
   deepseek-v4-flash:
     targets:
-      - {provider: openRouter, priority: 1}   # native via model_map
+      - {provider: openRouter, priority: 1}
       - {provider: deepseek,   priority: 2}
 
-# Global routing behavior.
 routing:
   queue_timeout: 0    # seconds to wait for a free slot; 0 = wait forever
   failover: true      # retry the next target on backend error
   auto_group: true    # identical canonical names across backends load-balance
   down_backoff: 15    # seconds a failed backend is skipped before retry
-  failover_statuses: [402, 429, 500, 502, 503, 504]  # upstream statuses that fail over
+  failover_statuses: [402, 429, 500, 502, 503, 504]
 
-# Context guardrail: shrink a chat that cannot fit the `num_ctx` it declares.
 trim:
   enabled: true
   tokenizer: /app/tokenizers/qwen3.8.json  # tokenizer.json to count with; "" = estimate
-  chars_per_token: 3.0        # fallback estimate = JSON chars / this (conservative)
-  response_headroom: 4000     # tokens kept free below num_ctx for the reply
+  chars_per_token: 3.0          # the fallback estimate: JSON chars / this
+  response_headroom: 4000       # tokens kept free below num_ctx for the reply
   max_tool_result_tokens: 4000  # old tool results above this are excerpted first
-  protect_recent: 10          # the newest N messages are never excerpted
+  protect_recent: 10            # the newest N messages are never excerpted
 ```
 
 ### Provider fields
 
 | Field | Description |
 |---|---|
-| `name` | Backend key, also the `provider:` routing prefix |
-| `kind` | `http` (default): an OpenAI-compatible server at `base_url`. `claude-cli`: the Claude Code CLI run in the container — see [Claude via the Claude Code CLI](#claude-via-the-claude-code-cli). The URL/path/header fields below apply to `http` only |
-| `base_url` | Upstream base URL (`http` only; required there) |
-| `api_key` | Sent as `Authorization: Bearer` upstream. Empty → no auth header (e.g. Ollama) |
-| `enabled_models` | Allow-list in **native** ids. **Empty** = expose all (live-queried). **Non-empty** = exactly these (no live call) |
-| `slots` | Max concurrent in-flight requests (shared across the backend's models). Omit = unlimited |
-| `priority` | Preference when a model has several backends; lower wins. Default = config order. Ties round-robin across backends with a free slot |
-| `require_permission` | `true` → gated behind a proxy auth key (default `false`) |
-| `strip_path_prefix` | Path segment removed before appending to `base_url`. For OpenAI-compatible backends whose root isn't `/v1` — e.g. Google Gemini (`v1` → its `/v1beta/openai/...`) |
-| `strip_fields` | Top-level request-body keys to drop before forwarding. For strict backends that 400 on unknown fields (e.g. Google rejects the `num_ctx` some clients inject) |
-| `model_map` | Per-provider **native → canonical** dictionary. Drives `/v1/models` display (native→canonical) and request rewrite (canonical→native). Must be a bijection |
-| `provider_routing` | OpenRouter only — per-model upstream pinning, keyed by **native** id (list = strict order, dict = verbatim `provider` field) |
-| `headers` | Extra headers sent upstream, applied as **defaults** (a header the client already sent wins). For backend attribution the client can't set itself — e.g. OpenRouter app identity (`HTTP-Referer` / `X-Title`). Values support `${ENV}` |
-| `cache_ttl` | Seconds the live `/models` result is cached for this backend |
-| `pricing` | List prices for a backend whose responses carry **no** `usage.cost` (DeepSeek's own API). `models:` maps **native** id (or `"*"`) → `{input, cached, output}` USD per million tokens (`cached` defaults to `input`); optional `peak: {multiplier, weekdays, utc_hours}` surcharges a UTC window. Used only when the backend reports nothing. See [Cost tracking](#price-tables) |
+| `name` | The backend's key, and the `provider:` routing prefix |
+| `kind` | `http` (default): an OpenAI-compatible server at `base_url`. `claude-cli`: the Claude Code CLI run in the container (see [Claude via the Claude Code CLI](#claude-via-the-claude-code-cli)). The URL, path and header fields below apply to `http` only |
+| `base_url` | Upstream base URL. Required for `http` |
+| `api_key` | Sent upstream as `Authorization: Bearer`. Empty means no auth header (Ollama) |
+| `enabled_models` | Allow-list in **native** ids. Empty exposes everything the backend reports (queried live). Non-empty exposes exactly these, with no live query |
+| `model_map` | **Native → canonical** dictionary. Drives the `/v1/models` listing and the request rewrite. Must be one-to-one |
+| `slots` | Maximum in-flight requests, shared across the backend's models. Omitted means unlimited |
+| `priority` | Preference when a model has several backends; lower wins. Defaults to the position in the config. Ties round-robin |
+| `require_permission` | `true` puts the backend behind a proxy auth key. Default `false` |
+| `cache_ttl` | Seconds the live model list is cached for this backend. Default 60 |
+| `strip_path_prefix` | A path segment removed before appending to `base_url`, for backends whose OpenAI-compatible root is not `/v1`. Google Gemini: strip `v1`, with `base_url` ending in `/v1beta/openai` |
+| `strip_fields` | Top-level request-body keys dropped before forwarding, for strict backends that 400 on unknown fields (Google rejects the `num_ctx` some clients inject) |
+| `provider_routing` | OpenRouter only. Per-model upstream pinning keyed by **native** id (`"*"` for the rest). A list pins strictly; a dict is forwarded verbatim as OpenRouter's `provider` field. A `provider` field sent by the client wins |
+| `headers` | Extra headers sent upstream, as defaults: a header the client already sent wins. For attribution the client cannot set, such as OpenRouter's `HTTP-Referer` / `X-Title`. Values support `${ENV}` |
+| `pricing` | List prices for a backend whose responses carry no `usage.cost`. See [Price tables](#price-tables) |
+| `vendor` | `openrouter`, `nanogpt` or `deepseek`. Normally blank and detected from `base_url`. See [Rates, quota and balances](#rates-quota-and-balances) |
 
-### Canonical names
+### Other sections
 
-`model_map` is keyed by the **native** id, and must be a bijection per provider —
-`Provider.__post_init__` inverts it to build the reverse lookup, so two natives sharing a
-canonical name make one of them unreachable by that name. Native ids containing a colon
-(`qwen3.8-max:thinking`) parse fine unquoted, since YAML only splits on colon-*space*, but
-the console quotes them on write:
+| Section | Keys |
+|---|---|
+| `aliases` | `name: provider:canonical`. Resolved before everything else, and listed in `/v1/models` |
+| `models` | `name: {targets: [{provider, model?, priority}]}`. See [Names](#names-canonical-and-native) |
+| `routing` | `queue_timeout`, `failover`, `auto_group`, `down_backoff`, `failover_statuses`, `queue_affinity`, `affinity_max_skips`, and for [smart routing](#smart-routing) `smart_routing`, `smart_window_days`, `smart_min_requests`, `backend_modes` |
+| `trim` | `enabled`, `tokenizer`, `chars_per_token`, `response_headroom`, `max_tool_result_tokens`, `protect_recent`. See [Context guardrail](#context-guardrail) |
+| `notify` | `ntfy` (the topic URL; `http://ntfy:80/<topic>` inside a docker network), `token` (sent as a Bearer token), `low_balance`, `low_balance_by`, `reminder_hours`. Off until `ntfy` is set. See [Empty balances and warnings](#empty-balances-and-warnings) |
+| `auth` | `keys`: proxy auth keys, in addition to `PROXY_API_KEYS`. Values support `${ENV}` |
 
-```yaml
-providers:
-  - name: nanoGPT
-    model_map:
-      "deepseek/deepseek-v4-pro-0813:thinking": deepseek-v4-pro
-      "qwen3.8-max:thinking": qwen-max
-```
-
-> Short version, since this is the part everyone forgets: a **canonical name** is what
-> clients send (`deepseek-v4-pro`) and a **native id** is what one backend calls that same model
-> on the wire (`deepseek/deepseek-v4-pro-0813:thinking` on nanoGPT, `deepseek/deepseek-v4-pro-0813` on openRouter). `model_map`
-> translates between them, per provider. The console's Config tab has the same
-> explanation behind a (?) next to each section.
-
-Clients only ever see and send **canonical** names; native (provider-specific) ids stay
-internal. Two layers mint canonical names:
-
-- **`model_map`** (per provider) — the native↔canonical dictionary for *one* backend. A
-  pure rename/translation; no routing. Keyed by the native id.
-- **`models:`** (global) — the cross-provider routing table in canonical space (priority,
-  failover, load-balancing). A target's native id is its explicit `model:`, or — when
-  omitted — inherited from that provider's `model_map`.
-
-They compose without overlap: `models:` decides *which backends in what order*; `model_map`
-decides *what each backend calls the thing*. A canonical name reachable both as a logical
-model and via auto-group resolves as the logical model (it's earlier in the order).
-
-### `models:` and `routing:`
-
-- **`models:`** — declare logical models in canonical space (the flash example). Use an
-  explicit `model:` only to pin a specific native id (e.g. a per-box quant); otherwise it's
-  inherited from `model_map`. Backends sharing the *same* canonical name auto-group without
-  an entry.
-- **`vendor`** on a provider — normally blank; see [Rates, quota and balances](#rates-quota-and-balances).
-- **`routing:`** — `queue_timeout`, `failover`, `auto_group`, `down_backoff`,
-  `failover_statuses`, `queue_affinity`, `affinity_max_skips` (see above), and the
-  [smart routing](#smart-routing) keys `smart_routing`, `smart_window_days`,
-  `smart_min_requests`, `backend_modes`.
-- **`trim:`** — the context guardrail: `enabled`, `tokenizer`, `chars_per_token`, `response_headroom`,
-  `max_tool_result_tokens`, `protect_recent` (see [Context guardrail](#context-guardrail)).
+A typo in `backend_modes`, `vendor`, `kind`, a `pricing:` table or a `notify:` number
+fails the load instead of being read as a default.
 
 ### Environment variables
 
-Set in `docker-compose.yml` — **not** in `config.yaml`:
+Set these in `docker-compose.yml`, not in `config.yaml`:
 
-| Env var | Default | Description |
+| Variable | Default | Description |
 |---|---|---|
-| `PROXY_API_KEYS` | _(empty)_ | Comma-separated proxy auth keys for gated backends. Empty = gate disabled |
-| `LOG_INPUT` | `false` | Log the full proxied request (curl-style, auth masked). Toggleable at runtime via `/logging` |
-| `LOG_OUTPUT` | `false` | Log the upstream response (pretty JSON; streaming reassembled). Toggleable at runtime via `/logging` |
-| `PORT` | `8000` | Port the proxy binds to inside the container |
+| `PROXY_API_KEYS` | _(empty)_ | Comma-separated proxy auth keys for gated backends. Empty, with no `auth.keys`, turns the gate off |
 | `CONFIG_PATH` | `config.yaml` | Path to the YAML config |
-| `CONFIG_RELOAD_INTERVAL` | `3` | Seconds between config-file change checks (hot reload). `0` disables |
-| `TZ` | `America/Sao_Paulo` | Timezone for log timestamps (image ships tzdata; timestamps are ISO-8601 with offset) |
-| `RESOLVE_CLIENT_HOST` | `true` | Reverse-DNS the caller IP for the request log (cached, off-loop, time-bounded) |
-| `CLIENT_DNS_TIMEOUT` | `1.0` | Seconds to wait for a reverse-DNS lookup before logging IP-only |
-| `TRUST_PROXY_HEADERS` | `true` | Trust `X-Forwarded-For` / `X-Real-IP` for the caller IP (set `false` behind no proxy) |
-| `INFLIGHT_HISTORY` | `200` | Finished requests the In-flight tab keeps below the live ones (in-memory, lost on restart) |
-| `INFLIGHT_BODIES` | `true` | Attach each request's prompt + reply to its In-flight row. **Holds prompt text in memory** (bounded, never written to disk or stdout, admin-gated); `false` keeps the feed metadata-only |
-| `INFLIGHT_BODY_LIMIT` | `16384` | Bytes kept per side (request / reasoning / response) before truncating |
-| `LEDGER_PATH` | `ledger.sqlite` beside the config | The [cost ledger](#cost-tracking): one SQLite row per completed request, read by the Costs tab. The default lands in the config's directory, which in the deploy is the rw mount — so it persists where the config does. `""` disables it; `:memory:` keeps it for the life of the process |
+| `CONFIG_RELOAD_INTERVAL` | `3` | Seconds between config-file change checks. `0` disables hot reload |
+| `PORT` | `8000` | Port the proxy binds inside the container |
+| `TZ` | `America/Sao_Paulo` | Timezone for log timestamps and the ledger's days |
+| `LOG_INPUT` | `false` | Log the full proxied request (curl-style, auth masked). Can be toggled at runtime through `/logging` |
+| `LOG_OUTPUT` | `false` | Log the upstream response (pretty JSON, streams reassembled). Can be toggled at runtime through `/logging` |
+| `RESOLVE_CLIENT_HOST` | `true` | Reverse-DNS the caller's IP for the request log (cached, off the event loop, time-bounded) |
+| `CLIENT_DNS_TIMEOUT` | `1.0` | Seconds to wait for that lookup before logging the IP alone |
+| `TRUST_PROXY_HEADERS` | `true` | Trust `X-Forwarded-For` / `X-Real-IP` for the caller's IP. Set `false` when no proxy sits in front |
+| `INFLIGHT_HISTORY` | `200` | Finished requests the In-flight tab keeps below the live ones (in memory, lost on restart) |
+| `INFLIGHT_BODIES` | `true` | Keep each request's prompt and reply attached to its In-flight row. This holds prompt text in memory: bounded, never written to disk or stdout, readable only through the gated admin API. `false` keeps the feed metadata-only |
+| `INFLIGHT_BODY_LIMIT` | `16384` | Bytes kept per side (request, reasoning, response) before truncating |
+| `LEDGER_PATH` | `ledger.sqlite` beside the config | The [cost ledger](#cost-tracking). `""` disables it; `:memory:` keeps it for the life of the process |
 | `LEDGER_RETENTION_DAYS` | `365` | Ledger rows older than this are pruned at startup and once a day. `0` keeps everything |
 
-> **Single worker required.** Slot/queue accounting is in-process, so run **one**
-> uvicorn worker (the default). Multiple workers would split the accounting and break
-> the concurrency caps.
+> **Run a single worker.** Slot and queue accounting are in-process, so run one uvicorn
+> worker (the default). Several workers would split the accounting and break the
+> concurrency caps.
 
-## Authentication & permissions
+### Hot reload and the config mount
 
-Backends marked `require_permission: true` are gated. A request is **authorized** when it
-carries `Authorization: Bearer <key>` with a key listed in `PROXY_API_KEYS`.
+Edits to `config.yaml` are hot-reloaded: the file is checked every
+`CONFIG_RELOAD_INTERVAL` seconds and applied live. Requests already in flight finish
+under the settings they started with. A broken edit (a YAML typo) is logged and
+ignored, and the proxy keeps running on the previous config until the file parses
+again.
 
-- **With a valid key** → sees and uses every backend.
-- **Without a key** → gated backends are hidden from `/v1/models`, and requests to them
-  (including explicit `provider:model` pins) return **401**. Open backends work for everyone.
-- **No keys configured** → the gate is inert; everything is open.
+**Mount the config's directory, not the file.** A single-file bind mount is pinned to
+one inode. Anything that replaces the file by rename (`git pull`, vim's default save,
+`sed -i`) leaves the container on the old inode: host edits never arrive, and console
+saves go into a copy nobody else can see and are lost on the next recreate.
 
-> Use case: share your Ollama hosts with a friend (no key, open) while keeping your paid
-> DeepSeek/OpenRouter backends private (key required).
-
-## Quick Start
-
-```bash
-cp config.example.yaml config.yaml   # edit backends, slots, priorities, keys
-# set PROXY_API_KEYS and other env vars in docker-compose.yml (see table above)
-docker compose up -d
+```yaml
+    environment:
+      - CONFIG_PATH=/app/conf/config.yaml
+    volumes:
+      - ./conf:/app/conf          # rw: the console writes config edits back
 ```
 
-Point any OpenAI client at `http://<host>:8000/v1/chat/completions` and request a clean
-model name (e.g. `deepseek-v4-flash`). Pass `Authorization: Bearer <key>` for gated backends.
+With a directory mount the ledger's default path lands in the same directory, so it
+persists where the config does.
+
+The bundled dev compose mounts the single file for convenience. With it, edit the file
+in place (`nano`, a `>` redirect, `:set backupcopy=yes` in vim). The proxy detects a
+detached file: the Config tab shows a red banner and every save is refused until you run
+`docker compose up -d --force-recreate llm-proxy`.
+
+## Authentication and permissions
+
+Backends marked `require_permission: true` are gated. A request is authorized when it
+carries `Authorization: Bearer <key>` with a key from `PROXY_API_KEYS` or `auth.keys`.
+
+- **With a valid key**, a caller sees and uses every backend.
+- **Without a key**, gated backends are hidden from `/v1/models`, and requests to them
+  (including explicit `provider:model` pins) return **401**. Open backends work for
+  everyone.
+- **With no keys configured**, the gate is off and everything is open.
+
+A typical setup shares the local Ollama hosts with a friend (no key) while the paid
+backends stay private.
+
+The same keys gate `POST /logging` and every `/admin/*` endpoint.
 
 ## Endpoints
 
 | Path | Method | Description |
 |---|---|---|
-| `/health` | `GET` | Health check **and build identity**: `{"status":"ok","version":"master-52","revision":"<sha>","release":true}` |
-| `/metrics` | `GET` | Prometheus-format metrics |
-| `/models`, `/v1/models` | `GET` | Aggregated model list (clean names; honors the auth gate) |
-| `/logging` | `GET` | Current `log_input` / `log_output` state |
-| `/logging` | `POST` | Toggle request/response logging at runtime (honors the auth gate) |
-| `/ui/` | `GET` | Web console (Logging / In-flight / Costs / Models / Routing / Config). Static, served by the proxy |
+| `/*` | any | The proxy. Routed by the `model` in the request body |
+| `/models`, `/v1/models` | `GET` | The model list, in canonical names, honoring the auth gate |
+| `/health` | `GET` | Liveness and build identity: `{"status":"ok","version":"master-52","revision":"<sha>","release":true}`. No auth |
+| `/metrics` | `GET` | Prometheus metrics. No auth |
+| `/logging` | `GET` / `POST` | Read or toggle `log_input` / `log_output` at runtime. `POST` needs a key |
+| `/ui/` | `GET` | The web console |
 | `/admin/logs` | `GET` | Recent log lines from an in-memory ring buffer (`?since=<seq>&level=<min>`) |
-| `/admin/inflight` | `GET` | The request feed: live (running + queued) plus recent finished ones, with per-provider slot occupancy |
+| `/admin/inflight` | `GET` | The request feed: running, queued and recently finished, with per-backend slot occupancy |
 | `/admin/inflight/{id}/cancel` | `POST` | Kill one in-flight request. `404` if it already finished |
 | `/admin/inflight/{id}/body` | `GET` | The prompt and reply captured for one row (see `INFLIGHT_BODIES`) |
-| `/admin/accounts` | `GET` | Each backend's balance (with `state`: `ok`, `low` or `empty`) and subscription quota as the vendors last reported them (read in the background every couple of minutes; numbers only, no keys) |
-| `/admin/costs` | `GET` | Cost and token totals from the [ledger](#cost-tracking): per day, per model (with each model's split across backends), per backend, plus the newest requests. `?days=30` or an explicit `since=YYYY-MM-DD&until=YYYY-MM-DD` window, narrowed with `day=`, `model=`, `provider=`, capped by `limit=200` |
-| `/favicon.ico`, `/robots.txt` | `GET` | Served directly, so browser noise never reaches the proxy path |
-| `/admin/upstream-models` | `GET` | Probes every backend's raw `/v1/models` directly (`?provider=name` for just one) |
-| `/admin/routing` | `GET` | Routing graph: providers (live slots/health), logical models + priorities, aliases |
-| `/admin/routing/{model}` | `POST` | Rearrange a logical model's target priorities — applied live **and** persisted into the config file |
-| `/admin/config` | `GET` | The editable config: providers (no secrets), logical models, aliases, routing |
-| `/admin/config/providers/{name}/enabled-models` | `PUT` | Set a backend's upstream allow-list (`[]` = allow all, live discovery) |
-| `/admin/config/providers/{name}/model-map` | `PUT` | Set a backend's `model_map` (native id → canonical name); refuses a non-bijection |
+| `/admin/costs` | `GET` | Cost and token totals from the [ledger](#cost-tracking): per day, per model (with each model's split across backends), per backend, and the newest requests. `?days=30`, or `since=YYYY-MM-DD&until=YYYY-MM-DD`; narrowed with `day=`, `model=`, `provider=`; `limit=200` caps the request list |
+| `/admin/accounts` | `GET` | Each backend's balance (with `state`: `ok`, `low` or `empty`) and subscription quota, as the vendors last reported them. Numbers only, no keys |
+| `/admin/upstream-models` | `GET` | Probes every backend's raw `/v1/models` (`?provider=name` for one) |
+| `/admin/routing` | `GET` | The routing graph: backends with live slots and health, logical models and priorities, aliases, the smart-routing state |
+| `/admin/routing/{model}` | `POST` | Reorder a logical model's target priorities. Applied live and written to the config |
+| `/admin/config` | `GET` | The editable config: backends (no secrets), logical models, aliases, routing |
+| `/admin/config/providers/{name}/enabled-models` | `PUT` | Set a backend's allow-list (`[]` allows everything it reports) |
+| `/admin/config/providers/{name}/model-map` | `PUT` | Set a backend's `model_map`. Refuses a mapping that is not one-to-one |
 | `/admin/config/aliases` | `PUT` | Replace the alias map |
-| `/admin/config/models/{name}` | `PUT` / `DELETE` | Create, replace or drop a logical model (group) |
-| `/admin/config/smart` | `PUT` | The [smart routing](#smart-routing) switch and per-backend modes: `{"enabled": bool}` and/or `{"modes": {"google": "fixed", ...}}`. Applied live and written to the config |
-| `/*` | any | Catch-all proxy — routed from the request body's `model` |
+| `/admin/config/models/{name}` | `PUT` / `DELETE` | Create, replace or drop a logical model |
+| `/admin/config/smart` | `PUT` | The smart-routing switch and per-backend modes: `{"enabled": bool}` and/or `{"modes": {"google": "fixed"}}` |
 
-All `/admin/*` endpoints are gated by the same bearer keys as `POST /logging` (the
-log buffer can contain request/response bodies when `LOG_INPUT`/`LOG_OUTPUT` are on),
-and never serialize provider `api_key`s.
+`/admin/*` answers `403 {"error": "unauthorized"}` without a valid key and never returns
+a provider's `api_key`.
 
-### Web console (`/ui/`)
+## Web console
 
-A built-in, dependency-free dashboard served by the proxy itself — open
-`http://<host>:9999/ui/` and paste a proxy key (stored in your browser's
-`localStorage`, sent as `Authorization: Bearer`). Six tabs:
+A dependency-free dashboard served by the proxy at `/ui/`. Paste a proxy key (kept in
+your browser's `localStorage`). The header shows the running build.
 
-- **Logging** — live log tail (level filter, pause, autoscroll) plus the
-  `LOG_INPUT` / `LOG_OUTPUT` runtime toggles.
-- **In-flight** — what the proxy is doing *right now*, polled every second, as a rolling
-  feed: **live requests pinned on top** (newest first), then the recently finished ones
-  below a divider. Every row is numbered with the request id.
-  - A **running** row shows the backend it landed on, the native model id, live token
-    counts, and — for streams — a chunk counter that ticks as tokens arrive. A **queued**
-    row shows which backends it is waiting on and for how long. Both carry age /
-    queued-for / running-for.
-  - **Live token counts** come with a caveat worth knowing: an upstream reports `usage`
-    only in its *final* streaming chunk (verified against llama.cpp — 1 chunk in 33), so
-    while a request runs, `tok out` is the proxy's own count of generation steps, shown as
-    `~40`, and is replaced by the authoritative number the instant usage arrives. `tok in`
-    is genuinely unknowable before then and reads `0`. A buffered (non-streaming) request
-    reveals nothing until it returns, so both read `0` while it runs.
-  - **`tok/s`** is the same figure the request log emits as `speed_tps`: output tokens over
-    the time the upstream exchange took — queue wait excluded, prompt processing included,
-    because the clock starts when the request is sent rather than at the first token. A
-    running row shows the average so far (over the `~` estimate, so it carries a `~` too)
-    and reads `0.00` until the first token lands; a finished row shows the final number,
-    computed from the very duration the log line used. Embeddings and rerankers generate
-    nothing, so their `tok/s` is input tokens/s, as in the log's `in_tps`.
-  - A **finished** row is frozen at completion with its status, total time, queue wait and
-    token counts (`done` / `cancelled` / `failed`, colour-coded). History is capped by
-    `INFLIGHT_HISTORY` and is lost on restart by design — the durable per-request record is
-    the `event=request` log line.
-  - Every row shows who called (service from the `User-Agent`, plus IP and reverse-DNS name)
-    and the request body size.
-  - Badges on the first line flag what happened to a request on the way through:
-    `attempt 2` (failed over), `passed over N×` (queue affinity), and **`trimmed N msgs`**
-    when the [context guardrail](#context-guardrail) dropped history — hover it for the
-    token estimate against the budget and how many tool results were excerpted.
-  - **Body** expands the row to show the prompt this request sent and the reply that came
-    back — pretty-printed, with a thinking model's reasoning kept separate from its answer.
-    On a running request the reply fills in as it streams. This is the reason it exists:
-    reading one request end-to-end here beats grepping it out of a log stream that also
-    carries every `/metrics` scrape. Bodies are fetched per row on demand, never in the
-    1s poll.
-  - **Kill** cancels a live request, on a single click. Works on a queued request *and* on
-    one wedged in an upstream read that will never return; the slot is freed immediately
-    and the caller gets a `503`. See [Killing a request](#killing-a-request).
-  - The toolbar totals running / queued / done and shows each provider's `in_use/slots`,
-    amber when full — so a growing queue reads straight against the capacity causing it.
-    See [Slots, priority & queueing](#slots-priority--queueing).
-  - A finished row also carries a **`cost`** cell — what the backend said it charged, `—`
-    for a backend that reports no price — and a `cache hit N` badge when part of the
-    prompt was served from the backend's prompt cache.
-- **Costs** — what the proxy's traffic cost, from the [cost ledger](#cost-tracking). At the top, an
-  **Accounts** strip: each backend's balance and, for a subscription, an allowance meter with
-  the reset countdown (amber from 85%, red when used up) — see
-  [Rates, quota and balances](#rates-quota-and-balances). One filter row scopes everything on the tab: a range preset (today / 7d / 30d / 90d /
-  all), a model, a backend, and a day picked by clicking a column of the chart.
-  - A **KPI row**: total cost (with how many of the requests actually carried a price —
-    the total is a floor, since a backend that reports nothing adds nothing), requests
-    and failures, tokens in and out, how much of the prompt came from a cache, how much
-    of the output was reasoning, and the mean cost per priced request.
-  - **Range** — presets for today / 7d / 30d / 90d / this month / last month / all, and two
-    date boxes for any specific stretch (a week, a quarter). `‹` `›` step the window back
-    and forward by its own length — by whole calendar months when it is one, so September
-    then August is two clicks. A date typed past the other end drags that end with it.
-  - **By day** — a column chart of cost, requests or tokens per day (one column per
-    calendar day of the range, so a quiet day shows as a gap in the data rather than in
-    the axis). Hover or focus a column for that day's numbers; click it to narrow the
-    rest of the tab to that day, click again to release. The **Days** table beside the
-    model table is the same data as rows.
-  - **By model** — each model as the client asked for it, with its requests, tokens,
-    cache-hit share, reasoning tokens, cost and cost per request — and under the name,
-    a chip per backend that served it with that backend's count and spend, which is
-    where the "which route for this model is actually cheaper" question gets answered.
-    Clicking a row filters the tab to that model.
-  - **By backend** — one row per backend with requests, cache-hit share, cost, cost per
-    request and cost per million tokens (over the priced requests only, so backends with
-    different request sizes compare fairly). All `ollama*` hosts count as one `ollama` here
-    and in the backend filter; the request list below still names the actual host.
-  - **Requests** — the newest requests in range (capped; narrow the filters to see
-    more), one per row: when, model, backend, status, tokens, cache reads, cost,
-    duration and caller.
-- **Config** — edit `config.yaml` from the browser; every save rewrites the file
-  (comments preserved) and takes effect immediately, no restart.
-  - **Upstream models** — per backend, either *allow all* (use whatever it live-reports)
-    or an explicit list. **Probe backend** fetches its real catalog as checkboxes; an id
-    that is pinned but no longer reported stays visible and checked, marked
-    *not in catalog*, so saving cannot silently drop it. A paid provider can report
-    hundreds of ids, so the list has a **filter** plus **Tick shown** / **Untick shown**
-    for bulk selection of whatever the filter matches — typing and ticking never re-render
-    the list, so focus and scroll position survive.
-  - **Model groups** — add, edit and delete logical models: pick each target's backend,
-    native id (blank inherits from `model_map`) and priority.
-  - **Aliases** — add, edit and delete short names. An alias pointing at an unknown
-    provider is refused rather than written, since an alias resolves ahead of everything
-    else and a broken one silently breaks a model name.
-  - Every pinned id is tagged with **what a client actually has to send** for it:
-    `→ glm-5.3 group` when a group fronts it, `→ deepseek-v4-flash model_map` when the
-    provider renames it, and nothing when neither applies — because then the raw native
-    id *is* the public name. A summary line above the list counts all three
-    ("1 behind a group · 1 renamed by model_map · 4 exposed under the raw id") and names
-    the raw ones, since pinning a model does **not** give it a clean name and that is the
-    single most common misreading of this page.
-  - **Name mapping** per backend edits its `model_map` — `native id → what clients call
-    it` — which is how a native id gets a clean public name without a group. The mapping
-    must be one-to-one: two native ids sharing a canonical name would make the reverse
-    lookup pick one silently, so that is refused with a pointer to groups (which is what
-    the multi-backend case actually wants).
-  - The **add a native model id** field pins exactly one id into the allow-list — it is
-    not where renaming happens. Anything with a space or an arrow (`a -> b`) is rejected
-    and points at Name mapping, because that mistake used to be accepted verbatim as an
-    id that could never match anything.
-  - Each section has a **(?)** panel explaining the concepts in place — including a
-    walkthrough of the same model's name at each hop (backend reports `deepseek/deepseek-v4-pro-0813:thinking`
-    → `model_map` renames it → client asks for `deepseek-v4-pro` → proxy sends
-    `deepseek/deepseek-v4-pro-0813:thinking`), which is the thing worth having on screen while you are staring
-    at a list of native ids.
-  - `api_key` values are never sent to the browser; a provider shows only whether one is
-    set. Editing secrets and adding/removing whole providers stay file-side for now.
+- **Logging.** A live log tail with a level filter, a text filter, pause and autoscroll,
+  plus the `LOG_INPUT` / `LOG_OUTPUT` runtime toggles.
+- **In-flight.** What the proxy is doing now, refreshed every second: live requests on
+  top, recently finished ones below.
+  - A running row shows its backend, the native model id, token counts and `tok/s`. A
+    queued row shows which backends it is waiting on and for how long. A finished row is
+    frozen with its status, total time, queue wait, tokens and cost.
+  - While a stream runs, `tok out` is the proxy's own count of generation steps, shown
+    with a `~`, and is replaced by the backend's number when usage arrives in the final
+    chunk. `tok in` is unknown until then.
+  - `tok/s` is the request log's `speed_tps`: output tokens over the upstream exchange,
+    queue wait excluded.
+  - Badges flag what happened on the way through: `attempt 2` (failed over),
+    `passed over N×` (queue affinity), `trimmed N msgs` (the
+    [context guardrail](#context-guardrail)), `smart` / `pinned` (a reordered backend
+    list), `cache hit N` (prompt tokens served from the backend's cache).
+  - **Body** expands a row to show the prompt and the reply, with a thinking model's
+    reasoning kept apart from its answer. Bodies are fetched per row on demand.
+  - **Kill** cancels a live request. See [Killing a request](#killing-a-request).
+  - The toolbar shows each backend's `in_use/slots`, amber when full, and the model it
+    has loaded.
+- **Costs.** What the traffic cost, from the [cost ledger](#cost-tracking).
+  - An **accounts** strip: each backend's balance and, for a subscription, an allowance
+    meter with the reset countdown (amber from 85%, red when used up).
+  - One filter row scopes the whole tab: a range (Today, 7d, 30d, 90d, This month, Last
+    month, All, or two dates, with `‹` `›` to step by the window's own length), a model,
+    a backend, and a day picked by clicking a column of the chart.
+  - A KPI row: total cost and how many requests carried a price, requests and failures,
+    tokens in and out, cache share, reasoning share, mean cost per priced request.
+  - **By day**: a column chart of cost, requests or tokens. **By model**: each model as
+    the client asked for it, with a chip per backend that served it, which answers
+    "which route for this model is cheaper". **By backend**: requests, cache share,
+    cost, cost per request and per million tokens; all `ollama*` hosts count as one
+    `ollama`. **Requests**: the newest requests in range.
+- **Models.** The catalog clients see, plus **Probe upstreams**, which queries each
+  backend's real `/v1/models` regardless of `enabled_models`.
+- **Routing.** The smart-routing switch, a mode per backend, each model's order now
+  beside its configured one, and the price used for each backend. Below it, each logical
+  model with its prioritized targets and live down/busy badges; reorder with `↑` `↓` or
+  by editing the number. Auto-grouped models and aliases are read-only here.
+- **Config.** Edit `config.yaml` from the browser. Every save rewrites the file with
+  comments preserved and takes effect at once.
+  - **Upstream models** per backend: allow everything, or an explicit list picked from
+    the backend's probed catalog. A pinned id the backend no longer reports stays
+    visible and checked, marked *not in catalog*.
+  - **Name mapping** per backend edits its `model_map`.
+  - **Model groups** adds, edits and deletes logical models. A target's native id left
+    blank inherits from `model_map`, and saving it does not turn it into an explicit
+    pin.
+  - **Aliases** adds, edits and deletes short names. An alias pointing at an unknown
+    backend is refused.
+  - Every pinned id is tagged with what a client has to send for it: the group that
+    fronts it, the name `model_map` gives it, or nothing when the raw id is the public
+    name.
+  - API keys are never sent to the browser. Editing secrets and adding or removing whole
+    backends stay file-side.
 
-#### Killing a request
+### Killing a request
 
-The **Kill** button cancels the asyncio task serving that request, which unwinds the
-ordinary cleanup path: the slot is released, the upstream connection closed, and the
-request moves into the history as `cancelled`. Cancellation rather than a flag, because
-the requests worth killing are blocked inside an `await` — a queued one inside the slot
-waiter future, a running one inside an upstream read that may never return.
+**Kill** cancels the task serving the request, which runs the ordinary cleanup: the slot
+is released, the upstream connection closed, and the request moves into the history as
+`cancelled`. It works on a queued request and on one stuck in an upstream read that
+will never return.
 
-What the caller sees depends on how far the request got:
-
-- **Queued, or a buffered (non-streaming) response** — a clean `503` with
-  `{"error": {"type": "cancelled"}}`, the same shape as a queue timeout.
-- **Mid-stream** — the SSE stream simply ends. The `200` was committed with the first
-  chunk, so there is no status code left to send; the client sees a truncated completion
-  and a normal end of body.
+- **Queued, or a non-streaming response:** the caller gets a `503` with
+  `{"error": {"type": "cancelled"}}`.
+- **Mid-stream:** the SSE stream ends. The `200` was committed with the first chunk, so
+  the client sees a truncated completion.
 
 Each kill is logged at `WARNING` with the request id, model, backend and elapsed time.
-- **Models** — the aggregated catalog, plus a **Probe upstreams** button that queries
-  each backend's real `/v1/models` so every endpoint's full list is visible at once
-  (independent of `enabled_models`).
-- **Routing** — a **Smart routing** section on top (the on/off switch, a mode per backend, each
-  model's order now against its configured one, and the observed prices it ranks by — see
-  [Smart routing](#smart-routing)), then each logical model drawn as connected boxes (model → prioritized
-  targets) with live down/busy badges; rearrange priorities with `↑`/`↓` or by editing
-  the number. Edits apply immediately **and are written back into the config file**.
-  Auto-grouped models and aliases are shown read-only.
 
-#### How console edits reach the file
+### How console edits reach the file
 
-Every console edit rewrites `config.yaml` through a **ruamel.yaml round-trip**, so
-comments, key order, quoting and blank lines survive. Measured on this project's own
-production config (189 lines, 31 comments): a round-trip keeps every comment and
-produces a semantically identical document. The one irreducible change is
-hand-alignment *padding inside flow maps* —
-`{provider: nanoGPT,␣␣␣␣␣␣priority: 2}` becomes `{provider: nanoGPT,␣priority: 2}`,
-because ruamel does not track intra-flow spacing. That normalization happens **once**,
-on the first console write.
+Every console edit rewrites `config.yaml` through a ruamel.yaml round-trip, so comments,
+key order, quoting and blank lines survive. The one thing ruamel cannot keep is
+hand-aligned padding inside flow maps (`{provider: nanoGPT,      priority: 2}`), which is
+normalized once, on the first console write.
 
-Requirements & behavior:
+- The config must be mounted **read-write**. On a `:ro` mount the edit is refused as
+  "not persisted" and the tabs show a read-only warning.
+- **Abort, don't corrupt.** Each edit is serialized, re-parsed, and checked to contain
+  exactly the requested change before the file is opened for writing. An edit may never
+  add or remove a provider. Any surprise aborts with a reason and leaves the file
+  byte-identical.
+- The write is in place, never write-then-rename, so it works on a single-file bind
+  mount.
+- The edit is applied to the running process before the response returns.
+- `api_key` values are written back verbatim and never leave the process.
 
-- The config volume must be mounted **read-write** (the bundled compose does this).
-  On a `:ro` mount the change is refused with *"not persisted"* and the file is
-  untouched; the Config and Routing tabs show a read-only warning.
-- **Abort-don't-corrupt.** Every edit is serialized, re-parsed with plain PyYAML, and
-  checked to contain exactly the requested change *before* the file is opened for
-  writing. A mutation may never add or remove a provider — that guard is explicit.
-  Any surprise aborts with a reason and leaves the file byte-identical.
-- The write is **in-place** (`r+` + truncate), never write-temp-then-rename:
-  `/app/config.yaml` is a single-file bind mount, so a rename would detach from the
-  host inode.
-- The edit is applied to the live process before the response returns, so the console
-  re-renders from the file rather than from what it hoped it wrote.
-- `api_key` values are read and written back verbatim and **never** leave the process.
-  A provider reports only `has_api_key`.
+## The model list
 
-**Inherited vs. explicit native ids.** A target's `model:` may be omitted, meaning
-"inherit the native id from this provider's `model_map`". The editor keeps that
-distinction: an inherited target shows an empty field with the resolved id as a
-greyed `inherits …` placeholder, and saving it unchanged does **not** write an
-explicit pin. Otherwise opening a group and pressing Save would silently harden every
-inherited id — changing what the config means without changing what it says.
+`/v1/models` lists, deduplicated and in canonical names: aliases, logical models, and
+every other model once. A model served by several backends appears a single time.
 
-### `/models` aggregation
+- Backend-prefixed `provider:model` ids are not listed. They still work for pinning.
+- Anything a logical model fronts is hidden, both its canonical name and the native ids
+  of its targets, so per-backend variants do not appear and disappear as backends come
+  and go. A logical model is always listed.
+- Backends with an empty `enabled_models` are queried live (`GET {base_url}/v1/models`),
+  cached for `cache_ttl`, with concurrent cold requests sharing one probe.
+- **A failed probe does not blank a backend.** A local backend busy loading a model can
+  miss its probe window, so the last catalog that succeeded stands in for up to 5
+  minutes, re-probing every 15 seconds. Past that, a backend that is still failing drops
+  out of the list.
+- Gated backends are hidden from callers without a valid key.
 
-Lists, deduplicated, in **canonical** names: aliases, logical models, and each remaining
-canonical model once (native ids translated through `model_map`). A model served by several
-backends appears a **single** time (the proxy load-balances behind it). Backend-prefixed
-`provider:model` ids are **not** listed — they still work for pinning a specific backend, but
-advertising them would just duplicate the clean names. Likewise, anything a logical model
-fronts is **hidden** — both its canonical name and the concrete native ids of its targets —
-so clients use the stable logical name instead, and per-backend variants (e.g. quantizations)
-don't flap in and out of the list as backends come and go. Live-discovered backends are queried (`GET {base_url}/v1/models`),
-cached for `cache_ttl`, coalesced via single-flight so a burst of cold requests triggers one
-probe per backend; offline backends drop out.
-
-**A failed probe does not blank a backend.** A local backend busy loading a model can miss
-its `/v1/models` window, and treating that as "this box has no models" made every model on
-it unresolvable for a full `cache_ttl`. Instead the last catalog that *did* succeed stands
-in for up to 5 minutes (`registry.STALE_GRACE`), re-probing every 15s while it does, and is
-logged each time. Past that window a backend that is still failing really is gone and its
-models drop out of the listing. Gated backends are hidden from callers
-without a valid key.
-
-## Prometheus Metrics
+## Prometheus metrics
 
 Scrape `http://<host>:8000/metrics`:
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `llm_proxy_requests_total` | Counter | `provider`, `model` | Completed requests |
-| `llm_proxy_tokens_input_total` | Counter | `provider`, `model` | Cumulative input tokens |
-| `llm_proxy_tokens_output_total` | Counter | `provider`, `model` | Cumulative output tokens |
-| `llm_proxy_tokens_cached_total` | Counter | `provider`, `model` | Prompt tokens the backend reported as served from its prompt cache (a subset of input) |
-| `llm_proxy_cost_total` | Counter | `provider`, `model` | Cumulative cost in USD **as reported by the backend** (`usage.cost`). Backends that report no price add nothing, so this is a floor on spend, not the bill. See [Cost tracking](#cost-tracking) |
-| `llm_proxy_request_duration_seconds` | Histogram | `provider`, `model` | Request latency (0.1–600s) |
+| `llm_proxy_tokens_input_total` | Counter | `provider`, `model` | Input tokens |
+| `llm_proxy_tokens_output_total` | Counter | `provider`, `model` | Output tokens |
+| `llm_proxy_tokens_cached_total` | Counter | `provider`, `model` | Prompt tokens served from the backend's prompt cache (a subset of input) |
+| `llm_proxy_cost_total` | Counter | `provider`, `model` | Cost in USD: what the backend reported, or the [price table](#price-tables) estimate. A backend with neither adds nothing, so this is a floor on spend |
+| `llm_proxy_request_duration_seconds` | Histogram | `provider`, `model` | Request latency (0.1 to 600 s) |
 | `llm_proxy_errors_total` | Counter | `provider`, `model`, `status_code` | Failed requests |
-| `llm_proxy_slots_in_use` | Gauge | `provider` | In-flight requests holding a slot |
-| `llm_proxy_queue_waiting` | Gauge | — | Requests currently waiting for a slot |
 | `llm_proxy_failovers_total` | Counter | `provider` | Failovers away from a backend |
+| `llm_proxy_slots_in_use` | Gauge | `provider` | In-flight requests holding a slot |
+| `llm_proxy_queue_waiting` | Gauge | | Requests waiting for a slot |
 | `llm_proxy_queue_affinity_grants_total` | Counter | `provider` | Times the queue admitted a request ahead of an earlier one to avoid a model swap |
-| `llm_proxy_queue_starvation_yields_total` | Counter | `provider` | Times `affinity_max_skips` forced FIFO to unblock a passed-over request |
-| `llm_proxy_trims_total` | Counter | `model` | Requests whose conversation was shrunk to fit the `num_ctx` they declared (see [Context guardrail](#context-guardrail)) |
+| `llm_proxy_queue_starvation_yields_total` | Counter | `provider` | Times `affinity_max_skips` forced a passed-over request through |
+| `llm_proxy_trims_total` | Counter | `model` | Requests shrunk by the [context guardrail](#context-guardrail), keyed by the name the client sent |
+| `llm_proxy_build_info` | Gauge | `version`, `revision` | Always 1; the labels are the running build |
 
-> **Metric prefix:** as of the multi-backend rework these use `llm_proxy_` (was
-> `deepseek_proxy_`). Update existing Grafana/alert queries accordingly.
+The `model` label is the native id. Requests with no model (passthroughs) are left out
+of the per-model metrics.
 
-### Counters reset on restart — on purpose
+### Counters reset on restart, on purpose
 
 In-memory counters go back to zero when the proxy restarts. Prometheus recognises that
-as a counter reset and compensates for it, so `rate()` and `increase()` stay correct
-across a reboot; all you lose is the sliver of traffic between the last scrape and the
-shutdown.
+as a counter reset, so `rate()` and `increase()` stay correct across a reboot.
 
-**Do not "fix" this by snapshotting the counters to disk and re-seeding them on boot.**
-This repo shipped exactly that (`METRICS_PERSIST`) and it was removed, because it turns a
-harmless reset into a fabricated spike. The snapshot always lags the last scrape a little,
-so the counter comes back *lower* than the value Prometheus already read. Prometheus reads
-any decrease as a reset-to-zero and credits the **entire pre-drop value** as fresh
-increase — the phantom is the size of the whole counter, not the size of the dip. On
-2026-08-26 a two-request lag reported 1260 requests and 36.6 M input tokens inside a
-21-minute window for a local model that had served two.
+Do not snapshot the counters to disk and re-seed them on boot. This repo once did
+(`METRICS_PERSIST`) and it was removed, because it turns a harmless reset into a
+fabricated spike: the snapshot lags the last scrape, the counter comes back lower than
+the value Prometheus already read, and Prometheus credits the entire pre-drop value as
+new increase.
 
-For long-range totals, use the reset-proof `:increase5m` recording rules
-(`monitoring/recording-rules.yml` in the deploy repo) rather than reading the raw counter:
+For long-range totals, use reset-proof `:increase5m` recording rules instead of the raw
+counter:
 
 ```promql
 sum_over_time(llm_proxy_requests_total:increase5m[$__range])
 ```
 
-Live gauges (`slots_in_use`, `queue_waiting`) and the latency histogram reflect the current
-process and reset too — that is what they are for.
-
 ## Cost tracking
 
-Some backends say what a request cost. OpenRouter and NanoGPT both put the price in the
-response's `usage.cost` (USD), next to the token counts, and both also report how much of
-the prompt was served from a **prompt cache** (`prompt_tokens_details.cached_tokens`,
-`cache_read_input_tokens`) and how many completion tokens were **reasoning**. DeepSeek
-reports cache hits (`prompt_cache_hit_tokens`) but no price; Google, Copilot and the local
-Ollama boxes report neither; the Claude CLI backend reports cache reads and writes and
-deliberately no price (it draws from a subscription seat, and the CLI's `total_cost_usd`
-is a list-price estimate, not a charge).
+Some backends say what a request cost. OpenRouter and NanoGPT put the price in the
+response's `usage.cost` (USD) and report how much of the prompt was served from a
+prompt cache and how many completion tokens were reasoning. DeepSeek reports cache hits
+but no price. Google, Copilot and local Ollama report neither. The Claude CLI backend
+reports cache reads and writes and deliberately no price, since it draws from a
+subscription seat.
 
-The proxy reads all of those spellings into one usage record per request
-(`app/usage.py`) and fans it out to four places:
+The proxy reads all of those spellings into one usage record per request and sends it
+to four places:
 
-1. the **request log** line — `cost=`, `cached=`, `cache_write=`, `reasoning=`, each
-   present only when the backend reported it (`cost=0` is kept: a free model *is* priced,
-   at zero);
-2. the **In-flight** row's `cost` cell and `cache hit` badge;
+1. the **request log** line: `cost=`, `cached=`, `cache_write=`, `reasoning=`, each
+   present only when the backend reported it;
+2. the **In-flight** row's cost cell and `cache hit` badge;
 3. the metrics `llm_proxy_cost_total` and `llm_proxy_tokens_cached_total`;
-4. the **cost ledger** — one row per completed request in a SQLite file
-   (`LEDGER_PATH`, default `ledger.sqlite` beside the config), which is what the
-   console's **Costs** tab reads: totals, per day, per model with the per-backend split,
-   per backend, and the newest requests, over a chosen range and optional day / model /
-   backend filters (`GET /admin/costs`).
+4. the **cost ledger**: one row per completed request in a SQLite file (`LEDGER_PATH`),
+   which the console's Costs tab and `GET /admin/costs` read.
 
-The ledger exists because the questions it answers — *what did this model cost this
-month, which backend served it cheaper, which requests were they* — span restarts, and
-nothing else in the process does: the In-flight history is a bounded in-memory ring and
-the Prometheus counters reset by design. It is **not** a counter snapshot and is never
-fed back into one (see the note below on why that would be wrong); it is an append-only
-record, like the log lines it mirrors, read only by the admin API. Rows older than
-`LEDGER_RETENTION_DAYS` (365) are pruned. Writes run in a worker thread and a ledger that
-cannot be written is a warning, never a failed request. In the deploy the file lives in
-the config directory mount — `monitoring/llmproxy/ledger.sqlite`, gitignored there — so it
-survives container recreates.
+The ledger exists because its questions (what did this model cost this month, which
+backend served it cheaper) span restarts, and nothing else in the process does. It is an
+append-only record, never fed back into a counter. Rows older than
+`LEDGER_RETENTION_DAYS` are pruned. A ledger that cannot be written is a warning, never
+a failed request.
 
-A price the backend did not report is **unknown, not zero**: the ledger stores `NULL`,
-the tab shows `—` and counts how many requests were actually priced next to every total,
-so a total over mixed backends reads as the floor it is.
+A price the backend did not report is **unknown, not zero**. The ledger stores `NULL`,
+the tab shows `—` and counts how many requests were priced next to every total, so a
+total over mixed backends reads as the floor it is. `cost=0` is different: a free model
+is priced, at zero.
 
 ### Price tables
 
 For a backend that never reports a price, give its provider block a `pricing:` table and
-the proxy prices each request itself, from the token counts the response *does* carry:
+the proxy prices each request from the token counts the response does carry:
 
 ```yaml
   - name: deepseek
@@ -988,18 +832,24 @@ the proxy prices each request itself, from the token counts the response *does* 
 ```
 
 The price is `(in - cached) × input + cached × cached + out × output`, times the peak
-multiplier when the request **started** inside the window. Rates are the off-peak
-base. Such a price is an **estimate at list price**, not a charge: it flows to the same
-four places as a reported one, and the log line says so with `cost_src=table`. Three
-rules keep it honest: a price the backend *did* report always wins; a model missing from
-the table (and no `"*"` entry) stays unpriced; and a response with no usage block stays
-unpriced rather than costing zero. A malformed table fails the config load instead of
-pricing at zero. Vendor holidays (DeepSeek bills Chinese public holidays off-peak) are not
-modelled — those days read as peak, so the estimate errs high.
+multiplier when the request started inside the window. `cached` defaults to `input`, and
+a `"*"` entry covers unlisted models.
 
-## Request Logging
+Such a price is an estimate at list price, not a charge. It goes to the same four
+places as a reported one, and the log line marks it with `cost_src=table`. The rules:
 
-Every completed request — success **or** error — emits exactly one structured
+- a price the backend did report always wins;
+- a model missing from the table, with no `"*"` entry, stays unpriced;
+- a response with no usage block stays unpriced, never zero;
+- a malformed table fails the config load.
+
+Vendor holidays (DeepSeek bills Chinese public holidays off-peak) are not modelled, so
+on those days the estimate errs high. The same table is what [smart routing](#smart-routing)
+uses as the backend's published rate.
+
+## Request logging
+
+Every completed request, success or error, emits one structured
 [logfmt](https://brandur.org/logfmt) line on stdout:
 
 ```
@@ -1008,64 +858,52 @@ ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=
 
 | Field | Meaning |
 |---|---|
-| `ts` | ISO-8601 timestamp **with offset** (local time per `TZ`; unambiguous regardless of reader) |
-| `provider`, `model` | Backend chosen and the **native** model id sent to it |
-| `asked` | The model name the **client** sent, when it differs from `model`. A group spanning three backends resolves to three different native ids, so `model=` alone splits one model's traffic across three series — and a failover moves a request between them mid-flight. Group by `asked` to chart what people actually requested; omitted when the two names are identical |
-| `served` | The model the backend's **response** says it ran, when it differs from `model`. A native id is often a rolling alias — the [Claude CLI](#claude-via-the-claude-code-cli)'s `opus`, an aggregator's unversioned slug — and this is where the concrete version that answered (`claude-opus-5-5`) is recorded; omitted when the backend echoes the id it was sent |
-| `status` | Upstream HTTP status relayed to the client |
+| `ts` | ISO-8601 timestamp with offset (local time per `TZ`) |
+| `provider`, `model` | The backend chosen and the **native** model id sent to it |
+| `asked` | The model name the client sent, when it differs from `model`. Group by this to chart what people requested: a logical model spanning three backends has three native ids |
+| `served` | The model the backend's response says it ran, when it differs from `model`. Records the concrete version behind a rolling alias |
+| `status` | The upstream HTTP status relayed to the client |
 | `stream` | Whether the response was streamed |
-| `in`, `out`, `dur` | Prompt/completion tokens and wall-clock duration as `H:MM:SS` (rounded up to the second, so a fast request reads `0:00:01` not `0:00:00`) |
-| `cached`, `cache_write`, `reasoning` | Present only when the backend reported them: prompt tokens read from its prompt cache (a subset of `in`), prompt tokens written into it, and completion tokens spent thinking (a subset of `out`). See [Cost tracking](#cost-tracking) |
-| `cost` | What the request cost, in USD, as a plain decimal — present only when the backend reported one (OpenRouter, NanoGPT) or the provider has a [price table](#price-tables). `cost=0` means a free model; no field means nobody said. `sum by (asked) (sum_over_time({container="llm-proxy"} \| logfmt \| unwrap cost [$__range]))` charts spend per model in Grafana |
-| `cost_src` | `table` when `cost` is the proxy's list-price estimate from a [price table](#price-tables) rather than what the backend charged; absent otherwise |
-| `speed_tps` | Output tokens/s. **Omitted for embeddings & rerankers** — they return no completion tokens, so it would always be a misleading `0.00` |
-| `op`, `in_tps` | Present only on no-output ops (**`embedding`**, **`rerank`**): the op kind plus input tokens/s — the throughput that matters when nothing is generated |
-| `client_ip` | Caller address (`X-Forwarded-For`/`X-Real-IP` honored when `TRUST_PROXY_HEADERS`) |
-| `client_host` | Reverse-DNS of `client_ip` (omitted if unresolved or `RESOLVE_CLIENT_HOST=false`) |
-| `svc`, `ua` | Service guessed from the User-Agent's leading token, and the full User-Agent |
-| `err` | Short error category (`invalid_request`, `unauthorized`, `rate_limited`, `upstream_error`…); absent on success |
-| `route` | Present only when [smart routing](#smart-routing) or a `first`/`last` override actually changed the backend order for this request: `smart`, `pinned` or `smart+pinned` |
-| `trimmed`, `trim_capped` | Present only when the [context guardrail](#context-guardrail) shrank the request: messages dropped and old tool results cut to an excerpt. `{trimmed!=""}` in Loki finds every trimmed request; the matching `CONTEXT TRIM request #N …` WARNING has the token estimates |
+| `in`, `out` | Prompt and completion tokens |
+| `dur` | Duration of the upstream exchange as `H:MM:SS`, rounded up to the second |
+| `cached`, `cache_write`, `reasoning` | When reported: prompt tokens read from the cache (a subset of `in`), prompt tokens written to it, and completion tokens spent thinking (a subset of `out`) |
+| `cost` | USD, as a plain decimal, when the backend reported one or the provider has a [price table](#price-tables). `cost=0` is a free model; no field means nobody said |
+| `cost_src` | `table` when `cost` is the proxy's list-price estimate |
+| `speed_tps` | Output tokens per second. Omitted for embeddings and rerankers |
+| `op`, `in_tps` | On embeddings and rerankers only: `embedding` or `rerank`, and input tokens per second |
+| `route` | When smart routing or a `first`/`last` override changed the backend order: `smart`, `pinned` or `smart+pinned` |
+| `trimmed`, `trim_capped` | When the [context guardrail](#context-guardrail) acted: messages dropped and tool results cut to an excerpt |
+| `client_ip`, `client_host` | The caller's address and its reverse-DNS name |
+| `svc`, `ua` | The service guessed from the User-Agent's first token, and the full User-Agent |
+| `err` | A short error category (`invalid_request`, `unauthorized`, `not_found`, `rate_limited`, `upstream_error`); absent on success |
 
-An **embedding or rerank** request returns no completion tokens (`out=0`), so it's tagged
-`op=embedding` / `op=rerank` and reports `in_tps` (input tokens/s) in place of `speed_tps` —
-an output-tokens/s figure would just be a constant `0.00` that skews throughput panels.
-Detection is by request path (`/v1/embeddings`, `/v1/rerank`, …) **and** model id (e.g. a
-`*-Reranker-*` / `*-Embedding-*` name), so it works even on a nonstandard path:
+Embedding and rerank requests return no completion tokens, so they are tagged `op=` and
+report `in_tps` in place of `speed_tps`. Detection is by request path and by model id
+(a name containing `embed` or `rerank`).
 
-```
-ts=2026-06-30T12:24:12-03:00 level=info event=request provider=ollamaGW model=Qwen3-Reranker-8B op=rerank status=200 stream=false in=9515 out=0 dur=0:00:12 in_tps=792.92 client_ip=172.19.0.19 client_host=open-webui.main svc=python-requests ua=python-requests/2.34.2
-```
+A request whose body carries no `model` (a non-chat or multipart passthrough, forwarded
+untouched to the first HTTP backend the caller may use) is logged as
+`event=passthrough`, keyed by `method` and `path`. These stay out of the per-model
+metrics and the ledger.
 
-A request whose body carries no resolvable `model` (a non-chat / multipart passthrough —
-forwarded untouched to the first provider) is logged instead as **`event=passthrough`**,
-keyed by `method` + `path` rather than a model, e.g.:
-
-```
-ts=2026-06-17T12:10:23-03:00 level=info event=passthrough provider=deepseek method=POST path=/models status=405 stream=false client_ip=192.168.0.79 client_host=luis.brandao svc=PostmanRuntime ua="PostmanRuntime/7.52.0" err=invalid_request
-```
-
-So `model=` never appears as `unknown`, and these requests stay out of per-model dashboards
-(they're also excluded from the `llm_proxy_*` model metrics). Split them in Loki with
-`| logfmt | event="request"` vs `event="passthrough"`.
-
-Because it's logfmt, Loki/Grafana parse it with no regex:
+Loki and Grafana parse the line with no regex:
 
 ```logql
 {container="llm-proxy"} | logfmt | status>=`400`            # all failed requests
 {container="llm-proxy"} | logfmt | provider=`openRouter`    # one backend
-sum by (client_host) (count_over_time({container="llm-proxy"} | logfmt [1h]))  # calls per caller machine
+{container="llm-proxy"} | logfmt | trimmed!=""              # every trimmed request
+sum by (asked) (sum_over_time({container="llm-proxy"} | logfmt | unwrap cost [$__range]))   # spend per model
 ```
 
-The line is emitted **after** the response is delivered (background task / stream
-end), so reverse-DNS never adds latency to the caller.
+The line is emitted after the response is delivered, so the reverse-DNS lookup never
+adds latency for the caller. All other log lines (the verbose dumps, warnings, uvicorn's
+own) use `<ts> LEVEL <msg>` with the same timestamp format, also on stdout.
 
-`LOG_INPUT` logs the full proxied request curl-style (auth masked); `LOG_OUTPUT` logs the
-upstream response pretty-printed (streaming reassembled into one JSON with
-`_assembled_content` / `_reasoning_content`). These verbose dumps and uvicorn's access/error
-logs use the human-readable `<ts> LEVEL <msg>` format (same ISO-8601 timestamp).
+### Verbose logging
 
-Both flags can be flipped at runtime — no restart required:
+`LOG_INPUT` logs the full proxied request curl-style, with auth masked. `LOG_OUTPUT`
+logs the upstream response pretty-printed; a stream is reassembled into one JSON with
+`_assembled_content` and `_reasoning_content`. Both can be flipped at runtime:
 
 ```bash
 curl http://<host>:8000/logging                          # current state
@@ -1074,14 +912,14 @@ curl -X POST http://<host>:8000/logging \
   -d '{"log_input": true, "log_output": true}'           # either key optional
 ```
 
-The `POST` requires a valid proxy key when `PROXY_API_KEYS` is set (otherwise open). The
-env vars still set the state at boot; runtime changes are not persisted across restarts.
+Runtime changes are not kept across restarts; the environment variables set the state
+at boot.
 
-### Error logging & relay
+### Upstream errors
 
-Upstream errors are **always logged with their response body** (WARNING level, pretty-printed,
-truncated at 4 KB) regardless of `LOG_OUTPUT` — the body is where the backend says *why* it
-rejected the request:
+An upstream error is always logged with its response body (WARNING, pretty-printed,
+truncated at 4 KB) whatever `LOG_OUTPUT` says, because the body is where the backend
+says why:
 
 ```
 2026-06-11T23:42:22-03:00 WARNING Upstream error 400 from 'google' (model: gemini-2.5-pro):
@@ -1090,78 +928,43 @@ rejected the request:
 }
 ```
 
-The error body and status are also relayed to the client verbatim — including on **streaming**
-requests, where the upstream's 4xx/5xx is returned as a plain JSON response instead of being
-wrapped in a bogus `200` SSE stream. The one-line `event=request … status=400 err=invalid_request`
-summary above is emitted in addition, so you can both alert on it and read the full reason.
+The error body and status are relayed to the client verbatim, on streaming requests
+too: an upstream 4xx/5xx is returned as a plain JSON response, not wrapped in a `200`
+SSE stream.
 
-> **Streaming token counts:** upstreams only emit a `usage` block in a streamed response
-> when the request sets `stream_options: {"include_usage": true}`. The proxy **injects
-> this automatically** on streamed requests (unless the client explicitly set it), so
-> token metrics/logs are reliable for streams too. As a result the client receives a final
-> usage chunk (standard OpenAI streaming behavior). Non-streaming always reports usage.
+> **Streaming token counts.** Upstreams emit a `usage` block in a stream only when the
+> request sets `stream_options: {"include_usage": true}`. The proxy adds it to streamed
+> requests unless the client set it, so the client receives a final usage chunk.
 
-## CI / CD
+## Build, versioning and CI
 
-Pushes to `master` (ignoring `.md`-only changes) build the Docker image and push to GitHub
-Container Registry, tagged `latest` and `master-{run_number}`, using `GITHUB_TOKEN`.
+A push to `master` runs the tests and then builds the Docker image and pushes it to
+GitHub Container Registry, tagged `latest` and `master-<run_number>`. A push that
+touches only `.md` files builds nothing. The same `master-N` is pushed as a git tag on
+the built commit, so `git checkout master-70` is the code a running version was built
+from.
 
-The same name is pushed as a **git tag** on the built commit, after the image push, so a
-tag exists only for a build that produced an image. For any running version —
-`/health`, the console's build chip, the image in the compose file — `git checkout master-70`
-is the code it was built from, and `git log master-69..master-70` is what changed between
-two deploys.
-
-## Tech Stack
-
-- **FastAPI** + **uvicorn** — async ASGI
-- **httpx** — async client with streaming
-- **prometheus-client** — native metrics
-- **PyYAML** — config parsing
-- **ruamel.yaml** — comment-preserving config *writes* from the console
-- **pytest** + **pytest-asyncio** — test suite (dev only, see below)
-- **Python 3.11**
-
-## Versioning
-
-The image tag and the version the process reports are the **same string**, so you
-can always tell whether the container answering requests is the build you pinned.
-
-CI passes the build identity into the image:
-
-```yaml
-build-args: |
-  APP_VERSION=master-${{ github.run_number }}   # identical to the image tag
-  APP_REVISION=${{ github.sha }}
-```
-
-The Dockerfile turns those into `ENV`, and `app/version.py` reads them once at
-startup. It shows up in four places:
+The image tag and the version the process reports are the same string, so you can tell
+whether the container answering requests is the build you pinned:
 
 | Where | Looks like |
 |---|---|
 | Startup log | `llm-proxy master-52 (1e5837a3) starting — 8 providers, 9 logical models, 0 aliases` |
 | `GET /health` | `{"status":"ok","version":"master-52","revision":"1e5837a3…","release":true}` |
 | `GET /metrics` | `llm_proxy_build_info{version="master-52",revision="1e5837a3…"} 1.0` |
-| Console header | a `master-52` chip next to the title, hover for the commit |
+| Console header | a `master-52` chip next to the title; hover for the commit |
 
-Built outside CI (a plain `docker build`, or running from a checkout) the version
-is `dev` with `release: false` — a truthful answer rather than a misleading
-number.
-
-Two things this makes possible that weren't before:
+Built outside CI (a plain `docker build`, or running from a checkout) the version is
+`dev` with `release: false`.
 
 ```bash
 # does the running process agree with what the compose file pins?
-curl -s gw.brandao:8000/health | jq -r .version
-
-# alert on a fleet running mixed builds
-count(count by (version) (llm_proxy_build_info)) > 1
+curl -s <host>:8000/health | jq -r .version
 ```
 
-`/health` is unauthenticated, like `/metrics` — this is a build counter, not a
-CVE-mappable version string, on a proxy that already lists its catalog to
-anonymous callers.
+Stack: Python 3.11, FastAPI and uvicorn, httpx, prometheus-client, PyYAML (config
+reads), ruamel.yaml (comment-preserving config writes), tokenizers (the context
+guardrail), SQLite from the standard library (the ledger).
 
 ## Tests
 
@@ -1170,12 +973,12 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-Around 300 tests, no network, a few seconds. They exist to pin the properties that
-are invisible in review: that every acquired slot is released on every exit path
-(including timeout and cancellation), that two identical config saves leave the
-file byte-identical, that an unknown model 404s instead of being routed to an
-arbitrary backend, and that the fields the web console reads from `/admin/*` are
-all still there. `AGENTS.md` has the per-file breakdown.
+About 500 tests, no network, a few seconds. They pin the properties that are invisible
+in review: every acquired slot is released on every exit path, two identical config
+saves leave the file byte-identical, an unknown model 404s instead of being routed to
+an arbitrary backend, and the fields the console reads from `/admin/*` are all still
+there. [`AGENTS.md`](AGENTS.md) describes the code's structure, its invariants, and
+what each test file guards.
 
 ## License
 

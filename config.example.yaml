@@ -2,9 +2,9 @@
 # Copy to config.yaml and fill in. Provider API keys go inline below; they may
 # optionally be pulled from the environment via ${ENV_VAR} interpolation instead.
 #
-# Runtime flags (LOG_INPUT, LOG_OUTPUT, PORT) and the proxy auth keys
-# (PROXY_API_KEYS) are NOT here — set them as environment variables in
-# docker-compose.yml / .env.
+# Runtime flags (LOG_INPUT, LOG_OUTPUT, PORT, LEDGER_PATH, …) are NOT here — set
+# them as environment variables in docker-compose.yml (README "Environment
+# variables").
 #
 # ── Canonical namespace ─────────────────────────────────────────────────────
 # Clients only ever see and send CANONICAL names. Native (provider-specific) ids
@@ -23,10 +23,11 @@ aliases:
   reasoner: deepseek:deepseek-v4-flash
 
 # Proxy auth keys gate any backend marked `require_permission: true`. Set them
-# via the PROXY_API_KEYS env var (comma-separated for several). Clients pass one
-# as `Authorization: Bearer <key>`. A caller with a valid key sees and uses
-# everything; a caller without one only sees/uses the open backends. With no
-# keys configured the gate is inert (everything open).
+# via the PROXY_API_KEYS env var (comma-separated for several), or list them here
+# under `auth: {keys: [...]}` (${ENV_VAR} supported); both sources are accepted.
+# Clients pass one as `Authorization: Bearer <key>`. A caller with a valid key
+# sees and uses everything; a caller without one only sees/uses the open
+# backends. With no keys configured the gate is inert (everything open).
 
 # Each backend has:
 #   slots             max concurrent in-flight requests (shared across all its
@@ -149,8 +150,8 @@ providers:
 #     served as a different quant on each box.
 # Backends that expose the *same* canonical id auto-group with no entry here,
 # ordered by provider priority. Explicit `provider:model` always still pins one.
-# Keep targets in this one-line flow style — the web console's runtime priority
-# editor persists changes by rewriting exactly these lines (config mount must be rw).
+# The web console edits these entries and writes them back into this file with
+# comments and formatting preserved, so the config mount must be rw.
 models:
   deepseek-v4-flash:
     targets:                    # native ids inherited via each provider's model_map
@@ -178,13 +179,15 @@ routing:
   # to the next target (a connection failure always does). 4xx like 400/404 are
   # relayed as-is — every backend would reject them the same way. Default below.
   failover_statuses: [402, 429, 500, 502, 503, 504]   # 402: balance ran out between two reads
-  # Smart routing: try a model's backends cheapest-first, ranked by what the cost
-  # ledger has seen each one charge per million tokens (see README "Smart routing").
-  # OFF by default — the priority order above runs unless this is true. Switchable
-  # from the console's Routing tab, which writes it back here.
+  # Smart routing: try a model's backends cheapest-first (see README "Smart
+  # routing"). Each backend is priced from, in order: a subscription with
+  # allowance left (free), the vendor's published rate, or what the cost ledger
+  # has seen it charge. OFF by default — the priority order above runs unless
+  # this is true. Switchable from the console's Routing tab, which writes it back.
   smart_routing: false
-  smart_window_days: 7      # how far back the observed prices are read
-  smart_min_requests: 5     # priced requests a (model, backend) needs before it is ranked
+  smart_window_days: 7      # how far back the observed prices (the fallback) are read
+  smart_min_requests: 5     # requests a (model, backend) needs before its observed price,
+                            # or its own cache/output shares, are trusted
   # Per-backend override. auto (default) takes part in the ranking; fixed is never
   # moved by it; first / last put a backend ahead of / behind the rest of its
   # model's backends — "use X because I said so" — with smart routing on or off.
@@ -193,7 +196,7 @@ routing:
   #   google: fixed
   #   nanoGPT: first
 
-# Warnings to an ntfy topic (see README "Warnings"): a balance running low or empty, a
+# Warnings to an ntfy topic (see README "Empty balances and warnings"): a balance running low or empty, a
 # subscription allowance used up, a payment refused. Off until `ntfy` is set. Inside the
 # docker network the topic is http://ntfy:80/<topic>; `token` is sent as a Bearer token
 # when the server needs one. One message when a condition becomes true, a reminder every

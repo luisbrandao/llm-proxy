@@ -20,12 +20,6 @@ involved, and the image tag is a build counter you must *read*, never guess.
 | Production host | `gw.brandao` — `ssh techmago@gw.brandao` | deploy repo lives at `~/docker`, has git credentials |
 | Image | `ghcr.io/luisbrandao/llm-proxy` | tags: `latest` **and** `master-<run_number>` |
 
-> **This repo was renamed** (`deepseek-prometheus` → `llm-proxy`). The local
-> `origin` URL still says the old name and works only via GitHub's redirect. The
-> image name comes from `github.repository`, which resolves to the **new** name —
-> so the image is `ghcr.io/luisbrandao/llm-proxy`, not `.../deepseek-prometheus`.
-> `gh` follows the rename transparently; don't "fix" the remote as part of a deploy.
-
 > **Sandbox note:** run every `ssh` and `docker` step **outside the sandbox**. The
 > sandbox hides `~/.ssh` (breaks SSH to gw) and strips supplementary groups
 > (breaks the local docker socket).
@@ -66,10 +60,12 @@ involved, and the image tag is a build counter you must *read*, never guess.
 
 ```bash
 cd /dados/techmago/git/luis/llm-proxy
-git add -A && git commit -m "<what changed>"
+git status                      # only your own changes should be listed
+git add <the files you changed> && git commit -m "<what changed>"
 git push
 ```
 
+Add by path, not `-A`: another session may have uncommitted work in this tree.
 Pushing to `master` is what triggers the build — there is no manual dispatch.
 
 ## 2. Wait for the build, then read the real tag
@@ -95,7 +91,8 @@ gh run list --workflow "Docker Build" --limit 1 \
 gh run watch <databaseId> --exit-status
 ```
 
-A run appears a few seconds after the push and takes **~20–35s** to finish. If
+A run appears a few seconds after the push and takes **one to two minutes** to
+finish (the tests, then the image build). If
 `gh run list` still shows the previous run, wait and re-poll — do not assume it
 was skipped. Confirm `headSha` matches the commit you just pushed.
 
@@ -140,14 +137,15 @@ rollback guesswork.
 cd /dados/techmago/git/luis/techsytes-docker
 # one line, in the `llm-proxy:` service block of monitoring/docker-compose.yml
 #   image: ghcr.io/luisbrandao/llm-proxy:master-<N>
-git commit -am "llm-proxy: master-<N>"
+git commit -m "llm-proxy: master-<N>" -- monitoring/docker-compose.yml
 git push
 ```
 
 Push this **before** touching gw — step 4 pulls it.
 
-Commit **by path** (`-- monitoring/docker-compose.yml`), not `-am`: this working
-tree routinely holds unrelated in-progress edits. And expect the push to be
+Commit **by path**, never `-am`: this working tree routinely holds unrelated
+in-progress edits, and `-am` once swept one into a tag bump and removed a
+provider from production. And expect the push to be
 rejected as non-fast-forward now and then — gw pushes a `Server Bump` whenever
 the console wrote config — so `git pull --rebase && git push` is the normal
 recovery, not a sign anything is wrong.
@@ -228,7 +226,7 @@ exactly what was running:
 cd /dados/techmago/git/luis/techsytes-docker
 git log -p --follow -- monitoring/docker-compose.yml | grep -m5 'llm-proxy:master'
 # set the image back to the last known-good master-N, then:
-git commit -am "llm-proxy: rollback to master-<N>"; git push
+git commit -m "llm-proxy: rollback to master-<N>" -- monitoring/docker-compose.yml; git push
 ssh techmago@gw.brandao 'cd ~/docker && git commit -am "Server Bump"; git pull; git push; cd monitoring && docker compose up -d'
 ```
 

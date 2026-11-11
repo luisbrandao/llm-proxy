@@ -12,6 +12,22 @@ Checked on 2026-10-21 with the proxy's own keys, read-only calls.
 | [NanoGPT](nanogpt.md) | `GET /api/v1/models?detailed=true` | `GET /api/subscription/v1/usage` | `POST /api/check-balance` | `cacheReadInputPer1kTokens` | not seen |
 | [DeepSeek](deepseek.md) | **none**, a table on the docs page | none | `GET /user/balance` | on the docs page | on the docs page |
 
+## What the proxy reads
+
+The table above is everything the vendors expose. These are the calls `app/providers/` makes,
+from the background task in `app/rates.py`. Paths are relative to the provider's `base_url` with
+a trailing `/v1` removed.
+
+| vendor | rates (hourly) | covered models (hourly) | quota | balance | request repair |
+|---|---|---|---|---|---|
+| OpenRouter | `GET /v1/models`, no key sent | none | none | `GET /v1/credits` | none |
+| NanoGPT | `GET /v1/models?detailed=true`, Bearer | `GET /subscription/v1/models` | `GET /subscription/v1/usage` | `POST /check-balance`, `x-api-key` | none |
+| DeepSeek | none: the provider's `pricing:` table | none | none | `GET /user/balance` | `reasoning_content` on tool-call turns ([deepseek.md](deepseek.md)) |
+
+Quota and balances are read every 2 minutes, every 30 seconds while a subscription is past 95%
+used. The per-host endpoint lists (`/models/{slug}/endpoints`, NanoGPT's `/providers`) and
+OpenRouter's `/key` are documented on the vendor pages but not read.
+
 ## Units differ, and one of them is a trap
 
 | source | field | unit |

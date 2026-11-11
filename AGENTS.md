@@ -1,546 +1,561 @@
 # AGENTS.md
 
-Guidance for AI agents working in this repo. Read this before changing routing,
-concurrency, or auth code. User-facing docs live in `README.md`.
+Guidance for AI agents working in this repo: what each part does, how a request moves
+through it, and the properties that must not break. Read it before changing routing,
+concurrency, auth, or anything that persists.
+
+Three documents, three jobs:
+
+- **`README.md`** is the operator's reference: config fields, environment variables,
+  endpoints, metrics, log fields, console tabs.
+- **This file** is the map of the code and the list of invariants.
+- **Each module's docstring** holds the full reasoning for that module's design. Read it
+  before editing the module; it is longer and more specific than anything here.
 
 ## What this is
 
-An OpenAI-compatible reverse proxy (FastAPI + httpx) in front of multiple LLM
-backends. Clients send a clean model name; the proxy resolves it to one or more
-prioritized backends, gates by permission, load-balances across per-backend
-concurrency slots (queueing when full), forwards, fails over on error, and
-decompresses the response. Single process, async, one uvicorn worker.
+An OpenAI-compatible reverse proxy (FastAPI + httpx, Python 3.11) in front of several
+LLM backends. A client sends a clean model name. The proxy resolves it to one or more
+prioritized backends, gates them by permission, admits the request to a per-backend
+concurrency slot (queueing when all are full), forwards it, fails over on error, and
+records what it cost. One process, async, **one uvicorn worker**.
+
+It serves real clients continuously (Open WebUI, coding agents) and callers with no
+proxy key, who may only ever reach the open backends. When you touch routing, the auth
+gate or error responses, check the keyless path as well as the authorized one: an error
+a keyless caller receives has to make sense from the client side alone.
+
+## Commands
+
+```bash
+pip install -r requirements-dev.txt
+pytest                                   # ~500 tests, no network, ~4 s
+
+# import check against the example config (CI runs this too)
+CONFIG_PATH=config.example.yaml python -c "from app import main; print('imports OK')"
+
+# run locally
+CONFIG_PATH=config.yaml uvicorn app.main:app --port 8000
+```
 
 ## Module map
 
 | File | Responsibility |
 |---|---|
-| `app/config.py` | Loads `config.yaml` + env. Dataclasses `Provider`, `Target`, `LogicalModel`, `Routing`. Exposes `PROVIDERS`, `PROVIDERS_BY_NAME`, `ALIASES`, `LOGICAL_MODELS`, `ROUTING`, `AUTH_KEYS`. Hot reload: `reload_if_changed()` re-reads the file and rebinds those globals (polled from `main._config_reload_loop`). |
-| `app/router.py` | `resolve(model) -> [Target]` (async). Resolution order: alias → `provider:model` → `models:` logical → auto-group. `_allow_listed` is the fallback for `auto_group: false` only — with auto-grouping on it can match nothing `_auto_group` doesn't. Returns `[]` when nothing serves the model — **never** a guessed backend. |
-| `app/slots.py` | Per-provider concurrency. `acquire(targets, timeout, on_skip)` / `release(provider, model)` / `poke()`. Priority admission (round-robin within a tie tier), then an **explicit** queue of `_Waiter` futures with model-affinity reordering. Also `in_use`/`resident_model`/`queue_depth` for introspection. |
-| `app/inflight.py` | The request feed backing the console's In-flight tab: `begin()` per request, `Entry.wait/run/chunk/token/record`, `Entry.tps()` (tokens/s over the handler's measured upstream time — the log's `speed_tps`, never a second clock), `Entry.finish()` (freezes into a bounded `_recent` ring buffer, `INFLIGHT_HISTORY`), `snapshot()`, `Entry.cancel()` for the Kill button, and a separate bounded `_bodies` store (`set_request`/`add_response`/`bodies()`) read only by `/admin/inflight/{id}/body`. Observation only apart from `cancel` — nothing in the *request path* reads it. |
-| `app/registry.py` | `/v1/models` listing, live model discovery (cached, single-flight), and backend health (`mark_down`/`is_down`/`clear_down`). |
-| `app/auth.py` | Bearer-key gate: `is_authorized(request)`, `restricted(provider)`. |
-| `app/proxy.py` | Request lifecycle: parse → resolve → gate → `_dispatch` (acquire slot, build body, forward, failover) → `_handle_non_stream` / `_handle_stream`. Also decompression, `_error` (the one OpenAI-shaped error envelope) and `_relay_headers`. |
-| `app/trim.py` | The context guardrail: `trim_request(payload, body_str, asked)` returns a shrunk copy of a chat body that declares `num_ctx` and is estimated to exceed it, or `None` when nothing needs to change. Excerpts old oversized tool results first, then drops the oldest turns at tool-call block boundaries; system messages always survive. Returns a `Trimmed` (payload + dropped/capped/before/after/budget) that `_route` writes to the entry (`Entry.mark_trimmed`) so the row badge and the log's `trimmed=`/`trim_capped=` fields carry the same numbers. Configured by the `trim:` section (`conf.TRIM`). Counts with a real tokenizer (`_TokenMeter`, the `tokenizer.json` that `trim.tokenizer` names — the image bakes Qwen's) over what the chat template renders; `_CharMeter` (JSON chars / `chars_per_token`) is only the fallback. Called once per request in `proxy._route`, in a worker thread (`asyncio.to_thread`), before `_dispatch`. |
-| `app/smart.py` | Smart routing. `order(targets, asked)` (pure, sync) returns the targets in the order a request should try them plus a note (`{"by": "smart"\|"pinned"\|"smart+pinned", "smart", "pinned", "to", "prices", "sources"}`, or `None` when nothing moved). When `routing.smart_routing` is on, each `auto` target is priced by `price_for`: **quota** (a covered model on a subscription with allowance left is `0`; used up and no overage is `inf`) → **published rate** (`rates.card_for`, evaluated at the request instant and weighted by the ledger's cache/output shares via `rates.expected_per_mtok`) → **observed** (`_prices`, needs `smart_min_requests`); an unpriceable target keeps its place. Rankable ones are sorted cheapest-first and dealt back into the positions the rankable ones held, each position keeping its original `priority`; then `first`/`last` overrides (`routing.backend_modes`) are applied with strict priorities 1..n. `refresh()` re-reads `ledger.observed_prices` and `observed_shares` into `_prices`/`_shares` every `REFRESH_SECS`; `snapshot()` backs the Routing tab. Called once per request in `proxy._route`, after the down-backend filter and before the guardrail. |
-| `app/rates.py` | What the vendors publish, kept fresh by the lifespan task `refresh_loop` (`cycle`): every hour each vendor's price catalog filtered to the models in use (`wanted`) plus which models a subscription covers, every 2 minutes subscription quota and balances. Plain dicts the request path only reads: `_cards` `(provider, native id) -> RateCard`, `_included`, `_quotas`, `_balances`. `card_for` (the operator's `pricing:` table beats a fetched card), `quota_state(provider, native)` → `free`/`billed`/`refused`/`None`, `expected_per_mtok`, `accounts_snapshot()` for `/admin/accounts`. A vendor that fails keeps its last good data and warns once per window; `refresh_*` never raise. |
-| `app/notify.py` | Warnings to ntfy (`conf.NOTIFY`, the `notify:` section; off until `ntfy` is set). `evaluate()` turns the `rates` account snapshot into notices — balance low/empty, subscription allowance used up, topped up — keyed `(provider, kind)`; `run_once()` sends them and marks one sent only when ntfy accepted it; `loop()` is the lifespan task (first check after 45 s, then every 60 s). `payment_required(provider, model)` is the only call from the request path (on a 402): it decides synchronously and sends from a background task. `send` never raises. |
-| `app/providers/` | One module per vendor (`openrouter`, `nanogpt`, `deepseek`) with `fetch_rates` / `fetch_included` / `fetch_quota` / `fetch_balance` (each optional) taking the shared client and a `Provider`, and pure `parse_*` functions over the decoded payload. `__init__` holds `RateCard` (a base `config.Rate` plus time-of-day `Override`s, `at(when)`), `Quota`, `Balance`. Every parser converts to USD per million tokens (OpenRouter prices per token, NanoGPT's cache price per thousand). `config.vendor_of(provider)` picks the module from the `base_url` host or an explicit `vendor:`. A vendor module may also define `adapt_request(payload)`, which `proxy._build_body` applies **per target** to the outgoing body (copy-on-write, never touching the payload shared with failover targets yet to be tried): `deepseek` puts the `reasoning_content` key on tool-call assistant messages that lack it, because DeepSeek 400s a conversation another backend started without it. Endpoints and units: `docs/providers/`. |
-| `app/usage.py` | One `Usage` out of every vendor's spelling of the response's usage block: `prompt`/`completion`, prompt-cache `cached`/`cache_write`, `reasoning`, and `cost`/`currency` (`usage.cost`, OpenRouter and NanoGPT; NanoGPT's `x_nanogpt_pricing` as fallback), plus `estimated` when the price came from a `pricing:` table. `parse(data)` takes the whole response object and returns `None` when there is no `usage`. `cost` is `None` when not reported — never 0, since `cost: 0` is a real statement (a free model). A leaf. |
-| `app/ledger.py` | The cost ledger: one SQLite row per completed request (`LEDGER_PATH`, default `ledger.sqlite` beside the config; `""` off, `":memory:"` process-lifetime). `record(...)` from `proxy._emit_request_log`, `summary(days, day, model, provider, limit, since, until)` for `/admin/costs`: totals, `by_day`, `by_model` (with each model's per-provider split), `by_provider`, newest `requests`. An explicit `since`/`until` (inclusive local dates) wins over `days`. The backend views and filter group `ollama*` providers as one `ollama` (`BACKEND_GROUPS`) — rows keep the real provider name. Every call runs in `asyncio.to_thread` on one connection under `_lock`; `record` never raises. Retention prune (`LEDGER_RETENTION_DAYS`) at connect and on the first write of a new local day. `startup()`/`close()` from the lifespan. |
-| `app/version.py` | Build identity — `VERSION` (the image tag, e.g. `master-52`), `REVISION` (git sha), `summary()`, `as_dict()`. Read from `APP_VERSION`/`APP_REVISION` at import; baked in by the Dockerfile from CI build-args. **Not** hot-reloaded — it is build metadata, not config. |
-| `app/claude_cli.py` | The `kind: claude-cli` backend: an `httpx.AsyncBaseTransport` that answers `POST …/chat/completions` by running the official `claude` binary headless (`claude -p --output-format json`, every tool off, empty cwd). `translate(payload)` → `Translated` (system prompt, prompt, callable functions → their parameter schemas); the CLI's `result` JSON → an OpenAI `chat.completion` (or a one-chunk SSE stream). With `tools`, the run is `stream-json` and `_Watch` turns a function call caught mid-stream into `tool_calls` (`_caught`). `client()` is the process-wide client `proxy._client_for` hands claude-cli providers instead of `upstream.forward_client()`. |
-| `app/upstream.py` | The two shared `httpx.AsyncClient`s and their timeouts. Everything outbound goes through here so connections are pooled; `FORWARD_TIMEOUT` is long-read/short-connect on purpose. Closed by `main`'s lifespan. |
-| `app/metrics.py` | Prometheus counters/gauges (`llm_proxy_` prefix). Never persisted — see the metrics note below. |
-| `app/logbuffer.py` | In-memory ring buffer (`logging.Handler`) of recent log lines, seq-stamped, for the `/admin/logs` tail. Process-local like the slot/health state. |
-| `app/configwrite.py` | Persists console edits into `CONFIG_PATH` via a **ruamel.yaml round-trip** (comments/key order/quoting preserved). `persist_model_priorities`, `set_enabled_models`, `set_aliases`, `set_logical_model`, `delete_logical_model` — each returns `(ok, reason)`. Abort-don't-corrupt; in-place write (bind-mount inode). |
-| `app/main.py` | FastAPI app, routes, logging unification, lifespan (config hot-reload watcher + upstream pool shutdown). The `/admin/*` API lives on the `admin` `APIRouter`, which carries the auth dependency, plus the `/ui` static mount. `_provider_view` / `_serialize_targets` are the single serializers all three admin views share. |
-| `tests/` | pytest + pytest-asyncio. `pip install -r requirements-dev.txt && pytest`. See **Testing** below for what each file guards. |
-| `app/static/` | The web console (`index.html` + `app.css` + `app.js`). Vanilla, no build step; served via `StaticFiles` at `/ui/`. |
+| `app/main.py` | ASGI entry. Logging setup (everything to stdout, uvicorn's loggers re-pointed), the lifespan (ledger open and close, the config watcher, the `smart` / `rates` / `notify` background tasks, pool shutdown), the public routes (`/health`, `/metrics`, `/logging`, `/v1/models`), the `/admin/*` API on the `admin` router, the `/ui` static mount, and the catch-all that calls `proxy.proxy_request`. `_provider_view`, `_serialize_targets` and `_config_snapshot` are the only serializers the admin views use. |
+| `app/proxy.py` | The request lifecycle: `proxy_request` (parse, open the in-flight entry) → `_route` (resolve, gate, filter, order, trim) → `_dispatch` (acquire a slot, `_build_body`, forward, fail over) → `_handle_non_stream` / `_handle_stream`. Also `_emit_request_log` (the `event=request` line and the ledger row), `_apply_pricing`, `_record_metrics`, `_error` (the one OpenAI-shaped error envelope), `_decompress`, `_relay_headers`. |
+| `app/router.py` | `resolve(model) -> [Target]`: alias → `provider:model` → `models:` logical model → auto-group. `_allow_listed` runs only with `auto_group: false`. Returns `[]` when nothing serves the model. |
+| `app/registry.py` | Live model discovery per backend (cached for `cache_ttl`, single-flight, last good catalog kept for `STALE_GRACE`), backend health (`mark_down` / `is_down` / `clear_down`), and `list_models` for `/v1/models`. |
+| `app/slots.py` | Per-backend concurrency: `acquire(targets, timeout, on_skip)`, `release(provider, model)`, `poke()`. Priority admission with round-robin inside a tie tier, then an explicit queue of `_Waiter` futures reordered by model affinity. `in_use` / `resident_model` / `queue_depth` for introspection. |
+| `app/smart.py` | `order(targets, asked)`: the cost ranking (when `routing.smart_routing` is on) and the `first` / `last` overrides (always). `price_for` picks quota → published rate → observed price. `refresh()` snapshots the ledger into `_prices` / `_shares` every 60 s. `snapshot()` backs the Routing tab. |
+| `app/rates.py` | Background reads of what the vendors publish: price catalogs hourly, subscription quota and balances every 2 minutes (30 s while a subscription is past 95% used). The request path only reads: `card_for`, `quota_state`, `out_of_funds`, `expected_per_mtok`. `accounts_snapshot()` backs `/admin/accounts`. |
+| `app/providers/` | One module per vendor (`openrouter`, `nanogpt`, `deepseek`), each with the fetchers it has an API for (`fetch_rates`, `fetch_included`, `fetch_quota`, `fetch_balance`), pure `parse_*` functions, and optionally `adapt_request(payload)`. `__init__` holds `RateCard`, `Override`, `Quota`, `Balance`, `get_vendor`. Endpoints and units are in `docs/providers/`. |
+| `app/notify.py` | Warnings to ntfy: balance low or empty, allowance used up, payment refused, topped up. `evaluate()` → `run_once()` → `loop()`. `payment_required()` is the one call from the request path. |
+| `app/trim.py` | The context guardrail. `trim_request(payload, body_str, asked, request_id)` returns a `Trimmed` (the shrunk payload plus the numbers) or `None`. `_TokenMeter` counts with a real tokenizer; `_CharMeter` is the fallback. |
+| `app/claude_cli.py` | The `kind: claude-cli` backend: an `httpx.AsyncBaseTransport` that answers `POST …/chat/completions` by running the `claude` binary headless. `translate` (OpenAI request → prompt), `_Watch` (catches emulated function calls mid-stream), `_coerce`, `client()`. |
+| `app/usage.py` | `parse(response) -> Usage \| None`: every vendor's spelling of tokens, cache reads and writes, reasoning and cost, folded into one object. `format_cost` for the log. Imports nothing from the app. |
+| `app/ledger.py` | The cost ledger: one SQLite row per completed request. `record(...)` (never raises), `summary(...)` for `/admin/costs`, `observed_prices` / `observed_shares` for `smart.refresh`, `startup()` / `close()`. |
+| `app/inflight.py` | The request feed behind the In-flight tab: `begin()`, `Entry.wait / run / record / finish / cancel`, a bounded history ring, a separately bounded body store, `snapshot()`. |
+| `app/configwrite.py` | Console edits persisted to `CONFIG_PATH` through a ruamel round-trip: `persist_model_priorities`, `set_enabled_models`, `set_model_map`, `set_aliases`, `set_logical_model`, `delete_logical_model`, `set_smart`. Each returns `(ok, reason)`. Also `config_writable()` and `config_detached()`. |
+| `app/config.py` | Loads `config.yaml` and the environment into dataclasses (`Provider`, `Target`, `LogicalModel`, `Routing`, `Trim`, `Notify`, `Pricing` / `Rate` / `Peak`). Globals `PROVIDERS`, `PROVIDERS_BY_NAME`, `ALIASES`, `LOGICAL_MODELS`, `ROUTING`, `AUTH_KEYS`, `TRIM`, `NOTIFY`, rebound by `reload_if_changed()`. Helpers `native_for`, `vendor_of`, `strip_prefix`. |
+| `app/auth.py` | `is_authorized(request)` (a bearer key in `AUTH_KEYS`; no keys configured means the gate is off) and `restricted(provider)`. |
+| `app/upstream.py` | The three shared `httpx.AsyncClient`s and their timeouts: `forward_client` (600 s read, 5 s connect), `probe_client` (5 s, 3 s connect), `account_client` (30 s, 5 s connect). |
+| `app/clientinfo.py` | Who called, for the log: `client_ip`, `client_host` (cached reverse DNS, off the loop, time-bounded), `service_from_ua`. |
+| `app/metrics.py` | The Prometheus series, all prefixed `llm_proxy_`. |
+| `app/logbuffer.py` | Ring buffer of the last 2000 log lines, sequence-stamped, for `/admin/logs`. |
+| `app/version.py` | Build identity from `APP_VERSION` / `APP_REVISION`; `dev` outside a CI image. Never hot-reloaded. |
+| `app/static/` | The web console: `index.html`, `app.css`, `app.js`. Vanilla, no build step, served at `/ui/`. `app.js` is one file split by `/* ── Section ── */` banners (Auth, Tabs, Logging, Models, In-flight, Config, Routing, Costs, Init); grep for `^/\* ──` to navigate. |
 
-## Request lifecycle (`proxy.proxy_request`)
+Outside `app/`:
 
-1. Parse body; extract `model`, `stream`. No model → passthrough to first provider (auth-gated, no slots).
-2. `authorized = auth.is_authorized(request)`.
-3. `router.resolve(model)` → ordered targets.
-4. Gate: if unauthorized, drop `require_permission` targets; none left → **401**.
-5. Drop currently-down targets (keep as last resort).
-6. `trim.trim_request` — the context guardrail. Only touches a body with `messages` + an
-   integer `num_ctx` that is estimated to exceed it; anything else passes through untouched.
-   Runs once, before any target is chosen, so every failover attempt forwards the same body.
-6b. `smart.order` — reorder the candidates (cost ranking when switched on, `first`/`last` overrides always). Sits after the down filter and before `trim`/`_dispatch`; a no-op unless one of those is in force, and it only permutes the candidate list, so it can neither add a backend nor drop one.
-7. `_dispatch`: loop — `slots.acquire` → `_build_body` (rewrite model id, inject `provider_routing`) → forward. Fails over on two conditions: an `httpx.RequestError` (connection failure) **or** an upstream response whose status is in `ROUTING.failover_statuses` (`_should_failover`, default 402/429/5xx). Either one → release slot, `mark_down`, drop this target, try next. Exhausted: a connection failure → `_backend_error`; a relayed upstream error → that last response **verbatim** (real status + body). `clear_down` runs only on a `< 400` response.
-8. After the response is delivered (background task / stream `finally`): the handler's one `usage.parse` result feeds `_record_metrics`, `Entry.record`, and `_emit_request_log` — which writes the `event=request` line **and** the ledger row (`ledger.record`), so the four readers of a request's usage can never disagree. Only the attempt that answered the client reaches this step: a failed-over attempt's response is discarded with its background task, so a request is one line and one row however many backends it tried.
+| Path | What |
+|---|---|
+| `tests/` | The pytest suite. See [Testing](#testing). |
+| `docs/providers/` | What each vendor's account API returns, with units and what was verified live. |
+| `config.example.yaml` | The annotated example config. CI imports the app against it, so it must stay loadable. |
+| `Dockerfile` | Bakes the pinned `claude` CLI and the Qwen tokenizer. Build args `APP_VERSION`, `APP_REVISION`, `CLAUDE_CODE_VERSION`. |
+| `docker-compose.yml` | The dev compose: file-mounted config, published on port 9999. Production's compose lives in the deploy repo. |
+| `.github/workflows/docker-build.yml` | Tests, then image build and push, then the `master-N` git tag. Does not run for pushes that touch only `.md` files. |
+| `.claude/skills/deploy-llm-proxy/` | The deploy procedure. See [Deploy](#deploy). |
+| `grafana-queue-dashboard.json` | An importable Grafana dashboard for the queue-affinity metrics. |
+
+## Request lifecycle
+
+Any path that is not a route declared in `main.py` reaches `proxy.proxy_request`.
+
+1. **Parse** the body once and read `model` and `stream`. Open the in-flight entry
+   (`inflight.begin`).
+2. **No model** (the body is not a JSON object, or has no `model`): passthrough. The
+   request is forwarded untouched to the first `http` provider the caller is permitted to
+   use, with no slot and no failover, and logged as `event=passthrough`. No permitted
+   provider → 401.
+3. **Resolve**: `router.resolve(model)` returns priority-ordered targets. Empty → 404
+   `model_not_found`.
+4. **Gate**: an unauthenticated caller loses every `require_permission` target. None
+   left → 401.
+5. **Filter**: `funded or healthy or targets`. `healthy` drops backends marked down;
+   `funded` further drops backends that are `rates.out_of_funds`. A filtered-out backend
+   is not tried at all while another can serve, and comes back only when nothing else is
+   left.
+6. **Order**: `smart.order(candidates, model)` applies the cost ranking when it is
+   switched on and the `first` / `last` overrides always. It only permutes the list.
+7. **Trim**: `trim.trim_request`, in a worker thread. It runs once, before any target is
+   chosen, so every failover attempt forwards the same body.
+8. **Dispatch** (`_dispatch`), looping over the candidates that remain:
+   `slots.acquire` → `_build_body` (native model id, the vendor's `adapt_request`,
+   `provider_routing`, `stream_options.include_usage`, `strip_fields`) → handler.
+   It fails over on an `httpx.RequestError`, or on a response whose status is in
+   `routing.failover_statuses` while another target remains: release the slot,
+   `mark_down`, drop that provider, loop. A 402 also calls `notify.payment_required`.
+   When the candidates run out, connection failures become `_backend_error` (502, or 504
+   for a timeout) and an upstream error is relayed verbatim with its real status and
+   body. `clear_down` runs only on a status below 400.
+9. **After the response is delivered** (a background task, or the stream generator's
+   `finally`): the handler's single `usage.parse` result, priced by `_apply_pricing` when
+   the backend reported no cost, feeds `_record_metrics`, `Entry.record` and
+   `_emit_request_log`, which writes the `event=request` line and the ledger row. Only the
+   attempt that answered the client reaches this step, so a request is one line and one
+   row however many backends it tried.
+
+Errors the proxy generates itself go through `proxy._error`: 401 `unauthorized`,
+404 `model_not_found`, 502 `upstream_unavailable`, 504 `upstream_timeout`,
+503 `slot_timeout`, 503 `cancelled`. The one exception is a plain-text 503 when no
+providers are configured at all.
 
 ## Layering
 
-Strict topological order — nothing imports upward, nothing imports sideways
-within a layer, so there are no cycles:
+Imports only point downward, so there are no cycles.
 
 ```
-main.py                        ASGI entry: routes, /admin router, lifespan
-  └─ proxy.py                  request lifecycle, failover
-       └─ router.py            name -> ordered targets
-            └─ registry.py     discovery + health
-  registry · slots · inflight · auth · clientinfo · configwrite · trim · claude_cli · ledger · smart · rates   services
-       └─ config.py            the leaf everything reads
-  config.py · metrics.py · logbuffer.py · upstream.py · version.py · usage.py   leaves
-       providers/   (parse and fetch per vendor; depend on config only)
+main                               routes, the /admin router, the lifespan
+ └─ proxy                          request lifecycle, failover
+     ├─ router → registry          name → targets; discovery and health
+     ├─ smart → ledger, rates      ordering, from the snapshots
+     ├─ notify → rates             warnings
+     ├─ rates → providers/         vendor account reads
+     └─ slots · inflight · trim · claude_cli · auth · clientinfo · ledger
+ main also uses: configwrite · logbuffer
+ leaves: config · upstream · usage · metrics · version
 ```
 
-`config.py` is the only module everything depends on, and it is read **per
-operation** (`conf.X`) rather than snapshotted at import. That is the whole
-mechanism behind hot reload: `reload_if_changed()` rebinds the module globals,
-and because there is no `await` between the rebinds, a request sees either the
-old config or the new one, never a mix.
+`config.py` is the one module everything depends on, and it is read **per operation**
+(`conf.X`), never snapshotted at import. That is the whole mechanism behind hot reload:
+`reload_if_changed()` rebinds the module globals with no `await` between the rebinds, so
+a request sees either the old config or the new one and never a mix.
 
 ## Where state lives
 
-Every piece of state that gates admission is a plain dict in one process's
-memory. That is not an oversight — it is what makes the slot handoff correct
-without a lock — but it is why the single uvicorn worker is load-bearing, and why
-a restart is a real reset rather than an inconvenience. Three tiers, and the
-difference between them is deliberate:
+Every piece of state that gates admission is a plain dict in one process's memory. That
+is what makes the slot handoff correct without a lock, and it is why the single worker is
+load-bearing and why a restart is a real reset.
 
 | Tier | What | Why |
 |---|---|---|
-| **Dropped on every config reload** | `registry._cache`, `registry._last_good` | A changed `base_url` points somewhere else entirely, so a catalog from the previous endpoint is worse than no catalog. |
-| **Survives a reload, lost on restart** | `slots._in_use` / `_running` / `_last_model` / `_waiters`, `registry._down_until`, `inflight._active` / `_recent` / `_bodies`, `logbuffer._buf`, `smart._prices` / `_shares`, `rates._cards` / `_included` / `_quotas` / `_balances`, the Prometheus counters | Keyed by provider *name*, so it survives the rebind on purpose: a request holding a slot still holds it after the edit. |
-| **Durable, outside the process** | `config.yaml` (ruamel round-trip, in place), Loki (one `event=request` line per request), Prometheus (scraped counters), the cost ledger (`ledger.sqlite`, one row per request) | The durable copy of every request is its log line, which is exactly why the in-memory history is allowed to be lossy. The ledger is the same record in a form the console can query; it is read only by `/admin/costs` and never fed back into process state. |
+| **Dropped on every config reload** | `registry._cache`, `registry._last_good` | A changed `base_url` points somewhere else, so a catalog from the previous endpoint is worse than none. |
+| **Survives a reload, lost on restart** | `slots._in_use` / `_running` / `_last_model` / `_waiters` / `_rr`, `registry._down_until`, `inflight._active` / `_recent` / `_bodies`, `logbuffer`, `smart._prices` / `_shares`, `rates._cards` / `_included` / `_quotas` / `_balances`, `notify._sent` / `_seeded` / `_payment_at`, `clientinfo._dns_cache`, the loaded tokenizer (`trim._loaded`), the Prometheus counters | Keyed by provider *name*, so a request holding a slot still holds it after an edit. |
+| **Durable, outside the process** | `config.yaml` (written in place by the console), the cost ledger (`ledger.sqlite`), Loki (one `event=request` line per request), Prometheus (scraped counters) | The durable copy of a request is its log line and its ledger row, which is why the in-memory history may be lossy. |
 
-Most of the invariants below are consequences of that table rather than
-independent rules. If you add process-local state, add it to the reset list in
-`tests/conftest.py` too, or it leaks between tests.
+If you add process-local state, add it to `reset_state` in `tests/conftest.py`, or it
+leaks between tests.
 
-## Invariants — do not break these
+## Naming model
 
-- **Single worker.** Slot/queue/health state is in-process. Never add `--workers > 1`
-  without moving that state to a shared store.
-- **Config is hot-reloaded — always read it as `conf.X` at use time.** Never
-  `from app.config import PROVIDERS` (a snapshot that goes stale after a reload; the
-  dataclasses/helpers like `Provider`/`Target`/`strip_prefix` are fine to import) and
-  never cache config values across requests. `reload_if_changed()` rebinds the module
-  globals with no `await` in between, so a request sees either the old or the new
-  config, never a mix. After a reload the watcher drops `registry._cache` and pokes
-  queued slot waiters; derived state keyed by provider *name* (`slots._in_use`,
-  `registry._down_until`) intentionally survives.
-- **Every acquired slot must be released exactly once.** Non-stream: released in
-  `_dispatch` after the call. Stream: released in the generator's `finally` via the
-  `on_complete` callback (the handler returns before streaming finishes). If you add a
-  code path, guarantee release on every exit including errors and client disconnect.
-- **Async primitives are lazily created** (`registry._lock_for`, and each
-  `slots._Waiter.future`) so they bind to uvicorn's running loop, not the import-time
-  loop. Do not move them to module-level construction — it breaks under some
-  Python/loop setups.
-- **Slot admission is a synchronous handoff, and needs no lock.** `slots` has no
-  Condition any more: a release decrements, then `_drain()` picks the best waiter and
-  resolves its future, all in one synchronous step with no `await` between. That is what
-  makes it correct without a lock and what stops a newly arrived request from barging
-  past the queue — so **never introduce an `await` inside `_drain`/`_release`/`_choose`
-  or the accounting becomes observable mid-update.** Two consequences to preserve:
-  `acquire`'s `finally` must hand back a slot granted in the instant it gave up
-  (`w.granted and not w.taken` — the timeout/cancel race), and `release` must be passed
-  the **native model** that finished, or affinity has nothing to work from and silently
-  degrades to FIFO.
-- **Affinity only reorders waiting requests.** It must never change which targets a
-  request is eligible for, never hold a slot idle waiting for a better match, and never
-  be consulted on the fast path. `Routing.affinity_max_skips` is the starvation bound and
-  is checked *before* affinity in `_choose` — keep that order, it is the only thing
-  stopping a hot model from starving a cold one.
-- **Streaming fails over only pre-first-byte.** `_handle_stream` pre-flights the
-  connection (`stream_cm.__aenter__`) and re-raises `RequestError` so `_dispatch` can try
-  the next target *before* a `StreamingResponse` commits its 200 status. Don't move the
-  error handling inside the body generator.
-- **Handlers raise, the dispatcher decides.** `_handle_non_stream` / `_handle_stream`
-  must let `httpx.RequestError` propagate (for connection-level failover) and return a
-  buffered `Response` carrying the upstream status for HTTP errors. `_dispatch` owns *both*
-  failover triggers — the `RequestError` except-branch and the `_should_failover(status)`
-  check on the returned response — and is the only place that converts errors to terminal
-  client responses (`_backend_error`, 401, 503) or relays an upstream error verbatim.
-- **Decompression reads raw bytes, and handles exactly what it advertises.**
-  `_handle_non_stream` uses `aiter_raw()` + manual `_decompress` so we control decoding.
-  `_build_headers` caps the forwarded `Accept-Encoding` at `gzip, deflate` and
-  `_decompress` implements exactly those two — **keep them aligned**. The `br`/`zstd`
-  branches that used to be there could never fire (nothing requested those encodings)
-  and would have raised `ImportError` if they had, since neither library is a
-  dependency; they were removed. To add one you need all three: the library in
-  `requirements.txt`, the branch, *and* the encoding advertised in `_build_headers`.
-- **Auth gate consistency.** Any new model-listing or routing path must apply the same
-  `require_permission` filtering as `registry.list_models` and `proxy_request`.
-- **Never substitute a backend the client didn't ask for.** `router.resolve` returning `[]`
-  means "nothing serves this model" and must become a 404 (`proxy._model_not_found`), not a
-  fallback to `PROVIDERS[0]`. That fallback existed and caused a production bug: an
-  unauthenticated caller requesting a free local model, during a live-discovery blip, was
-  routed to the first-listed backend — a `require_permission` one — and received a 401
-  about a model they never asked for and cannot see. The same rule applies to the
-  model-less passthrough path, which must pick the first backend the *caller is permitted
-  to use*, not the first configured one. When resolution is uncertain, fail loudly; a wrong
-  backend produces an error that cannot be diagnosed from the client side.
-- **Discovery failure ≠ empty catalog.** `registry._cached_live` keeps the last successful
-  catalog for `STALE_GRACE` when a probe fails (re-probing every `STALE_RETRY`), because a
-  backend mid-model-swap misses its probe window routinely. Caching `[]` on failure made
-  every model on that backend unresolvable for a full `cache_ttl` — which is what triggered
-  the bug above. `clear_cache()` drops the last-known catalogs too, since a config reload
-  may have repointed `base_url`.
-- **Admin surface (`/admin/*`, `/ui`).** The gate is **structural**: every `/admin/*`
-  route is declared on the `admin` `APIRouter`, which carries
-  `Depends(require_admin)`, so a new endpoint is protected by construction. Declare
-  new admin routes on that router, never on `app` directly — the old per-handler
-  prologue failed silently, since an endpoint that forgot it was simply open. The
-  403 body is `{"error": "unauthorized"}` via `_AdminForbidden`; keep that shape,
-  the console and any scripts read it. Provider serialization must **never** include
-  `api_key` — secrets stay in-process. `POST /admin/routing/{model}` mutates
-  `LOGICAL_MODELS[*].targets` priorities in place and must re-`sort` the target list
-  afterwards, or the priority-tier `groupby` in `slots._pick_free` breaks. Routes +
-  the `/ui` mount live **above** the catch-all in `main.py` so they win over the
-  proxy path. `/favicon.ico` and `/robots.txt` are there for the same reason and are
-  not cosmetic: without them a browser's automatic favicon request falls into the
-  catch-all, is treated as a model-less passthrough, 401s, and lands in the request
-  feed as a failed request on every page load. Any other well-known browser path
-  belongs there too.
-- **Body capture is bounded and never leaves the process.** `_bodies` is capped per
-  side (`INFLIGHT_BODY_LIMIT`) and evicted with the history, because an agentic
-  client's prompt is routinely hundreds of KiB. It must stay out of `snapshot()` —
-  the console polls that every second — and out of stdout, which is what separates it
-  from `LOG_INPUT`/`LOG_OUTPUT`: those go to the log shipper, this does not. It is
-  auth-gated like every other `/admin/*` route because it holds prompt text.
-- **Config write-back (`configwrite.py`) round-trips through ruamel, never PyYAML.**
-  The config is a hand-annotated, git-tracked file on the deploy host, so a write
-  must preserve comments — `yaml.dump` would erase all 31 of them. Use `_yaml()`;
-  its `indent(mapping=2, sequence=4, offset=2)` reproduces this project's list
-  indentation (ruamel's default collapses it and inflates the diff five-fold) and
-  `preserve_quotes`/`width=4096` stop quote and line-wrap churn. Intra-flow
-  alignment padding is the one thing ruamel cannot keep; that normalizes once.
-  The write must be **in-place** (`r+` + truncate): `/app/config.yaml` is a
-  single-file bind mount, so replace-by-rename detaches from the host inode.
-  **Mutate the loaded document in place; never rebuild a node.** ruamel remembers
-  each scalar's quote style and each collection's flow/block style, and replacing a
-  `CommentedMap`/`CommentedSeq` discards all of it — which made a save that changed
-  nothing rewrite `"a": "b"` as `a: b` and flatten block lists into flow. Every
-  editor here keeps surviving entries at their original position untouched and only
-  writes genuine additions, removals and value changes. There is a regression test
-  for exactly this: two consecutive identical saves must leave the file
-  byte-identical.
-  Abort-don't-corrupt: every mutation is serialized, re-parsed with plain PyYAML,
-  and self-checked to contain exactly the requested change before the file is
-  opened — plus a hard guard that the provider list is unchanged, since adding or
-  dropping a backend is the blast radius that takes routing down. Any surprise
-  returns `(False, reason)` with the file untouched. Persist failures are warnings,
-  never 500s.
-- **A target's `model` is inherited when omitted — preserve that through an edit.**
-  `Target.model is None` means "resolve via the provider's `model_map`", and
-  **`config.native_for` is the single place that resolution lives**. It used to be
-  three: inline in `router._from_logical`, plus near-identical copies in `main` and
-  `configwrite` — and this AGENTS.md claimed there was one. Call it, don't re-derive
-  it. Both sides of a priority write need it: callers hand over live `Target`s where
-  an inherited id is still `None`, while the file must be matched on the id it
-  resolves to. The config API likewise reports `model` raw and `resolved_model`
-  separately (`_serialize_targets(..., raw=True)`) — collapsing them would make the
-  editor write explicit pins for every inherited target on the first save, changing
-  what the config means without changing what it says.
-- **`api_key` never leaves the process, including through the config editor.**
-  `_config_snapshot` emits `has_api_key`, never the value; `configwrite` reads and
-  writes key lines back verbatim without ever returning one. Any new config endpoint
-  must keep that property.
-- **In-flight registry (`inflight.py`) has exactly one closer per entry.** `proxy_request`
-  opens the entry and closes it for every response *except* a `StreamingResponse` — that
-  one is still in flight when the handler returns, so `_handle_stream`'s generator closes
-  it in its `finally`, in the leading sync block before any `await` (a raising await must
-  not leave a phantom live row). `record()` before `finish()`, or the history row loses its
-  status and token counts. `finish()` is idempotent — removal from `_active` is the guard,
-  so a request can never appear twice in the feed. Mirror the slot-release rule: if you add
-  a code path, guarantee the entry is closed on every exit including errors, cancellation
-  and client disconnect. Keep it write-only from the request path — never let admission,
-  routing or failover read it, or an observability bug becomes a routing bug.
+Clients only ever see and send **canonical** names. **Native** (provider-specific) ids
+never leak.
+
+- `provider.model_map` is keyed by the **native** id (`{native: canonical}`).
+  `to_canonical(native)` drives the `/v1/models` listing; `to_native(canonical)` rewrites
+  the id on the wire. It must be a bijection per provider: the reverse lookup is built
+  once in `__post_init__`, and a collision makes one native id unreachable.
+- `enabled_models` is the allow-list, in **native** ids. Empty means "everything the
+  backend live-reports".
+- A `models:` entry (a logical model, called a "group" in the console) lives in
+  canonical space. A target's `model` is the native id; omitted, it is `None` and means
+  "inherit `provider.to_native(logical_name)`".
+- **`config.native_for(model_name, provider_name, model)` is the single place that
+  inheritance is resolved.** Routing, the routing view, the config editor and
+  `configwrite` all call it. Do not re-derive it.
+- `router.resolve` returns targets whose `model` is already the native wire id.
+  `provider_routing` and `pricing` are keyed by that native id.
+- `registry.list_models` hides anything a logical model fronts, both by canonical name
+  and by the concrete `(provider, native)` of each target.
+- The request log carries three names. `model=` is the native id and must stay that way
+  (dashboards key on it). `asked=` is what the client sent, omitted when equal to
+  `model`; it is the field to group by, because one logical model resolves to a
+  different native id per backend. `served=` is what the backend's response says ran,
+  emitted only when it differs; it is a diagnostic, never a dashboard key.
+
+## Invariants
+
+### Process and config
+
+- **Single worker.** Slot, queue and health state are in-process. Never add
+  `--workers > 1` without moving that state to a shared store.
+- **Read config as `conf.X` at use time.** Never `from app.config import PROVIDERS`
+  (a snapshot that goes stale after a reload) and never cache config values across
+  requests. Importing the dataclasses and helpers (`Provider`, `Target`, `native_for`) is
+  fine. After a reload, both the watcher and `main._apply_config_change` (run after a
+  console edit) call `registry.clear_cache()` and `slots.poke()`. A file that fails to
+  parse leaves the running config in place.
+- **Async primitives are created lazily** so they bind to uvicorn's running loop:
+  `registry._lock_for`, each `slots._Waiter.future`, `configwrite._lock_for`, the clients
+  in `upstream` and `claude_cli`. Do not move them to module-level construction.
+- **Outbound calls use the shared clients in `upstream.py`.** Never build a client per
+  request and never `aclose()` one from a request path; a stream returns its connection
+  by exiting `stream_cm`. A stale pooled connection raises `RemoteProtocolError`, a
+  `RequestError`, which the failover path already handles.
+- **The forwarding timeout is long-read, short-connect, and both halves matter.** The
+  600 s read covers a model loading or a backend that buffers the whole completion; do
+  not shorten it. The 5 s connect is there because a bare `Timeout(600)` also sets
+  connect to 600 s, and a host that black-holes SYN then holds a slot for ten minutes
+  with `down_backoff` never engaging.
+
+### Admission (`slots.py`)
+
+- **Every acquired slot is released exactly once.** Non-stream: in `_dispatch`, after the
+  handler returns. Stream: in the generator's `finally`, through the `on_complete`
+  callback, because the handler returns before streaming finishes. A new code path must
+  guarantee release on every exit, including errors and client disconnect.
+- **Admission is a synchronous handoff and needs no lock.** A release decrements, then
+  `_drain()` picks the best waiter and resolves its future, all in one synchronous step.
+  That is what stops a newly arrived request from barging past the queue. **Never put an
+  `await` inside `_drain`, `_release` or `_choose`.** Two consequences to preserve:
+  `acquire`'s `finally` hands back a slot granted in the instant it gave up
+  (`w.granted and not w.taken`), and `release` must be passed the **native model** that
+  finished, or affinity silently degrades to FIFO.
+- **Affinity only reorders waiting requests.** It never changes which targets a request
+  is eligible for, never holds a slot idle for a better match, and is not consulted on
+  the fast path. `affinity_max_skips` is checked *before* affinity in `_choose`; that
+  order is the only thing stopping a hot model from starving a cold one.
 - **Cancellation must not strand a slot.** The Kill button cancels the task serving a
-  request, so `CancelledError` can now surface at *any* `await` in the request path —
-  including ones that previously only ever saw `httpx.RequestError`. `_dispatch` therefore
-  releases the slot in an `except asyncio.CancelledError` branch (the non-stream path has
-  no `finally`, and for a stream the generator that owns the release never ran), and the
-  stream pre-flight closes its client on `BaseException`. Any new await that holds a slot
-  needs the same treatment. Cancellation prefers `Entry.stream_task` (bound inside the SSE
-  generator) over the request task: Starlette runs a streaming body in a child task while
-  the request task waits on client disconnect, so cancelling the latter mid-stream unwinds
-  through Starlette's disconnect listener and uvicorn logs a spurious "Exception in ASGI
-  application" traceback for a deliberate action.
-- **Outbound calls use the shared clients in `app/upstream.py`; never build one
-  per request.** Both were `httpx.AsyncClient(...)` constructed and closed inside the
-  handler, which threw the connection pool away after a single call — every request to
-  a remote backend paid a fresh TCP handshake plus a full TLS negotiation. The clients
-  are process-wide and closed by the lifespan, so **never `aclose()` one from a request
-  path**; a stream returns its connection by exiting `stream_cm`, nothing more. A stale
-  pooled connection surfaces as `httpx.RemoteProtocolError`, a `RequestError` subclass,
-  so the existing failover handles it.
-- **The forwarding timeout is long-read, short-connect, and both halves matter.**
-  `FORWARD_TIMEOUT = httpx.Timeout(600.0, connect=5.0)`. The 600s read is deliberate:
-  a large model loading, or a backend that buffers the whole completion, routinely
-  spends minutes before the first byte. Do not shorten it. The short connect is equally
-  deliberate: a bare `Timeout(600.0)` sets *connect* to 600s too, and since a handshake
-  completes in the kernel before the request is sent, no model-loading time lands
-  there — the only way to wait on connect is a host that black-holes SYN, which will
-  never answer. That request holds its slot for the whole wait, so on a single-slot
-  local backend one bad request was a ten-minute outage, with `down_backoff` never
-  engaging because nothing had failed yet.
-- **The request log carries both model names.** `model=` is the **native** id on the
-  wire and must stay that way — existing dashboards and recording rules key off it.
-  `asked=` is the canonical name the client sent, added because a logical model
-  spanning three backends resolves to three different native ids, so `model=` alone
-  splits one model's traffic across three series and a failover moves a request between
-  them mid-flight. `asked=` is the field to group by. It is omitted when the two are
-  equal, so an unmapped model logs exactly as before. A third, `served=`, is the
-  `model` the backend's *response* reports, emitted only when it differs from the
-  native id — the one place a rolling alias (the claude CLI's `opus`) is pinned to the
-  version that actually answered. Never key dashboards on it; it is a diagnostic.
-- **The version string must stay identical to the image tag.** CI passes
-  `APP_VERSION=master-${{ github.run_number }}` as a build-arg, which is the same value
-  the metadata step turns into the `master-N` image tag; `app/version.py` reads it and
-  `/health`, `/metrics` (`llm_proxy_build_info`) and the console header report it. That
-  equality is the whole point — the compose file pins a tag, and this is what lets you
-  confirm the process *answering requests* is that build rather than a container that
-  never got recreated. The same `master-N` is pushed as a git tag on the built commit
-  (the workflow's last step, after the image push), so a live version maps to its source
-  with `git checkout master-N`. If you change how the tag is derived, change the build-arg
-  and that tag step in the same commit. The `ARG` lines sit **after** `pip install` in the Dockerfile on purpose:
-  `APP_VERSION` changes every build, and an `ARG` above the install would invalidate that
-  layer every time. An undefined `ARG` expands to `""`, not to nothing, which is why
-  `version.py` treats blank as absent and reports `dev`.
-- **The context guardrail must be a no-op for anything it was not built for.** `trim`
-  acts only on a JSON chat body with a `messages` list *and* an integer `num_ctx`, and
-  only when the estimate exceeds the budget; every other body — no `num_ctx`, a fitting
-  chat, embeddings, a malformed `messages` — must come back as `None` so `_route`
-  forwards the client's bytes unchanged. A client that manages its own context is never
-  second-guessed. When it does act: system messages are never dropped, an assistant
-  `tool_calls` message and its `tool` results are kept or dropped together (a dangling
-  call is a 400 at most backends), and the newest block is always sent even when it alone
-  is over budget. It reads `num_ctx` *before* `_build_body` applies `strip_fields`, so a
-  Google target that strips the field still gets the trimmed conversation. Read it as
-  `conf.TRIM` at call time — it hot-reloads like everything else. **It runs in a worker
-  thread**, because counting a 600-message agent session with the tokenizer takes tens of
-  ms (the first one also loads it, ~0.4 s) and the one event loop is relaying every other
-  stream meanwhile; so `trim` must stay free of shared mutable state apart from
-  `_loaded`, the tokenizer cache, which is guarded by `_load_lock`. **Never let the
-  estimate run low:** under-counting forwards the very request this exists to stop, so
-  when the tokenizer cannot be loaded it falls back to the chars estimate rather than
+  request, so `CancelledError` can surface at any `await` in the request path.
+  `_dispatch` releases the slot in an `except asyncio.CancelledError` branch. Any new
+  `await` that holds a slot needs the same treatment. `Entry.cancel` prefers
+  `Entry.stream_task` (bound inside the SSE generator) over the request task, because
+  cancelling the request task mid-stream unwinds through Starlette's disconnect listener
+  and uvicorn logs a traceback for a deliberate action.
+
+### Routing
+
+- **Never substitute a backend the client did not ask for.** `router.resolve` returning
+  `[]` becomes a 404 (`proxy._model_not_found`), never a fallback to `PROVIDERS[0]`. That
+  fallback once sent a keyless caller's local-model request to a gated backend during a
+  discovery blip, and the caller got a 401 about a model they never asked for. The
+  passthrough path follows the same rule: the first backend the *caller is permitted to
+  use*, not the first configured one.
+- **Auth gate consistency.** Any new model-listing or routing path applies the same
+  `require_permission` filtering as `registry.list_models` and `proxy._route`.
+- **Discovery failure is not an empty catalog.** `registry._cached_live` keeps the last
+  successful catalog for `STALE_GRACE` (300 s) when a probe fails, re-probing every
+  `STALE_RETRY` (15 s), because a backend that is swapping models misses its probe
+  window routinely. Only a backend with no good catalog in that window caches `[]`.
+- **Smart routing only reorders, and never moves what it cannot price.** `smart.order`
+  permutes the list `_route` already built, so it cannot add a backend the caller may
+  not reach, and failover still walks everything left. A target is rankable only with
+  mode `auto` and a price from `price_for`. An unrankable one (unknown price, `fixed`, a
+  `claude-cli` seat) keeps its position: an unknown price must never read as cheap.
+  Rankable targets are dealt back into the positions rankable ones held, **each position
+  keeping its original `priority` value**, so a tie tier is still a tie tier for
+  `slots._pick_free`. Do not rewrite priorities to 1..n in the ranking. The `first` /
+  `last` override is the exception and does assign strict priorities, because a forced
+  backend tied with another would still be round-robined. Work on copies
+  (`dataclasses.replace`): the targets are shared with the live config.
+- **`backend_modes` values are validated at load and a typo raises.** A mode silently
+  read as `auto` would hand the ranking an override the operator believes is in force.
+- **A routing label says what moved the order, not what exists.** `order()` reports
+  `pinned` only when the override changed the sequence or broke a priority tie, `smart`
+  only when the ranking changed the sequence, `smart+pinned` for both, and `None` when
+  nothing moved.
+- **An empty balance is routing too.** `_route` filters `rates.out_of_funds` backends
+  like down ones, keeping them as a last resort because a balance is only as fresh as
+  the last read. `402` is a default failover status, so an account that empties between
+  two reads moves the request on.
+
+### Forwarding
+
+- **Handlers raise, the dispatcher decides.** `_handle_non_stream` and `_handle_stream`
+  let `httpx.RequestError` propagate and return a buffered `Response` carrying the
+  upstream status for HTTP errors. `_dispatch` owns both failover triggers and is the
+  only place that turns errors into terminal client responses.
+- **Streaming fails over only before the first byte.** `_handle_stream` pre-flights the
+  connection (`stream_cm.__aenter__`) so `_dispatch` can try the next target before a
+  `StreamingResponse` commits its 200. An upstream 4xx/5xx on a stream is buffered and
+  returned as a plain response. Do not move error handling inside the body generator.
+- **`_build_body` runs per target and never mutates the shared payload.** A vendor's
+  `adapt_request` is copy-on-write, so a failover to another vendor still gets the
+  client's own history.
+- **Decompression handles exactly what it advertises.** `_build_headers` caps the
+  forwarded `Accept-Encoding` at `gzip, deflate` and `_decompress` implements those two
+  from the stdlib. To add an encoding you need all three: the library in
+  `requirements.txt`, the branch in `_decompress`, and the encoding in `_build_headers`.
+
+### Observability
+
+- **The in-flight registry has exactly one closer per entry.** `proxy_request` closes
+  the entry for every response except a `StreamingResponse`; that one is closed by the
+  stream generator's `finally`, in the leading synchronous block before any `await`.
+  `record()` comes before `finish()`, or the history row loses its status and tokens.
+  `finish()` is idempotent. Keep the registry write-only from the request path: nothing
+  in admission, routing or failover may read it. `Entry.cancel`, driven from the admin
+  API, is the one deliberate exception.
+- **Body capture is bounded and never leaves the process.** `_bodies` is capped per side
+  (`INFLIGHT_BODY_LIMIT`) and evicted with the history. It stays out of `snapshot()`
+  (polled every second) and out of stdout, which is what separates it from `LOG_INPUT` /
+  `LOG_OUTPUT`.
+- **One usage object, four readers.** A handler calls `usage.parse` once and that result
+  feeds the metrics, the in-flight row, the log line and the ledger, so they cannot
+  disagree. `Usage.cost` is `None` when nothing was reported and `0.0` when the backend
+  said zero; never collapse the two.
+- **Never persist or re-seed the Prometheus counters.** A restart resetting them to zero
+  is a real counter reset that `rate()` and `increase()` handle. A snapshot restored from
+  disk lags the last scrape, so the counter comes back lower than Prometheus already
+  read, and Prometheus credits the whole pre-drop value as new increase.
+  `METRICS_PERSIST` did this and was removed. Long-range totals belong in a recording
+  rule.
+- **Metric names keep the `llm_proxy_` prefix**, and `llm_proxy_cost_total` counts USD
+  only; another currency still reaches the ledger with its label.
+
+### Cost ledger, rates and warnings
+
+- **The ledger is a record, not a counter.** It is append-only, read by `/admin/costs`,
+  and never used to initialise a counter, a slot, a health mark or anything else in
+  process state. It is write-only from the request path. Every call runs in
+  `asyncio.to_thread` on one connection under `_lock`, and `record` never raises: a full
+  disk is a rate-limited warning and a lost row.
+- **The one reader outside `/admin/costs` is `smart.refresh`**, a background task that
+  copies `ledger.observed_prices` and `observed_shares` into `smart._prices` /
+  `_shares`. Requests read only those dicts. A broken or empty ledger leaves the last
+  snapshot or none, which means published rates alone or the configured order. Do not
+  widen this: nothing else may read the ledger on a request.
+- **A price not reported is not zero.** The ledger stores `NULL` versus `0`, counts
+  `priced` rows next to every cost sum, and the console shows `—` for unknown. A
+  provider's `pricing:` table (`proxy._apply_pricing`) prices a response that carried
+  token counts but no cost and marks it `Usage.estimated` (`cost_src=table`). It never
+  overrides a reported price, never prices a model it does not list, and never prices a
+  response with no usage block. Rates are keyed by **native** id and the peak window is
+  UTC. The claude-cli backend reports no cost on purpose: its `total_cost_usd` is a
+  list-price estimate of usage drawn from a subscription seat.
+- **The ledger schema has no migration.** `SCHEMA` is `CREATE TABLE IF NOT EXISTS`, so a
+  new column needs an explicit `ALTER TABLE` for the file that already exists in
+  production.
+- **Vendor account reads are background-only, never raise, and keep the last good
+  data.** `rates.refresh_*` run in the lifespan task through `upstream.account_client()`.
+  A vendor that errors leaves its cards, quota and balance as they were and warns once
+  per `WARN_EVERY`. Keys go only to their own vendor, never to a public catalog
+  (OpenRouter's `/models`), and `accounts_snapshot` carries numbers only.
+- **Units are the trap.** Every parser converts to USD per million tokens. OpenRouter
+  prices per token, and NanoGPT's `cacheReadInputPer1kTokens` is per thousand whatever
+  its `unit` field says. A slip is a silent 1000x.
+- **A subscription counts as left only while at least 1% of it remains**
+  (`nanogpt.SPENT_BELOW`), never "while `remaining > 0`": a request that does not fit is
+  billed and not counted, so the counter can park just under the limit until the reset.
+  NanoGPT's `recommendedMode` lags, so it may veto and never grant. A subscription is
+  free only for the models it covers (`quota_state` consults the covered list). The
+  operator's `pricing:` table beats a fetched card. An override that depends on prompt
+  length is dropped, not guessed.
+- **Warnings never touch a request and do not repeat themselves.** `notify` reads the
+  `rates` snapshot, never a vendor, and every send swallows its errors.
+  `payment_required` decides synchronously and sends from a background task. A condition
+  is announced when it becomes true, reminded every `reminder_hours`, and followed by a
+  recovery message. State is in memory, so the first evaluation that finds account data
+  seeds silently: a restart must not re-announce what is already true. A notice counts
+  as sent only when ntfy accepted it.
+
+### Admin API and config write-back
+
+- **The admin gate is structural.** Every `/admin/*` route is declared on the `admin`
+  `APIRouter`, which carries `Depends(require_admin)`. Declare new admin routes on that
+  router, never on `app`. The 403 body is `{"error": "unauthorized"}`; the console and
+  scripts read that shape.
+- **`api_key` never leaves the process.** `_provider_view` and `_config_snapshot` emit
+  `has_api_key`, never the value, and `configwrite` writes key lines back verbatim
+  without returning one.
+- **Routes declared in `main.py` sit above the catch-all.** That includes
+  `/favicon.ico` and `/robots.txt`: without them a browser's automatic favicon request
+  falls into the proxy path, 401s, and shows up in the request feed as a failed request
+  on every page load. Any other well-known browser path belongs there too.
+- **`POST /admin/routing/{model}` mutates live target priorities and must re-sort the
+  list**, or the priority-tier `groupby` in `slots._pick_free` breaks.
+- **Config write-back round-trips through ruamel, never PyYAML.** The config is a
+  hand-annotated, git-tracked file; `yaml.dump` would erase its comments. Use `_yaml()`.
+- **Mutate the loaded document in place; never rebuild a node.** ruamel remembers each
+  scalar's quote style and each collection's flow or block style, and replacing a
+  `CommentedMap` / `CommentedSeq` discards it. Every editor keeps surviving entries
+  untouched and writes only genuine additions, removals and value changes. The
+  regression test: two identical saves leave the file byte-identical.
+- **Abort, don't corrupt.** Every mutation is serialized, re-parsed with plain PyYAML,
+  and checked to contain exactly the requested change before the file is opened, with a
+  hard guard that the provider list is unchanged. Any surprise returns `(False, reason)`
+  with the file untouched. A persist failure is a warning in the response, never a 500.
+- **The write is in place** (`r+` and truncate), never write-then-rename, because the
+  config may be a single-file bind mount pinned to one inode. `config_detached()`
+  (`st_nlink == 0`) catches the opposite accident, a host-side rename that orphans the
+  container's copy, and refuses every write until the container is recreated.
+- **Preserve inherited target ids through an edit.** The config API reports `model` raw
+  and `resolved_model` separately (`_serialize_targets(..., raw=True)`). Collapsing them
+  would make the editor write an explicit pin for every inherited target on the first
+  save.
+
+### Context guardrail (`trim.py`)
+
+- **A no-op for anything it was not built for.** It acts only on a JSON chat body with a
+  `messages` list and an integer `num_ctx`, and only when the count exceeds
+  `num_ctx - response_headroom`. Everything else returns `None` and `_route` forwards
+  the client's bytes unchanged.
+- **When it acts:** system messages are never dropped, an assistant `tool_calls` message
+  and its `tool` results are kept or dropped together, and the newest block is always
+  sent even when it alone is over budget.
+- **It reads `num_ctx` before `_build_body` applies `strip_fields`**, so a target that
+  strips the field still gets the trimmed conversation.
+- **It runs in a worker thread**, so it must stay free of shared mutable state apart
+  from `_loaded`, the tokenizer cache, guarded by `_load_lock`.
+- **Never let the count run low.** Under-counting forwards the request this exists to
+  stop. A tokenizer that will not load falls back to the chars estimate instead of
   skipping the check, and the markup constants are measured on the real template and
-  rounded *up*. The suite counts with chars unless a test installs a tokenizer
-  (`conftest.no_baked_tokenizer`): the baked file exists only inside the image.
-- **The claude-cli backend is a transport, and it stays disarmed.** It plugs in
-  *under* the forwarding path (`proxy._client_for`) rather than as a branch in
-  `_dispatch`, so slots, failover, metrics, the request log, the In-flight row and Kill
-  need no special case — keep it that way, and keep the backend contract: an answered
-  error is an HTTP status, an unanswered one (spawn failure, timeout) raises
-  `httpx.RequestError`. Three properties are load-bearing. **Lockdown:** the container
-  holds `config.yaml` with every backend's API key, so the CLI always runs with
-  `--tools ""`, no MCP, no setting sources, no slash commands, in an empty directory —
-  never add a flag that gives a prompt file, shell or network access. **No orphan
-  process:** `_run` kills the child on timeout *and* on cancellation (Kill button,
-  client disconnect) before the slot is released. **Credentials stay in the CLI:** the
-  proxy runs the unmodified binary and never reads, copies or forwards its login
-  (`/claude`, a volume) — lifting the subscription token into another client is what
-  Anthropic's terms forbid. The model-less passthrough skips non-`http` kinds; the
-  catalog of an empty `enabled_models` is `config.CLAUDE_CLI_MODELS`.
-  **Function calling is emulated, never granted.** A request's `tools` become prompt
-  text; the model calls them as tools anyway, and `_Watch` catches each call in the
+  rounded up.
+
+### claude-cli backend
+
+- **It is a transport.** It plugs in under the forwarding path (`proxy._client_for`), not
+  as a branch in `_dispatch`, so slots, failover, metrics, the log, the In-flight row and
+  Kill need no special case. Keep the backend contract: an answered error is an HTTP
+  status, an unanswered one (spawn failure, timeout) raises `httpx.RequestError`.
+- **Lockdown.** The container holds `config.yaml` with every backend's API key, so the
+  CLI always runs with `--tools ""`, no MCP, no setting sources, no slash commands, in
+  an empty directory. Never add a flag that gives a prompt file, shell or network
+  access.
+- **No orphan process.** `_run` kills the child on timeout and on cancellation before
+  the slot is released.
+- **Credentials stay in the CLI.** The proxy runs the unmodified binary and never reads,
+  copies or forwards its login (the `/claude` volume).
+- **Function calling is emulated, never granted.** A request's `tools` become prompt
+  text. The model calls them as tools anyway; `_Watch` catches each call in the
   `stream-json` events and stops the run before the CLI's "no such tool" reaches the
-  model, so the call goes back as `tool_calls`. Two findings hold this shape: told to
-  request calls through a structured-output field instead, the model still invoked
-  them directly and gave up on "no such tool"; and with no tool declared to the API
-  at all, it writes a call out as text and invents the result — which is why
-  `--json-schema` (`_REPLY`) stays on in tools mode: it declares the one tool that
-  switches tool use on. Since no schema shapes the arguments, `_coerce` puts loosely
-  typed scalars right against the client's parameter schema (opus sent an integer
-  `count` as `"5"`). Never "fix" any of this by giving the CLI real tools or an MCP
-  server for the client's functions.
-- **The cost ledger is a record, not a counter — and a price not reported is not
-  zero.** `ledger.sqlite` persists across restarts, which is the one thing the
-  "never persist" rule below forbids for the Prometheus counters; the difference is
-  that nothing is ever *re-seeded* from the ledger. It is append-only, read only by
-  `/admin/costs`, and a missing row is one missing row, not a dip Prometheus turns
-  into a phantom spike. Keep it that way: never initialise a counter, a slot, a
-  health mark or anything else in process state from it, and never let admission,
-  routing or failover read it from the request path — write-only from the request
-  path, like `inflight`. **The one deliberate exception is `smart.refresh`**: a
-  background task (never the request path) reads `ledger.observed_prices` and
-  `ledger.observed_shares` into the plain dicts `smart._prices` / `smart._shares`, and
-  requests read only those. It is safe because of how it fails: a broken or empty
-  ledger leaves the last snapshot or none, and no snapshot means published rates
-  alone or the configured priority order — the ledger can degrade routing to what
-  it was before it existed, never fail a request. Do not widen it: nothing
-  else may read the ledger on a request, and the snapshot must stay a rebound dict.
-  Every call runs in `asyncio.to_thread` (SQLite blocks; the loop is relaying
-  streams), on one connection under `_lock`, and `record` **never raises**: the
-  response is already on its way, so a full disk is a rate-limited WARNING and a
-  lost row. `Usage.cost` is `None` when the backend reported nothing and `0.0`
-  when it reported zero; the ledger stores `NULL` vs `0`, counts `priced` rows
-  next to every `cost` sum, and the console shows `—` for unknown — a total over
-  mixed backends is a floor, and must read as one. The one exception is a
-  provider's `pricing:` table (`config.Pricing`, applied by `proxy._apply_pricing`
-  in both handlers before `entry.record`): it prices a response that carried
-  token counts but **no** cost, marks it `Usage.estimated` (logged
-  `cost_src=table`), and never overrides a reported price, never prices a model
-  it does not list, and never prices a response with no usage block. Rates are
-  keyed by **native** id and the peak window is UTC — keep both. `COST_TOTAL` counts USD only;
-  another currency still reaches the ledger with its label. The claude-cli
-  backend reports **no** `cost` on purpose: its `total_cost_usd` is a list-price
-  estimate of usage drawn from a subscription seat, not a charge. In the deploy
-  the file sits in the config directory mount and is gitignored there — the host
-  commits `config.yaml` by path, never `-a`, or the ledger ends up in git.
-- **Vendor account reads are background-only, never raise, and keep the last good data.**
-  `rates.refresh_*` run in the lifespan task through the shared `upstream.account_client()`
-  (never one per call, and never from a request); the request path reads the dicts and
-  nothing else. A vendor that errors leaves that vendor's cards, quota and balance as they
-  were, records the error for the console and warns once per `WARN_EVERY` — an outage ages
-  the numbers, it does not empty them or touch a request. Keys are sent only to their own
-  vendor, never to a public catalog (OpenRouter's `/models`), and `accounts_snapshot` carries
-  numbers only. **Units are the trap**: every parser converts to USD per million tokens;
-  OpenRouter prices per token and NanoGPT's `cacheReadInputPer1kTokens` is per thousand,
-  whatever its `unit` field says — a slip is a silent 1000x. **A subscription counts as left
-  only while at least 1% of it remains** (`nanogpt.SPENT_BELOW`) — never "while `remaining > 0`":
-  a request that does not fit is billed and not counted, so the counter can park a few hundred
-  tokens under the limit for the rest of the week (2026-10-28, 821 left, every request billed).
-  NanoGPT's `recommendedMode` verdict lags too (it still said `subscription` with 0 remaining
-  while billing), so it may veto and never grant — and the
-  accounts are re-read every 30 s past 95% used (`rates.next_delay`). **A subscription is free only for
-  the models it covers**: `quota_state` consults the covered list, and a model outside it
-  (kimi-k3 on NanoGPT) bills the balance even with allowance left. The operator's
-  `pricing:` table beats a fetched card for the models it lists. An override that depends on
-  prompt length is dropped, not guessed.
-- **Warnings must never touch a request, and must not repeat themselves.** `notify` reads the
-  `rates` snapshot (never a vendor) and sends through the shared account client; every send
-  swallows its errors, and the one call from the request path (`payment_required`, on a 402)
-  decides synchronously and sends from a background task. A condition is announced when it
-  *becomes* true, reminded every `reminder_hours`, and followed by a recovery message — state
-  is in memory, so the **first evaluation that finds account data seeds silently**: a restart
-  (a deploy) must not re-announce what is already true. A notice counts as sent only when ntfy
-  accepted it, so an outage on the way is retried, not waited out. **An empty balance is
-  routing too**: `proxy._route` drops backends with `rates.out_of_funds` (balance at or under
-  `EMPTY_BELOW` with no subscription allowance available) exactly like down ones — kept as a
-  last resort when nothing else is left, because a balance is only as fresh as the last read —
-  and `402` is a default failover status so an account that empties between two reads moves the
-  request on instead of reaching the client.
-- **Smart routing only reorders, and never moves what it cannot price.**
-  `smart.order` permutes the candidate list `_route` already built — after the
-  resolver, the auth gate and the down filter — so it cannot add a backend the caller
-  may not reach (the "never substitute a backend" rule holds by construction), and
-  failover still walks everything left. Within that: a target is *rankable* only with
-  mode `auto` and a price from `smart.price_for` (quota, published rate, or an observed
-  price with at least `smart_min_requests` behind it); an unrankable target (unknown
-  price, `fixed`, a `claude-cli` seat) keeps its
-  position, because an unknown price must never read as cheap. Rankable targets are
-  dealt back into the positions rankable ones held **with each position's original
-  `priority` value**, so a tie tier is still a tie tier for `slots._pick_free`'s
-  round-robin — never rewrite priorities to 1..n in the ranking. The `first`/`last`
-  override is the exception: it assigns strict priorities, because a forced backend
-  tied with another would still be round-robined. Work on **copies**
-  (`dataclasses.replace`): the targets are shared with the live config. Both are
-  priority, not exclusivity — failover must still reach the rest. `backend_modes`
-  values are validated at load and a typo **raises**; a mode silently read as `auto`
-  would hand an override the operator believes is in force to the ranking. The
-  console only ever writes what the operator set (never the seat's implicit `fixed`). **A label must say what moved the order, not what exists**: `order()` reports `pinned`
-  only when the override changed the sequence or broke a priority tie (`_override` returns
-  "changed", not "present"), `smart` only when the ranking changed the sequence, and
-  `smart+pinned` for both — `last` on a backend that is already last is in force but moves
-  nothing, and reporting it once hid the ranking behind a `pinned` badge on every model that
-  had such a backend.
-- **Metric names use the `llm_proxy_` prefix** (renamed from `deepseek_proxy_`).
-- **Never persist or re-seed the counters.** A restart resetting them to zero is a real
-  counter reset, and `rate()`/`increase()` handle it correctly. A snapshot restored from
-  disk does not: it always lags the last scrape, so the counter returns *lower* than what
-  Prometheus already read, and Prometheus credits the whole pre-drop value as new increase.
-  The phantom equals the entire counter, however small the dip. `METRICS_PERSIST` did this
-  and was removed; don't reintroduce it. Long-range totals belong in a recording rule
-  (`sum_over_time(<counter>:increase5m[range])`), not in the process.
+  model, and the call goes back as `tool_calls`. `--json-schema` (`_REPLY`) stays on in
+  tools mode because it declares the one tool that switches tool use on; without any
+  tool declared the model writes a call out as text and invents the result. `_coerce`
+  fixes loosely typed scalars against the client's parameter schema. Never "fix" any of
+  this by giving the CLI real tools or an MCP server.
+- The passthrough path skips non-`http` kinds. With an empty `enabled_models`, the
+  catalog is `config.CLAUDE_CLI_MODELS`.
 
-## Conventions
+### Build identity
 
-- Match existing style: small module-level functions, `_private` helpers, docstrings that
-  explain *why*. No new deps without reason (stdlib first).
-- New per-backend behavior usually means a `Provider` field in `config.py` + parsing in
-  `_load` + documenting it in `README.md`, `config.example.yaml`, and here.
-- Secrets: provider keys inline in `config.yaml` (or `${ENV}`); proxy auth keys via
-  `PROXY_API_KEYS`. Never hard-code keys in `app/`. `config.yaml` and `.env` are not
-  committed; keep `config.example.yaml` / `.env.example` in sync.
-- Logging: human-readable lines (incl. uvicorn) use `<iso-ts> LEVEL <msg>` via the
-  `llm-proxy` logger; timestamps are local-time ISO-8601 with offset (set `TZ`, image
-  ships tzdata). One structured logfmt line per request (`event=request …`) goes to the
-  prefix-free `llm-proxy.event` logger so Loki parses it with `| logfmt`. Caller
-  identification lives in `app/clientinfo.py`. All handlers (ours + uvicorn's, the
-  latter re-pointed in `_unify_logging`) write to **stdout**, not stderr, so
-  `docker logs | grep` works without `2>&1`.
+- **The version string is identical to the image tag.** CI passes
+  `APP_VERSION=master-<run_number>` as a build arg, the same value the metadata step
+  turns into the image tag and the last step pushes as a git tag. `/health`,
+  `llm_proxy_build_info` and the console header report it. If you change how the tag is
+  derived, change the build arg and the tag step in the same commit.
+- **The `ARG` lines sit after `pip install` in the Dockerfile**, because `APP_VERSION`
+  changes on every build and would invalidate the install layer. An undefined `ARG`
+  expands to `""`, which is why `version.py` treats blank as absent and reports `dev`.
+
+## Changing things
+
+| To add | Touch |
+|---|---|
+| A `Provider` field | The dataclass and `_load` in `config.py`; `main._provider_view` if the console shows it; the provider table in `README.md`; `config.example.yaml`. |
+| A config section | A dataclass and its parsing in `config._load`; the tuple `_load` returns, unpacked in **two** places (the module-level `… = _boot()` and `reload_if_changed`, plus its `global` line); a `conftest` fixture if tests need a neutral default; `README.md`; `config.example.yaml`. |
+| An `/admin` endpoint | Declare it on the `admin` router. If `app.js` reads its fields, list them in `tests/test_admin_contract.py`. Add it to the endpoint table in `README.md`. |
+| A console config edit | A `configwrite.set_*` built from `mutate(doc)` and `check(parsed)` passed to `_edit`; the endpoint finishes with `_persisted(ok, error, what)`. Test the byte-identical resave. |
+| A vendor | `app/providers/<vendor>.py` with the fetchers it has; the name in `config.VENDORS` and its hosts in `_VENDOR_HOSTS`; parser tests against a real payload in `tests/test_providers.py`; a page in `docs/providers/`. |
+| Process-local state | A module-level dict keyed by provider name; `conftest.reset_state`; the state table above. |
+| A request-log field | The `fields` dict in `proxy._emit_request_log` (`None` values are dropped). To persist it: `ledger.SCHEMA`, `_ROW_COLUMNS`, `_ROW_SQL`, `_insert`, and an `ALTER TABLE` for existing files. Add it to the log table in `README.md`. |
+| A metric | `metrics.py`, with the `llm_proxy_` prefix; the metrics table in `README.md`. |
+
+Conventions:
+
+- Small module-level functions, `_private` helpers, docstrings that explain *why*.
+  Stdlib first; no new dependency without a reason.
+- Provider keys go inline in `config.yaml` or through `${ENV}`; proxy auth keys through
+  `PROXY_API_KEYS` or `auth.keys`. Never hard-code a key in `app/`. `config.yaml` is
+  gitignored; keep `config.example.yaml` in sync with what the loader accepts.
+- Human-readable log lines (uvicorn's included) are `<iso-ts> LEVEL <msg>` on the
+  `llm-proxy` logger, with local-time ISO-8601 timestamps that carry the offset. The
+  per-request line is pure logfmt on the prefix-free `llm-proxy.event` logger so Loki
+  parses it with `| logfmt`. Everything goes to **stdout**.
 
 ## Testing
 
-pytest + pytest-asyncio, no network, sub-second:
-
-```bash
-pip install -r requirements-dev.txt
-pytest
-```
-
-The suite exists because most of the section above is invariants — properties that
-are invisible in review and expensive in production. Each file guards a specific
-one:
+pytest + pytest-asyncio, no network. The suite exists because most of the invariants
+above are invisible in review. Each file guards a specific set:
 
 | File | Guards |
 |---|---|
-| `tests/test_slots.py` | Priority admission, round-robin within a tie tier, queue-when-full, the synchronous handoff (no barging), affinity reordering, the `affinity_max_skips` starvation bound, and **no slot stranded** by timeout or cancellation. |
-| `tests/test_configwrite.py` | Formatting fidelity — comments, key order, quote style, block-vs-flow lists — and the headline case: **two consecutive identical saves must leave the file byte-identical.** Plus abort-don't-corrupt on every refusal path. |
-| `tests/test_router.py` | Resolution order, inherited vs pinned native ids, and that an unknown model resolves to `[]` and **never** to `PROVIDERS[0]`. Also that `_auto_group` subsumes `_allow_listed`, which is what lets the latter live behind `auto_group: false`. |
-| `tests/test_proxy.py` | The full lifecycle through `httpx.MockTransport`: failover on both triggers, error relay, streaming, decompression, the request log. Every test asserts slot occupancy returns to zero. |
-| `tests/test_version.py` | The build-identity chain: blank args mean `dev`, a CI build reports its tag and sha, `/health` carries them, and `llm_proxy_build_info` is exposed. |
-| `tests/test_gate.py` | Catalog visibility with and without a key, the 401/404 distinction, admin gating, and that `api_key` never appears in a response. |
-| `tests/test_admin_contract.py` | The exact fields `app/static/app.js` dereferences from each admin view — `/admin/costs` included (the envelope, the shared aggregate shape, the request rows). The console is untyped with no build step, so a dropped field shows up as a blank cell rather than an error. |
-| `tests/test_trim.py` | The context guardrail is a no-op unless `num_ctx` is present and exceeded (a fitting body returns `None`, not a copy); system messages survive; the oldest turns go first; a tool call and its results are never separated at the cut (swept across budgets); old oversized tool results are excerpted before any turn is dropped while recent ones stay whole; the newest turn is always sent; images are counted flat; the `trim:` section parses and hot-reloads. With a tokenizer (a byte-per-token `tokenizer.json` built in the test, so counts are worked out by hand): what the template prints is counted, not its JSON escape, nor sampling fields; excerpts are cut in tokens; a tokenizer that will not load falls back to chars and warns once; a relative path resolves against the config directory; the default path is the one the Dockerfile writes. `test_proxy.py` covers the wire: a trimmed body reaches the backend, a fitting one is forwarded verbatim, and a failover re-sends the same trimmed body. |
-| `tests/test_claude_cli.py` | The claude-cli backend through the real lifecycle, with the CLI replaced by a fake script run via the real subprocess path: the OpenAI ↔ CLI translation, the lockdown flags and empty cwd, a keyless caller never reaching the CLI, CLI errors → HTTP statuses and failover, images and legacy `functions` refused with a 400, emulated function calling (functions as prompt text with the CLI's tools still off, a call caught mid-stream and the process killed before it carries on, argument types put right by the schema, parallel calls, `tool_choice`, history rendered into the transcript), and **no `claude` process outliving its slot** on timeout or cancellation. |
-| `tests/test_usage.py` | The usage parser against the two real priced samples (OpenRouter, NanoGPT) and every other spelling of cache and reasoning counts; that no usage block is `None` while an unpriced one is a `Usage` with `cost=None`; that `cost: 0` stays a price; that malformed fields zero out instead of raising; the log's plain-decimal cost format. |
-| `tests/test_smart.py` | Smart routing: inert unless switched on; cheapest first; each position keeps its priority value so a tie tier survives; an unpriced / under-sampled / `fixed` / seat backend is never moved; equal prices (local boxes at 0) keep the configured order; prices are per model; `first`/`last` are strict, work with smart routing off, beat the ranking and leave the input targets unmutated; a mistyped `backend_modes` fails the load; the ledger snapshot counts only successful priced requests with tokens, per real provider; a failed refresh keeps the last snapshot and never raises. `test_proxy.py` drives it through the lifecycle: the cheaper backend gets the request and the log/row say so, off means configured order, an override wins and still fails over, an explicit `provider:model` pin is untouched; rate-driven ranking is covered at the end of the file: a backend with no traffic still priced from its published rate, a rate change reordering the next request, a broken cache priced as no cache, the peak surcharge at the request instant, a subscription free while it lasts and priced after, a refusing backend last, an uncovered model at list price; `test_configwrite.py` covers `set_smart` (comments kept, byte-identical resave, partial calls, section created). |
-| `tests/test_pricing.py` | The `pricing:` table: cached tokens billed at the cache rate and never twice (clamped to the prompt), an unlisted model unpriced unless there is a `"*"`, the peak window weekday-only, UTC and end-exclusive, the YAML shape (`"01-04"` or `[1, 4]` spans, `cached` defaulting to `input`), and a malformed table failing the load. `test_proxy.py` covers the wire: a DeepSeek-shaped response priced into the log (`cost_src=table`), the row, the ledger and the counter; a reported price beating the table; no usage block staying unpriced; a stream priced from its final chunk. |
-| `tests/test_providers.py` | The parsers against payloads copied from the live APIs: OpenRouter per-token prices converted to per-million, time-of-day overrides (DeepSeek's weekday 01-04 / 06-10 UTC windows at 2x, edges inclusive/exclusive, midnight wrap, later-wins-per-key, prompt-length overrides dropped), NanoGPT's cache price per thousand, the quota from the real response shape (tightest of weekly/daily, `paygo` verdict, no subscription), balances, and vendor detection from the host. |
-| `tests/test_notify.py` | The ntfy warnings through a mocked server: off unless configured, the `notify:` section parsing (token from the environment, bad numbers failing the load), nothing sent for a condition already true at start, one message per condition, per-backend thresholds, low then empty without a false "topped up", reminders, recovery, a failed send retried rather than lost, an unreachable ntfy never raising, a spent subscription's message, and a 402 announced at most hourly per backend; plus `out_of_funds` (a subscription with allowance pays for itself). `test_proxy.py` covers the lifecycle: an empty backend skipped, all-empty still tried, a 402 failing over and raising the alarm, the last backend's 402 relayed. |
-| `tests/test_rates.py` | The service through a mocked `account_client`: the catalog filtered to models in use, the right credentials per vendor (none to a public catalog), the operator's table beating a fetched card, `quota_state` for covered / uncovered / exhausted-with-and-without-overage, accounts shown without any key, a failing vendor keeping its last data and warning once, and `cycle` reading catalogs when due or when the config changed what is wanted. |
-| `tests/test_ledger.py` | The ledger's aggregate shape (totals, by day, by model with the per-provider split, by provider, newest requests), the day/range/model/provider filters and that the day filter leaves the day series whole, retention pruning on reopen (and `0` = keep everything), a file ledger surviving a reopen, a disabled ledger recording nothing, and that a ledger that cannot be written warns once and **never raises**. `test_proxy.py` covers the wire end: a priced response reaches the log line, the In-flight row, the ledger and `llm_proxy_cost_total` as one number; an unpriced one stays unpriced; a free model is priced at zero; a stream's final chunk is parsed; a failed-over request is one row. |
-| `tests/test_inflight.py` | The feed's derived numbers, driven on `Entry` directly: tokens/s divides over upstream time (queue wait excluded), takes the handler's recorded duration over the clock, is reset by a failover, keeps the `~` estimate when a backend never reports usage, and rounds exactly as the log formats. `test_proxy.py` closes the loop by matching a history row to its `speed_tps` line. |
+| `test_slots.py` | Priority admission, round-robin in a tie tier, queueing, the synchronous handoff (no barging), affinity reordering, the `affinity_max_skips` bound, and no slot stranded by timeout or cancellation. |
+| `test_router.py` | Resolution order, inherited versus pinned native ids, an unknown model resolving to `[]` and never to `PROVIDERS[0]`, and `_auto_group` subsuming `_allow_listed`. |
+| `test_proxy.py` | The full lifecycle through `httpx.MockTransport`: both failover triggers, error relay, streaming, decompression, the request log, trimming on the wire, smart routing and rate-driven ranking, price tables, empty balances and 402s, the ledger and cost counter. Every test asserts slot occupancy returns to zero. |
+| `test_gate.py` | Catalog visibility with and without a key, the 401/404 distinction, admin gating, and `api_key` never appearing in a response. |
+| `test_admin_contract.py` | The exact fields `app/static/app.js` dereferences from each admin view. The console is untyped, so a dropped field shows as a blank cell instead of an error. |
+| `test_configwrite.py` | Formatting fidelity (comments, key order, quotes, block versus flow), two identical saves leaving the file byte-identical, every refusal path, and `set_smart`. |
+| `test_smart.py` | The ranking: inert unless on, cheapest first, positions keep their priority, unpriced / `fixed` / seat backends never moved, equal prices keep the configured order, `first` / `last` strict and unmutating, a mistyped mode failing the load, a failed refresh keeping the last snapshot. |
+| `test_rates.py` | The rates service through a mocked `account_client`: the catalog filtered to models in use, the right credentials per vendor, the operator's table beating a fetched card, `quota_state` for every case, a failing vendor keeping its data and warning once. |
+| `test_providers.py` | The parsers against payloads copied from the live APIs: unit conversions, time-of-day overrides and their edges, the NanoGPT quota shape, balances, vendor detection from the host. |
+| `test_pricing.py` | The `pricing:` table: cached tokens billed once at the cache rate, an unlisted model unpriced unless `"*"` exists, the peak window (weekday, UTC, end-exclusive), a malformed table failing the load. |
+| `test_notify.py` | The ntfy warnings through a mocked server: off unless configured, silent seeding, one message per condition, reminders, recovery, a failed send retried, a 402 announced at most hourly; plus `out_of_funds`. |
+| `test_ledger.py` | The aggregate shape, the day / range / model / provider filters, retention pruning, a file ledger surviving a reopen, a disabled ledger recording nothing, an unwritable ledger warning once and never raising. |
+| `test_usage.py` | The usage parser against real priced samples and every spelling of cache and reasoning counts; no usage block is `None`, `cost: 0` stays a price, malformed fields zero out. |
+| `test_inflight.py` | The feed's derived numbers on `Entry` directly: tokens/s over upstream time, reset by a failover, the `~` estimate kept when a backend never reports usage. |
+| `test_trim.py` | The guardrail: a no-op unless `num_ctx` is present and exceeded, system messages survive, tool calls and results never separated, excerpts before drops, the newest turn always sent; with a hand-built byte-per-token tokenizer, that the count follows what the template prints. |
+| `test_claude_cli.py` | The claude-cli backend through the real subprocess path with a fake CLI script: translation, lockdown flags, a keyless caller never reaching the CLI, CLI errors as HTTP statuses, emulated function calling, and no process outliving its slot. |
+| `test_version.py` | The build-identity chain: blank args mean `dev`, a CI build reports its tag and sha, `/health` and `llm_proxy_build_info` carry them. |
 
-Conventions that matter when adding tests:
+What matters when adding tests:
 
 - `tests/conftest.py` sets `CONFIG_PATH` **before** anything imports `app.*`, because
-  `config.py` reads it at import time.
-- `no_smart_refresh_loop` is autouse and swaps `smart.refresh_loop` **and `rates.refresh_loop`** for ones that idle (the latter would otherwise call real vendors from the lifespan); `reset_state` clears `rates` and `smart._shares` too:
-  the lifespan would otherwise overwrite a test's hand-set `smart._prices` from the
-  empty ledger. Tests set `smart._prices` directly and call `smart.refresh()` themselves.
-- `reset_state` is autouse and clears the process-local dicts between tests. Add new
-  process-local state to it, or tests leak into each other. It also points
-  `conf.LEDGER_PATH` at `:memory:` and closes the ledger afterwards, so every test
-  starts from an empty one — and nothing writes a `tests/fixtures/ledger.sqlite`. A
-  test that needs a file (reopen semantics) sets the path itself under `tmp_path`.
-- The Prometheus counters are process-global and are **not** reset between tests, so
-  never assert that a series is absent — an earlier test may have created it. Assert
-  on the value a specific request added instead.
-- Use `load_config(text)` to install a config and `providers(...)` to install
-  `Provider` objects directly; both go through the real code paths.
-- Mock upstream with `httpx.MockTransport`, and build responses with
-  `test_proxy.mock_response` — a plain `httpx.Response(json=...)` arrives with its
-  content already consumed and `aiter_raw()` raises `StreamConsumed`.
-- `test_proxy.py` deliberately sets `queue_timeout: 3` rather than the production
-  default of 0. Both backends have one slot, so a leaked slot under "wait forever"
-  hangs the suite instead of failing it; the wait-forever path is covered directly in
+  `config.py` reads it at import time. The fixture config is `tests/fixtures/config.yaml`.
+- Autouse fixtures: `reset_state` clears the process-local dicts and points the ledger at
+  `:memory:`; `no_smart_refresh_loop` replaces `smart.refresh_loop`, `rates.refresh_loop`
+  and `notify.loop` with ones that idle (the real ones would overwrite hand-set snapshots
+  and call vendors); `no_notifications` installs an empty `Notify`; `no_baked_tokenizer`
+  makes the guardrail count with chars unless a test installs a tokenizer.
+- Tests set `smart._prices` and the `rates` dicts directly and call `smart.refresh()`
+  themselves.
+- `load_config(text)` installs a config through the real reload path; `providers(...)`
+  installs `Provider` objects directly.
+- Mock upstream with `httpx.MockTransport` and build responses with
+  `test_proxy.mock_response`. A plain `httpx.Response(json=...)` arrives with its content
+  consumed and `aiter_raw()` raises `StreamConsumed`.
+- The Prometheus counters are process-global and not reset between tests. Never assert
+  that a series is absent; assert the value a specific request added.
+- `test_proxy.py` sets `queue_timeout: 3` instead of the production `0`, so a leaked slot
+  fails the suite instead of hanging it. The wait-forever path is covered in
   `test_slots.py`.
+- `pytest.ini` turns `DeprecationWarning` into an error. A collection failure in CI that
+  names third-party code is dependency drift (requirements are `>=` floors), not the
+  change under test.
 
-A quick smoke check without the suite:
+## Deploy
 
-```bash
-CONFIG_PATH=config.example.yaml python -c "from app import main; print('imports OK')"
-```
+Production runs the image `ghcr.io/luisbrandao/llm-proxy:master-N` from a compose file in
+a separate deploy repo, on port 8000. The config's **directory** is mounted read-write at
+`/app/conf` (`CONFIG_PATH=/app/conf/config.yaml`), and the ledger sits beside the config
+in that directory. A directory mount, not a file mount: a `git pull` replaces files by
+rename, and a file mount would orphan the running container's copy.
 
-## Canonical naming model
+The procedure (push, wait for the build, read the real `master-N`, bump the tag, restart,
+verify `/health` reports the same tag) is `.claude/skills/deploy-llm-proxy/SKILL.md`. Two
+facts that shape day-to-day work:
 
-Clients only ever see/send **canonical** names; native (provider-specific) ids never leak.
-
-- **`provider.model_map`** is a per-provider native↔canonical dictionary keyed by the
-  **native** id (`{native: canonical}`). `to_canonical(native)` drives `/v1/models` display;
-  `to_native(canonical)` rewrites the wire id when that provider is chosen. Must be a bijection
-  per provider (the reverse lookup is built once in `__post_init__`).
-- **`enabled_models`** is the allow-list in **native** ids (empty = live-discover all).
-- **`models:` logical targets** live in canonical space. A target's `model` is the native id;
-  omit it to inherit `provider.to_native(logical_name)`, set it to pin a specific native id
-  (the per-quant case). `Target.model` is `None` when omitted — resolution fills it in.
-- `router.resolve` returns Targets whose `model` is already the **native** wire id; `_build_body`
-  sends it verbatim. `provider_routing` is keyed by that native id.
-- `registry.list_models` hides anything a logical model fronts — by canonical name *and* by the
-  concrete `(provider, native)` of each target (so explicit per-quant ids stay hidden too).
+- A push that touches only `.md` files builds nothing, so there is nothing to deploy.
+- Recreating the container drops in-flight requests and resets all in-process state. The
+  config and the ledger survive.
 
 ## Gotchas
 
-- Model ids can contain `:` (e.g. `local.qwen-medium:low`). `provider:model` splits on the
-  **first** `:` only, and only treats the prefix as explicit if it matches a known provider.
-  Canonical names are colon-free by convention, so a native id like `deepseek/deepseek-v4-pro-0813:thinking`
-  maps cleanly to a canonical `deepseek-v4-pro`.
-- `priority` lower = preferred; defaults to config order. Within a tie tier, admission
-  round-robins across the tied backends that currently have a free slot (`slots._pick_free`).
-- `queue_timeout: 0` means wait forever (the current default).
-- Live discovery is cached per backend for `cache_ttl`; a down backend caches an empty list
-  for the full ttl (no hammering) and silently rejoins on recovery.
-- `/v1/models` hides ids that are targets of a logical model (clients use the stable logical
-  name). A logical model is always listed regardless of backend liveness, so the catalog
-  stays stable as backends come and go.
+- Model ids can contain `:` (`local.qwen-medium:low`). `provider:model` splits on the
+  **first** `:` and treats the prefix as a provider only when it names one. Canonical
+  names are colon-free by convention.
+- `priority`: lower is preferred. A provider's default is its position in the config; a
+  logical target's default is 100.
+- `queue_timeout: 0` means wait forever, and is the default.
+- `slots` omitted means unlimited: no gating at all for that backend.
+- A logical model is listed in `/v1/models` regardless of backend liveness, so the
+  catalog stays stable as backends come and go.
+- The passthrough path takes no slot and never fails over.
+- A failed-over attempt that got an HTTP error still increments
+  `llm_proxy_errors_total`, so a request that failed over on a 503 and then succeeded
+  counts one error and one request. A connection failure that failed over counts only in
+  `llm_proxy_failovers_total`.
+- A request killed from the console may lose its `event=request` line: the cancellation
+  can interrupt the task that emits it. The kill itself is logged at WARNING.
