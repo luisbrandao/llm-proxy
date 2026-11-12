@@ -61,13 +61,24 @@ only *ask* for a call, and only the client can make one. A run that calls nothin
 answers through structured output (`--json-schema`), which is there to switch
 tool use on at all (see `_REPLY`).
 
-Streaming is synthesized: the CLI runs to completion and the answer goes out as a
-single SSE chunk, so streaming clients work but see the reply arrive all at once.
+## Streaming
+
+A `stream: true` request is answered while the CLI is still running: it prints
+the answer piece by piece (`--include-partial-messages`) and `_Live` relays each
+piece as an SSE chunk. Only the answer's text is streamed. A function call goes
+back whole, in one chunk, as it always did; so does a run that fails, as the HTTP
+status it would have been unstreamed, because nothing is committed to the client
+until the first piece of the answer exists.
+
+In a request that offers functions the answer is not plain text on the wire but
+the `content` of the structured reply, written as fragments of JSON;
+`_ContentTap` reads the text out of them as they come.
 """
 import asyncio
 import json
 import math
 import os
+import re
 import tempfile
 import time
 import uuid
@@ -317,6 +328,9 @@ def _argv(model: str, system_file: str, payload: dict, functions: bool = False) 
     ]
     if functions:
         argv += ["--json-schema", _REPLY]
+    if payload.get("stream"):
+        # The answer as it is written, not only once it is whole (see `_Live`).
+        argv.append("--include-partial-messages")
     effort = payload.get("reasoning_effort")
     if effort in EFFORTS:
         argv += ["--effort", effort]
@@ -366,8 +380,10 @@ class _Watch:
             event = json.loads(line)
         except ValueError:
             return False
-        if not isinstance(event, dict):
-            return False
+        return isinstance(event, dict) and self.event(event)
+
+    def event(self, event: dict) -> bool:
+        """Feed one parsed event; True once the run has what it needs."""
         if event.get("type") != "assistant":
             # The CLI answers a message's tool calls only once the message is
             # complete, so its reply means every call that message carried is in.
@@ -387,9 +403,84 @@ class _Watch:
         return False
 
 
+# The tool `--json-schema` declares; its input is the reply (see `_REPLY`).
+_STRUCTURED = "StructuredOutput"
+
+
+class _ContentTap:
+    """The `content` of a structured reply, read while the reply is still being
+    written.
+
+    With `--json-schema` the answer is the input of a tool call, and a stream
+    carries that input as fragments of its JSON: `{"content": "The`, ` b`,
+    `icycle`. `feed` takes a fragment and returns the text it adds to `content`,
+    decoded.
+
+    It only ever returns text it is sure of. An escape cut in two by a fragment
+    boundary waits for its other half, and so does the first half of a surrogate
+    pair, which is no character on its own. A reply that does not open on
+    `content`, or JSON it cannot decode, makes it stop for good rather than
+    guess: the finished reply is the authority, and whatever the tap did not
+    return is sent from it when the run ends (`_Live._ending`).
+    """
+
+    _OPENING = re.compile(r'\s*\{\s*"content"\s*:\s*"')
+    _HIGH_SURROGATES = ("d8", "d9", "da", "db")
+
+    def __init__(self):
+        self._pending = ""  # JSON received and not yet returned as text
+        self._inside = False  # past the opening, within the string
+        self.done = False
+
+    def feed(self, fragment: str) -> str:
+        if self.done:
+            return ""
+        self._pending += fragment
+        if not self._inside:
+            opening = self._OPENING.match(self._pending)
+            if opening is None:
+                # Still arriving, or something else altogether: the opening is
+                # a dozen characters, so more than that without one is a no.
+                self.done = len("".join(self._pending.split())) > len('{"content":"')
+                return ""
+            self._inside, self._pending = True, self._pending[opening.end():]
+
+        text, at, pair = self._pending, 0, None
+        while at < len(text):
+            if text[at] == '"':
+                self.done = True
+                break
+            width = 1
+            if text[at] == "\\":
+                width = 6 if text[at + 1:at + 2] == "u" else 2
+                if at + width > len(text):
+                    break  # the rest of this escape is in the next fragment
+            pair = at if width == 6 and text[at + 2:at + 4].lower() in self._HIGH_SURROGATES else None
+            at += width
+        if pair is not None and not self.done:
+            at = pair  # the second half is still to come
+        self._pending = text[at:]
+        try:
+            # Not strict: a raw newline inside the string is still the model's text.
+            return json.loads(f'"{text[:at]}"', strict=False)
+        except ValueError:
+            self.done = True
+            return ""
+
+
 # A stream-json line carries a whole message; asyncio's default 64 KiB line
 # limit would fail any long answer.
 _LINE_LIMIT = 64 * 1024 * 1024
+
+
+async def _hand(proc, data: bytes) -> None:
+    """Write the process its whole stdin and close it."""
+    try:
+        proc.stdin.write(data)
+        await proc.stdin.drain()
+        proc.stdin.close()
+    except (BrokenPipeError, ConnectionResetError):
+        pass  # it exited before reading the prompt; its output says why
 
 
 async def _communicate(proc, data: bytes, watch: Optional[_Watch]) -> Tuple[bytes, bytes]:
@@ -400,12 +491,7 @@ async def _communicate(proc, data: bytes, watch: Optional[_Watch]) -> Tuple[byte
         return await proc.communicate(data)
     stderr = asyncio.ensure_future(proc.stderr.read())
     try:
-        try:
-            proc.stdin.write(data)
-            await proc.stdin.drain()
-            proc.stdin.close()
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # it exited before reading the prompt; its output says why
+        await _hand(proc, data)
         lines = []
         while True:
             line = await proc.stdout.readline()
@@ -421,11 +507,9 @@ async def _communicate(proc, data: bytes, watch: Optional[_Watch]) -> Tuple[byte
             stderr.cancel()
 
 
-async def _run(
-    argv: List[str], prompt: str, timeout, request: httpx.Request, watch: Optional[_Watch] = None,
-) -> Tuple[int, bytes, bytes]:
+async def _spawn(argv: List[str], request: httpx.Request):
     try:
-        proc = await asyncio.create_subprocess_exec(
+        return await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -437,6 +521,12 @@ async def _run(
         # Missing or non-executable binary: this backend cannot answer at all,
         # which to failover is exactly a connection failure.
         raise httpx.ConnectError(f"cannot start the claude CLI: {e}", request=request) from e
+
+
+async def _run(
+    argv: List[str], prompt: str, timeout, request: httpx.Request, watch: Optional[_Watch] = None,
+) -> Tuple[int, bytes, bytes]:
+    proc = await _spawn(argv, request)
     try:
         out, err = await asyncio.wait_for(_communicate(proc, _frame(prompt), watch), timeout)
     except asyncio.TimeoutError:
@@ -596,24 +686,38 @@ def _caught(watch: _Watch, model: str, single: bool) -> dict:
     )
 
 
+def _event(data: dict) -> bytes:
+    """One SSE event. A lone surrogate has no UTF-8; it goes out as `?` rather
+    than ending the stream it is part of."""
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8", errors="replace")
+
+
+def _chunk(head: dict, delta: dict, finish: Optional[str] = None) -> bytes:
+    return _event({**head, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+
+
+def _closing(head: dict, finish: str, usage: dict) -> List[bytes]:
+    """How a chat stream ends: the finish reason, then usage (what
+    `include_usage` asks for), then the terminator."""
+    return [_chunk(head, {}, finish), _event({**head, "choices": [], "usage": usage}), b"data: [DONE]\n\n"]
+
+
+def _called(completion: dict) -> List[dict]:
+    """A completion's `tool_calls`, the way a stream delta carries them."""
+    return [{"index": i, **call} for i, call in enumerate(completion["choices"][0]["message"]["tool_calls"])]
+
+
 def _sse(completion: dict) -> bytes:
-    """A finished completion as an OpenAI chat stream: the whole text in one
-    delta, then the finish reason, then usage (what `include_usage` asks for)."""
+    """A finished completion as an OpenAI chat stream: everything in one delta,
+    then the closing events."""
     head = {k: completion[k] for k in ("id", "created", "model")}
     head["object"] = "chat.completion.chunk"
     choice = completion["choices"][0]
     message = choice["message"]
     delta = {"role": "assistant", "content": message["content"]}
     if message.get("tool_calls"):
-        delta["tool_calls"] = [{"index": i, **call} for i, call in enumerate(message["tool_calls"])]
-    chunks = [
-        {**head, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
-        {**head, "choices": [{"index": 0, "delta": {}, "finish_reason": choice["finish_reason"]}]},
-        {**head, "choices": [], "usage": completion["usage"]},
-    ]
-    events = [f"data: {json.dumps(c, ensure_ascii=False)}\n\n" for c in chunks]
-    events.append("data: [DONE]\n\n")
-    return "".join(events).encode("utf-8")
+        delta["tool_calls"] = _called(completion)
+    return b"".join([_chunk(head, delta), *_closing(head, choice["finish_reason"], completion["usage"])])
 
 
 def _response(status: int, body: bytes, content_type: str) -> httpx.Response:
@@ -630,6 +734,235 @@ def _answer(completion: dict, payload: dict) -> httpx.Response:
 def _error(status: int, message: str, kind: str) -> httpx.Response:
     body = json.dumps({"error": {"message": message, "type": kind, "code": status}})
     return _response(status, body.encode("utf-8"), "application/json")
+
+
+def _complaint(result: dict) -> str:
+    return str(result.get("result") or result.get("subtype") or "the claude CLI reported an error")
+
+
+def _settle(
+    payload: dict, model: str, translated: Translated, watch: Optional[_Watch],
+    result: Optional[dict], code: Optional[int], detail: str,
+) -> httpx.Response:
+    """A run that is over, none of it sent yet -> the response to it."""
+    if watch is not None and watch.calls:
+        return _answer(_caught(watch, model, translated.single), payload)
+    if result is None:
+        return _error(
+            502, f"the claude CLI exited {code} without a result: {detail or '(no output)'}", "upstream_error"
+        )
+    if result.get("is_error"):
+        return _error(_status(result), _complaint(result), "upstream_error")
+    return _answer(_completion(result, model, bool(translated.functions)), payload)
+
+
+def _discard(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+class _Live(httpx.AsyncByteStream):
+    """A run answered while it is still running: the CLI's stdout, read event by
+    event, as the body of an OpenAI chat stream.
+
+    Only the answer's text is relayed as it comes. In a plain chat that is the
+    model's text. In a request that offers functions it is the `content` of the
+    structured reply (`_ContentTap`); what the model writes around a call is held
+    back, because until its message ends there is no telling a call follows, and
+    a call goes back whole with that text, exactly as it does unstreamed.
+
+    `open` reads up to the first piece of the answer and no further, because that
+    is the last moment a status code can still be chosen. A run that is over by
+    then — it failed, it called a function, it answered with nothing to relay —
+    gets the response a buffered run gets, so a failure is still an HTTP status
+    the dispatcher can fail over on. Only an answer that has begun commits the 200.
+
+    The process lives exactly as long as this body. `aclose` kills it, and the
+    proxy closes the response before it gives the slot back (`_handle_stream`'s
+    `close`) on every path: the body read to its end, the client gone, an
+    operator's kill. The read timeout applies to each line, as it does to each
+    read on a socket, so a long answer is not cut while it keeps coming.
+    """
+
+    def __init__(
+        self, proc, payload: dict, model: str, translated: Translated, timeout,
+        request: httpx.Request, system_file: str,
+    ):
+        self._proc = proc
+        self._payload, self._model, self._translated = payload, model, translated
+        self._timeout, self._request, self._system_file = timeout, request, system_file
+        self._stderr = asyncio.ensure_future(proc.stderr.read())
+        self._watch = _Watch(translated.functions) if translated.functions else None
+        # One tap a run, on its first structured reply; `_tapped` is that
+        # content block's index while it is being written.
+        self._tap: Optional[_ContentTap] = None
+        self._tapped = None
+        self._head = {
+            "id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion.chunk",
+            "created": int(time.time()), "model": model,
+        }
+        self._result: Optional[dict] = None
+        self._sent = ""  # the answer text relayed so far
+        self._noise: List[bytes] = []  # the last lines that were not events, for a 502
+        self._closed = False
+
+    async def _within(self, awaitable):
+        try:
+            return await asyncio.wait_for(awaitable, self._timeout)
+        except asyncio.TimeoutError:
+            raise httpx.ReadTimeout(
+                f"the claude CLI gave nothing for {self._timeout:.0f}s", request=self._request
+            ) from None
+
+    async def hand(self, prompt: str) -> None:
+        await self._within(_hand(self._proc, _frame(prompt)))
+
+    def _read(self, line: bytes) -> Tuple[str, Optional[str]]:
+        """One line of stdout -> (the answer text it adds, how the run ended if
+        this line ends it: `calls`, `result` or `eof`)."""
+        if not line:
+            return "", "eof"
+        try:
+            frame = json.loads(line)
+        except ValueError:
+            frame = None
+        if not isinstance(frame, dict):
+            self._noise = [*self._noise[-19:], line]
+            return "", None
+        if self._watch is not None and self._watch.event(frame):
+            return "", "calls"
+        kind = frame.get("type")
+        if kind == "result":
+            self._result = frame
+            return "", "result"
+        if kind == "system" and frame.get("subtype") == "init" and frame.get("session_id"):
+            self._head["id"] = f"chatcmpl-{frame['session_id']}"
+        if kind != "stream_event":
+            return "", None
+        event = frame.get("event") or {}
+        kind = event.get("type")
+        if kind == "message_start":
+            self._tapped = None
+            model = (event.get("message") or {}).get("model")
+            if isinstance(model, str) and model:
+                self._head["model"] = model
+        elif kind == "content_block_start" and self._watch is not None and self._tap is None:
+            block = event.get("content_block") or {}
+            # A client's own function of that name is a call to hand back, not the reply.
+            if block.get("name") == _STRUCTURED and _STRUCTURED not in self._watch.functions:
+                self._tap, self._tapped = _ContentTap(), event.get("index")
+        elif kind == "content_block_delta":
+            delta = event.get("delta") or {}
+            if self._watch is None:
+                if delta.get("type") == "text_delta":
+                    return str(delta.get("text") or ""), None
+            elif (
+                delta.get("type") == "input_json_delta" and self._tapped is not None
+                and event.get("index") == self._tapped and not self._watch.calls
+            ):
+                return self._tap.feed(str(delta.get("partial_json") or "")), None
+        return "", None
+
+    async def open(self) -> httpx.Response:
+        """Read up to the first piece of the answer. Returns this stream, opening
+        on that piece — or, the run being over already, what a buffered run
+        returns, with this stream closed behind it."""
+        while True:
+            text, end = self._read(await self._within(self._proc.stdout.readline()))
+            if end:
+                code, detail = None, ""
+                if end == "eof":
+                    code = await self._within(self._proc.wait())
+                    wrote = await self._within(self._stderr) or b"".join(self._noise)
+                    detail = wrote.decode("utf-8", errors="replace").strip()[-2000:]
+                await self.aclose()
+                return _settle(self._payload, self._model, self._translated, self._watch, self._result, code, detail)
+            if text:
+                self._sent = text
+                return httpx.Response(200, stream=self, headers={"content-type": "text/event-stream"})
+
+    def _failure(self, end: str) -> Optional[dict]:
+        """The error a stream that had begun ends on, when the run failed."""
+        if end == "eof":
+            return {"message": "the claude CLI stopped before it finished the answer", "code": 502}
+        if end == "result" and self._result.get("is_error"):
+            return {"message": _complaint(self._result), "code": _status(self._result)}
+        return None
+
+    def _ending(self, end: str) -> List[bytes]:
+        """The last events of a stream that had begun and whose run went well."""
+        if end == "calls":
+            # A call in the same message as an answer that had begun: the text
+            # stays as it was sent and the call follows it.
+            caught = _caught(self._watch, self._head["model"], self._translated.single)
+            return [
+                _chunk(self._head, {"tool_calls": _called(caught)}),
+                *_closing(self._head, "tool_calls", caught["usage"]),
+            ]
+        done = _completion(self._result, self._model, self._watch is not None)
+        choice = done["choices"][0]
+        # The finished reply is the authority. Whatever of it the pieces did not
+        # cover (a tap that stopped, a CLI that printed none) goes out now.
+        whole = choice["message"]["content"] or ""
+        rest = whole[len(self._sent):] if whole.startswith(self._sent) else ""
+        return [
+            *([_chunk(self._head, {"content": rest})] if rest else []),
+            *_closing(self._head, choice["finish_reason"], done["usage"]),
+        ]
+
+    async def __aiter__(self):
+        yield _chunk(self._head, {"role": "assistant", "content": self._sent})
+        while True:
+            text, end = self._read(await self._within(self._proc.stdout.readline()))
+            if text:
+                self._sent += text
+                yield _chunk(self._head, {"content": text})
+            if not end:
+                continue
+            failure = self._failure(end)
+            if failure:
+                # Too late for a status code: the 200 went out with the first
+                # chunk. The client gets the error as an event, and the proxy an
+                # exception, so the request is counted as the failure it was.
+                yield _event({"error": {**failure, "type": "upstream_error"}})
+                raise httpx.RemoteProtocolError(failure["message"], request=self._request)
+            for piece in self._ending(end):
+                yield piece
+            return
+
+    async def aclose(self) -> None:
+        """End the run wherever it is. Safe to call more than once."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self._proc.returncode is None:
+                try:
+                    self._proc.kill()
+                except ProcessLookupError:
+                    pass
+                await self._proc.wait()
+        finally:
+            self._stderr.cancel()
+            _discard(self._system_file)
+
+
+async def _go_live(
+    argv: List[str], payload: dict, model: str, translated: Translated, timeout,
+    request: httpx.Request, system_file: str,
+) -> httpx.Response:
+    """Start a run whose answer is relayed as it is written (see `_Live`)."""
+    live = _Live(await _spawn(argv, request), payload, model, translated, timeout, request, system_file)
+    try:
+        await live.hand(translated.prompt)
+        return await live.open()
+    except BaseException:
+        # A timeout, an operator's kill, a bug: nobody is left to close the
+        # stream, and its process must not outlive the slot.
+        await live.aclose()
+        raise
 
 
 class Transport(httpx.AsyncBaseTransport):
@@ -655,30 +988,24 @@ class Transport(httpx.AsyncBaseTransport):
         # enforce it, so the transport does.
         timeout = (request.extensions.get("timeout") or {}).get("read")
         fd, system_file = tempfile.mkstemp(prefix="system-", suffix=".txt", dir=_workdir())
+        running = False  # a stream still running keeps the file, and removes it when it closes
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(translated.system)
             functions = bool(translated.functions)
-            watch = _Watch(translated.functions) if functions else None
             argv = _argv(model, system_file, payload, functions)
+            if payload.get("stream"):
+                response = await _go_live(argv, payload, model, translated, timeout, request, system_file)
+                running = isinstance(response.stream, _Live)
+                return response
+            watch = _Watch(translated.functions) if functions else None
             code, out, err = await _run(argv, translated.prompt, timeout, request, watch)
         finally:
-            os.unlink(system_file)
+            if not running:
+                _discard(system_file)
 
-        if watch is not None and watch.calls:
-            return _answer(_caught(watch, model, translated.single), payload)
-
-        result = _result(out)
-        if result is None:
-            detail = (err or out).decode("utf-8", errors="replace").strip()[-2000:]
-            return _error(
-                502, f"the claude CLI exited {code} without a result: {detail or '(no output)'}", "upstream_error"
-            )
-        if result.get("is_error"):
-            message = str(result.get("result") or result.get("subtype") or "the claude CLI reported an error")
-            return _error(_status(result), message, "upstream_error")
-
-        return _answer(_completion(result, model, functions), payload)
+        detail = (err or out).decode("utf-8", errors="replace").strip()[-2000:]
+        return _settle(payload, model, translated, watch, _result(out), code, detail)
 
 
 def client() -> httpx.AsyncClient:

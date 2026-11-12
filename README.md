@@ -398,7 +398,8 @@ Slots, failover, metrics, the request log and the console's Kill button behave a
 an HTTP backend. A CLI error with an HTTP status is relayed with that status (a
 usage-limit 429 fails over like any 429). Anthropic's 529 becomes 503. A refused CLI
 login becomes 502, not a 401 the caller would read as their own key. A binary that will
-not start, or runs past the 600 s read timeout, counts as a connection failure.
+not start, or runs past the 600 s read timeout, counts as a connection failure. For a
+streamed answer the 600 s is the longest silence allowed, not the length of the answer.
 
 What it serves, and what it refuses:
 
@@ -414,7 +415,11 @@ What it serves, and what it refuses:
   call cannot be forced. `parallel_tool_calls: false` returns at most one call. Every
   request re-sends the conversation and the function list, so a client with many tools
   spends quota on them every turn. Legacy `functions` is refused with a 400.
-- **Streaming is synthesized.** The answer arrives as one SSE chunk when it is done.
+- **Streaming relays the answer as it is written.** With `stream: true` the text arrives
+  piece by piece while the CLI is still running, in a plain chat and in a request that
+  offers functions alike. A function call arrives whole, in one chunk. A run that fails
+  before its first piece of text is still an HTTP status, so it can fail over; one that
+  fails later ends the stream on an `error` event. Closing the connection stops the run.
 - **Images and audio are refused with a 400**, not silently dropped.
 - **The agent is disarmed.** Every built-in tool, MCP server, settings file and slash
   command is switched off and the process runs in an empty directory, because the

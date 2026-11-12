@@ -46,29 +46,54 @@ FAKE = textwrap.dedent('''
     with open(os.environ["FAKE_CLAUDE_LOG"], "a", encoding="utf-8") as f:
         f.write(json.dumps(seen) + "\\n")
     mode = os.environ.get("FAKE_CLAUDE_MODE", "ok")
-    if mode == "hang":
+    def emit(event):
+        print(json.dumps(event), flush=True)
+    def leave_pid():
         with open(os.environ["FAKE_CLAUDE_PID"], "w") as f:
             f.write(str(os.getpid()))
+    if mode == "hang":
+        leave_pid()
         time.sleep(60)
     if mode == "garbage":
         sys.stderr.write("something went very wrong\\n")
         sys.exit(3)
+    # An answer written piece by piece, the way `--include-partial-messages`
+    # prints it: as text, or with `--json-schema` as the JSON of the reply.
+    # `stall` stops after the first piece and `dies` exits there.
+    pieces = json.loads(os.environ.get("FAKE_CLAUDE_PIECES") or "[]")
+    written = ""
+    if pieces and "--include-partial-messages" in argv:
+        def stream(event):
+            emit({"type": "stream_event", "event": event})
+        as_json = "--json-schema" in argv
+        emit({"type": "system", "subtype": "init", "session_id": "s1"})
+        stream({"type": "message_start", "message": {"id": "msg_1", "model": "claude-opus-test-1"}})
+        block = {"type": "tool_use", "name": "StructuredOutput", "input": {}} if as_json else {"type": "text", "text": ""}
+        stream({"type": "content_block_start", "index": 0, "content_block": block})
+        for n, piece in enumerate(pieces):
+            if n == 0 and mode == "stall":
+                leave_pid()
+            delta = {"type": "input_json_delta", "partial_json": piece} if as_json else {"type": "text_delta", "text": piece}
+            stream({"type": "content_block_delta", "index": 0, "delta": delta})
+            if n == 0 and mode == "stall":
+                time.sleep(60)
+            if n == 0 and mode == "dies":
+                sys.exit(3)
+        stream({"type": "content_block_stop", "index": 0})
+        written = "".join(pieces)
     # A model calling functions as tools, the way `--output-format stream-json`
     # prints it: block by block, then the CLI's "no such tool" reply. The real CLI
     # would go on from there; this one sleeps, so a run that is not cut short hangs.
     calls = json.loads(os.environ.get("FAKE_CLAUDE_CALLS") or "[]")
     if calls:
         message = {"id": "msg_1", "model": "claude-opus-test-1", "usage": {"input_tokens": 7, "output_tokens": 3}}
-        def emit(event):
-            print(json.dumps(event), flush=True)
         emit({"type": "system", "subtype": "init", "tools": ["StructuredOutput"]})
         emit({"type": "assistant", "message": {**message, "content": [{"type": "text", "text": "Checking."}]}})
         for i, (name, args) in enumerate(calls):
             block = {"type": "tool_use", "id": "toolu_%d" % i, "name": name, "input": args}
             emit({"type": "assistant", "message": {**message, "content": [block]}})
         emit({"type": "user", "message": {"content": [{"type": "tool_result", "is_error": True, "content": "No such tool"}]}})
-        with open(os.environ["FAKE_CLAUDE_PID"], "w") as f:
-            f.write(str(os.getpid()))
+        leave_pid()
         if mode != "carry-on":
             time.sleep(60)
     result = {
@@ -80,6 +105,12 @@ FAKE = textwrap.dedent('''
     }
     # What --json-schema makes the real CLI print: the reply both as text and parsed.
     structured = os.environ.get("FAKE_CLAUDE_STRUCTURED")
+    # The result of a run that printed pieces is what they add up to, plus
+    # FAKE_CLAUDE_REST: text in the finished answer that no piece carried.
+    if written and "--json-schema" in argv:
+        structured = written
+    elif written:
+        result["result"] = written + os.environ.get("FAKE_CLAUDE_REST", "")
     if structured:
         result.update(result=structured, structured_output=json.loads(structured), stop_reason="tool_use")
     if mode.startswith("error"):
@@ -88,7 +119,7 @@ FAKE = textwrap.dedent('''
     # The real CLI can print a diagnostic line ahead of its result, and in
     # stream-json the events of the run come ahead of it too.
     print('[claude-code:diagnostic] {"noise": true}')
-    if not calls:
+    if not calls and not written:
         print(json.dumps({"type": "system", "subtype": "init", "tools": []}))
         print(json.dumps({"type": "assistant", "message": {"id": "msg_9", "content": [
             {"type": "text", "text": result["result"]}]}}))
@@ -233,7 +264,7 @@ def test_the_cli_runs_with_every_tool_off_in_an_empty_directory(client, cli):
     assert argv[argv.index("--setting-sources") + 1] == ""
     for flag in ("-p", "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"):
         assert flag in argv
-    assert "--effort" not in argv
+    assert "--effort" not in argv and "--include-partial-messages" not in argv
     assert os.path.basename(call["cwd"]).startswith("llm-proxy-claude-")
     # Only the per-request system prompt file was ever in it, and it is gone.
     assert os.listdir(call["cwd"]) == []
@@ -305,6 +336,166 @@ def test_a_stream_request_gets_the_answer_as_sse(client, cli):
     row = client.get("/admin/inflight", headers=AUTH).json()["requests"][0]
     assert row["provider"] == "claude" and row["out_tokens"] == 4
     assert idle() == {"claude": 0, "backup": 0}
+
+
+# ── Streaming ───────────────────────────────────────────────────────────────
+
+def sse(text):
+    data = [line[5:].strip() for line in text.splitlines() if line.startswith("data:")]
+    return [d if d == "[DONE]" else json.loads(d) for d in data]
+
+
+def streamed(client, body):
+    with client.stream("POST", "/v1/chat/completions", json=body, headers=AUTH) as r:
+        return r.status_code, sse("".join(r.iter_text()))
+
+
+def deltas(chunks):
+    return [e["choices"][0]["delta"] for e in chunks if isinstance(e, dict) and e.get("choices")]
+
+
+def pieces(monkeypatch, *parts):
+    monkeypatch.setenv("FAKE_CLAUDE_PIECES", json.dumps(list(parts)))
+
+
+def test_an_answer_is_relayed_piece_by_piece(client, cli, monkeypatch):
+    pieces(monkeypatch, "Hel", "lo, ", "wörld")
+    status, chunks = streamed(client, chat(stream=True))
+    assert status == 200 and chunks[-1] == "[DONE]"
+    assert deltas(chunks) == [
+        {"role": "assistant", "content": "Hel"}, {"content": "lo, "}, {"content": "wörld"}, {},
+    ]
+    assert chunks[-3]["choices"][0]["finish_reason"] == "stop"
+    assert chunks[-2]["usage"]["completion_tokens"] == 4
+    # One id, and the concrete model, on every chunk.
+    assert {(e["id"], e["model"]) for e in chunks[:-1]} == {("chatcmpl-s1", "claude-opus-test-1")}
+    call = cli.calls()[0]
+    assert "--include-partial-messages" in call["argv"]
+    # The system prompt file lasted as long as the stream, and no longer.
+    assert os.listdir(call["cwd"]) == []
+    assert idle() == {"claude": 0, "backup": 0}
+
+
+def test_text_no_piece_carried_is_sent_from_the_finished_answer(client, cli, monkeypatch):
+    pieces(monkeypatch, "Hel")
+    monkeypatch.setenv("FAKE_CLAUDE_REST", "lo")
+    _, chunks = streamed(client, chat(stream=True))
+    assert [d.get("content") for d in deltas(chunks)] == ["Hel", "lo", None]
+
+
+def test_a_structured_reply_is_relayed_as_its_text(client, cli, monkeypatch):
+    """With functions offered the answer is the `content` of a JSON reply, and
+    the stream carries that JSON in fragments."""
+    text = 'Sunny, 18°C.\n"Nice" \\ 😀'
+    doc = json.dumps({"content": text})
+    assert "\\ud83d\\ude00" in doc and "\\n" in doc  # escapes, and a surrogate pair
+    # Cut every five characters: through the escapes and through the pair.
+    pieces(monkeypatch, *[doc[i:i + 5] for i in range(0, len(doc), 5)])
+    status, chunks = streamed(client, chat("claude-sonnet", tools=TOOLS, stream=True))
+    sent = [d["content"] for d in deltas(chunks) if d.get("content")]
+    assert status == 200 and "".join(sent) == text and len(sent) > 3
+    assert chunks[-3]["choices"][0]["finish_reason"] == "stop"
+    assert idle() == {"claude": 0, "backup": 0}
+
+
+def test_a_reply_the_tap_cannot_follow_still_arrives_whole(client, cli, monkeypatch):
+    pieces(monkeypatch, '{"note": "x", ', '"content": "Late."}')
+    _, chunks = streamed(client, chat("claude-sonnet", tools=TOOLS, stream=True))
+    assert deltas(chunks)[0] == {"role": "assistant", "content": "Late."}
+
+
+def test_a_call_after_the_answer_began_follows_its_text(client, cli, monkeypatch):
+    pieces(monkeypatch, '{"content": "On ', 'it."}')
+    monkeypatch.setenv("FAKE_CLAUDE_CALLS", json.dumps(WEATHER))
+    _, chunks = streamed(client, chat("claude-sonnet", tools=TOOLS, stream=True))
+    first, second, third = deltas(chunks)[:3]
+    assert (first["content"], second["content"]) == ("On ", "it.")
+    (call,) = third["tool_calls"]
+    assert call["index"] == 0
+    assert call["function"] == {"name": "get_weather", "arguments": '{"city": "Curitiba"}'}
+    assert chunks[-3]["choices"][0]["finish_reason"] == "tool_calls" and chunks[-1] == "[DONE]"
+    assert idle() == {"claude": 0, "backup": 0}
+
+
+def test_a_stream_that_fails_before_its_first_piece_is_a_status(client, cli, monkeypatch):
+    """Nothing is committed until the answer begins, so a failed run is still an
+    HTTP status — and still something to fail over on."""
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "error429")
+    r = client.post("/v1/chat/completions", json=chat("claude-sonnet", stream=True), headers=AUTH)
+    assert r.status_code == 429 and r.json()["error"]["message"] == "it broke"
+    registry._down_until.clear()
+    r = client.post("/v1/chat/completions", json=chat(stream=True), headers=AUTH)
+    assert r.status_code == 200 and "from backup" in r.text
+    assert len(cli.calls()) == 2 and len(cli.backup_requests) == 1
+    assert idle() == {"claude": 0, "backup": 0}
+
+
+@pytest.mark.parametrize("mode,sent,code", [
+    ("error529", ["Hel", "lo"], 503),  # the run reported an error after its pieces
+    ("dies", ["Hel"], 502),            # the process went away mid-answer
+])
+def test_a_stream_that_fails_after_its_first_piece_ends_on_an_error(client, cli, monkeypatch, mode, sent, code):
+    pieces(monkeypatch, "Hel", "lo")
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", mode)
+    status, chunks = streamed(client, chat("claude-sonnet", stream=True))
+    assert status == 200
+    assert [d["content"] for d in deltas(chunks)] == sent
+    # The error is the last event: no finish reason and no [DONE] after it.
+    assert chunks[-1]["error"]["code"] == code and chunks[-1]["error"]["type"] == "upstream_error"
+    assert idle() == {"claude": 0, "backup": 0}
+
+
+def test_a_stream_that_stalls_is_cut_and_its_process_killed(client, cli, monkeypatch):
+    pieces(monkeypatch, "Hel", "lo")
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "stall")
+    impatient(monkeypatch)
+    status, chunks = streamed(client, chat("claude-sonnet", stream=True))
+    assert status == 200 and [d["content"] for d in deltas(chunks)] == ["Hel"]
+    assert not alive(int(cli.pid_file.read_text()))
+    assert idle() == {"claude": 0, "backup": 0}
+
+
+async def test_closing_a_stream_kills_the_process(cli, monkeypatch):
+    """A client that went away and an operator's kill both end in the proxy
+    closing the response. The process must not outlive that."""
+    pieces(monkeypatch, "Hel", "lo")
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "stall")
+    transport = claude_cli.Transport()
+    async with httpx.AsyncClient(transport=transport, base_url="http://claude-cli", timeout=httpx.Timeout(5.0)) as c:
+        async with c.stream("POST", "/v1/chat/completions", json=chat("opus", stream=True)) as r:
+            assert r.status_code == 200
+            first = await r.aiter_raw().__anext__()
+            assert b'"content": "Hel"' in first
+            pid = int(cli.pid_file.read_text())
+            assert alive(pid)
+        assert not alive(pid)
+    assert os.listdir(claude_cli._workdir()) == []
+
+
+@pytest.mark.parametrize("text", [
+    "plain", 'quote " backslash \\ newline \n tab \t', "é 自転車 😀", "\\ud83d is not an escape here", "",
+])
+def test_the_tap_gives_the_same_text_however_the_json_is_cut(text):
+    for ascii_only in (True, False):
+        doc = json.dumps({"content": text}, ensure_ascii=ascii_only)
+        cuts = [[doc], list(doc)] + [[doc[:i], doc[i:]] for i in range(len(doc) + 1)]
+        cuts += [[doc[i:i + n] for i in range(0, len(doc), n)] for n in (2, 3, 5, 7)]
+        for fragments in cuts:
+            tap = claude_cli._ContentTap()
+            assert "".join(tap.feed(f) for f in fragments) == text, fragments
+            assert tap.done
+
+
+def test_the_tap_returns_only_text_it_is_sure_of():
+    tap = claude_cli._ContentTap()
+    # Half a surrogate pair is no character, and half an escape no escape.
+    assert tap.feed('{"content": "a\\ud83d') == "a"
+    assert tap.feed("\\ude00b\\") == "😀b"
+    assert tap.feed('n"}') == "\n" and tap.done
+    # A reply that opens on anything else is not guessed at.
+    for doc in ('{"other": "x", "content": "y"}', '{"content": 5}'):
+        tap = claude_cli._ContentTap()
+        assert tap.feed(doc) == "" and tap.done
 
 
 # ── The gate ────────────────────────────────────────────────────────────────
@@ -553,12 +744,17 @@ def test_tool_choice_none_is_a_plain_chat(client, cli):
 
 # ── No process outlives its slot ────────────────────────────────────────────
 
-def test_a_timeout_kills_the_process(client, cli, monkeypatch):
-    monkeypatch.setenv("FAKE_CLAUDE_MODE", "hang")
+def impatient(monkeypatch):
     monkeypatch.setattr(claude_cli, "_client", httpx.AsyncClient(
         transport=claude_cli.Transport(), base_url="http://claude-cli", timeout=httpx.Timeout(1.0)
     ))
-    r = client.post("/v1/chat/completions", json=chat("claude-sonnet"), headers=AUTH)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_timeout_kills_the_process(client, cli, monkeypatch, stream):
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "hang")
+    impatient(monkeypatch)
+    r = client.post("/v1/chat/completions", json=chat("claude-sonnet", stream=stream), headers=AUTH)
     assert r.status_code == 504
     assert not alive(int(cli.pid_file.read_text()))
     assert idle() == {"claude": 0, "backup": 0}
