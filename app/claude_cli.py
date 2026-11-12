@@ -32,6 +32,21 @@ session persistence are all switched off, and the process runs in an empty
 scratch directory. A request that needs images or audio is refused with a 400
 rather than quietly degraded into something it did not ask for.
 
+## Delivered, not typed
+
+Switching the tools off is not enough, because the CLI reads plain `-p` text the
+way its terminal reads typing: an `@/path` in it attaches that file to the
+request — no tool is involved, so `--tools ""` does not stop it — and a message
+that is a command's name (`/cost`) is answered by the CLI without ever reaching
+the model. A caller could read the config that way. So the prompt goes in as one
+`stream-json` frame marked `client_composed`, the CLI's own mark for text a
+client put together: it reaches the model as written. Measured on 2.1.322 with a
+canary file, which plain text leaked and the marked frame did not.
+
+That frame is the only thing ever written to the CLI's stdin, and the client's
+text is only ever a JSON string inside it: `stream-json` input takes other kinds
+of frame too, one of which runs a shell command.
+
 ## Function calling, emulated
 
 A client's `tools` cannot reach the CLI as tools: it only takes tools through
@@ -295,16 +310,37 @@ def _argv(model: str, system_file: str, payload: dict, functions: bool = False) 
     # history clears easily, and argv is visible to anyone running `ps`.
     argv = [
         *COMMAND, "-p", "--model", model, "--system-prompt-file", system_file, *_LOCKDOWN,
+        # The prompt as a frame (see `_frame`). The CLI takes stream-json input
+        # only together with stream-json output, and that output needs --verbose.
+        # It is also what lets a function call be caught event by event.
+        "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
     ]
     if functions:
-        # Event by event, so a call can be caught the moment the model makes it.
-        argv += ["--output-format", "stream-json", "--verbose", "--json-schema", _REPLY]
-    else:
-        argv += ["--output-format", "json"]
+        argv += ["--json-schema", _REPLY]
     effort = payload.get("reasoning_effort")
     if effort in EFFORTS:
         argv += ["--effort", effort]
     return argv
+
+
+def _frame(prompt: str) -> bytes:
+    """The prompt as the one line the CLI reads from stdin.
+
+    `client_composed` is what makes the CLI hand the text to the model as
+    written instead of reading it as typing, where an `@/path` attaches a file
+    and a command's name runs the command.
+
+    The line is pure ASCII (`ensure_ascii`, the default): every newline, and
+    every Unicode line separator a reader might also split on, is an escape, so
+    whatever the client wrote stays inside this frame's string and can never
+    start a frame of its own.
+    """
+    frame = {
+        "type": "user",
+        "message": {"role": "user", "content": [{"type": "text", "text": prompt}]},
+        "client_composed": True,
+    }
+    return json.dumps(frame).encode("ascii") + b"\n"
 
 
 class _Watch:
@@ -402,7 +438,7 @@ async def _run(
         # which to failover is exactly a connection failure.
         raise httpx.ConnectError(f"cannot start the claude CLI: {e}", request=request) from e
     try:
-        out, err = await asyncio.wait_for(_communicate(proc, prompt.encode("utf-8"), watch), timeout)
+        out, err = await asyncio.wait_for(_communicate(proc, _frame(prompt), watch), timeout)
     except asyncio.TimeoutError:
         raise httpx.ReadTimeout(
             f"the claude CLI gave no answer within {timeout:.0f}s", request=request
@@ -417,8 +453,8 @@ async def _run(
 
 
 def _result(out: bytes) -> Optional[dict]:
-    """The `type: result` object `--output-format json` prints. The CLI can emit
-    diagnostic lines ahead of it (`[claude-code:unrecognized_model] {...}`), so
+    """The `type: result` object a run ends on. Other events come ahead of it,
+    and so can diagnostic lines (`[claude-code:unrecognized_model] {...}`), so
     take the last line that parses as one rather than the whole of stdout."""
     for line in reversed(out.decode("utf-8", errors="replace").splitlines()):
         line = line.strip()

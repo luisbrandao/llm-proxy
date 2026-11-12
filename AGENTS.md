@@ -54,7 +54,7 @@ CONFIG_PATH=config.yaml uvicorn app.main:app --port 8000
 | `app/providers/` | One module per vendor (`openrouter`, `nanogpt`, `deepseek`), each with the fetchers it has an API for (`fetch_rates`, `fetch_included`, `fetch_quota`, `fetch_balance`), pure `parse_*` functions, and optionally `adapt_request(payload)`. `__init__` holds `RateCard`, `Override`, `Quota`, `Balance`, `get_vendor`. Endpoints and units are in `docs/providers/`. |
 | `app/notify.py` | Warnings to ntfy: balance low or empty, allowance used up, payment refused, topped up. `evaluate()` → `run_once()` → `loop()`. `payment_required()` is the one call from the request path. |
 | `app/trim.py` | The context guardrail. `trim_request(payload, body_str, asked, request_id)` returns a `Trimmed` (the shrunk payload plus the numbers) or `None`. `_TokenMeter` counts with a real tokenizer; `_CharMeter` is the fallback. |
-| `app/claude_cli.py` | The `kind: claude-cli` backend: an `httpx.AsyncBaseTransport` that answers `POST …/chat/completions` by running the `claude` binary headless. `translate` (OpenAI request → prompt), `_Watch` (catches emulated function calls mid-stream), `_coerce`, `client()`. |
+| `app/claude_cli.py` | The `kind: claude-cli` backend: an `httpx.AsyncBaseTransport` that answers `POST …/chat/completions` by running the `claude` binary headless. `translate` (OpenAI request → prompt), `_frame` (the prompt as the one line written to stdin), `_Watch` (catches emulated function calls mid-stream), `_coerce`, `client()`. |
 | `app/usage.py` | `parse(response) -> Usage \| None`: every vendor's spelling of tokens, cache reads and writes, reasoning and cost, folded into one object. `format_cost` for the log. Imports nothing from the app. |
 | `app/ledger.py` | The cost ledger: one SQLite row per completed request. `record(...)` (never raises), `summary(...)` for `/admin/costs`, `observed_prices` / `observed_shares` for `smart.refresh`, `startup()` / `close()`. |
 | `app/inflight.py` | The request feed behind the In-flight tab: `begin()`, `Entry.wait / run / record / finish / cancel`, a bounded history ring, a separately bounded body store, `snapshot()`. |
@@ -442,6 +442,14 @@ never leak.
   CLI always runs with `--tools ""`, no MCP, no setting sources, no slash commands, in
   an empty directory. Never add a flag that gives a prompt file, shell or network
   access.
+- **The prompt is a frame, never typing.** It goes to stdin as one `stream-json` line
+  marked `client_composed` (`_frame`). Plain `-p` text is read as typing, and an
+  `@/path` in it attaches that file to the request whatever `--tools` says: measured on
+  2.1.322, where it handed a canary file to the model. That line is the only thing
+  written to stdin, and the client's text is only ever a JSON string inside it, because
+  `stream-json` input also takes a frame that runs a shell command. The fake CLI in the
+  tests cannot show how the real one reads the frame, so after a `CLAUDE_CODE_VERSION`
+  bump ask the claude backend `@/etc/hostname` and check that no file came with it.
 - **No orphan process.** `_run` kills the child on timeout and on cancellation before
   the slot is released.
 - **Credentials stay in the CLI.** The proxy runs the unmodified binary and never reads,
@@ -515,7 +523,7 @@ above are invisible in review. Each file guards a specific set:
 | `test_usage.py` | The usage parser against real priced samples and every spelling of cache and reasoning counts; no usage block is `None`, `cost: 0` stays a price, malformed fields zero out. |
 | `test_inflight.py` | The feed's derived numbers on `Entry` directly: tokens/s over upstream time, reset by a failover, the `~` estimate kept when a backend never reports usage. |
 | `test_trim.py` | The guardrail: a no-op unless `num_ctx` is present and exceeded, system messages survive, tool calls and results never separated, excerpts before drops, the newest turn always sent; with a hand-built byte-per-token tokenizer, that the count follows what the template prints. |
-| `test_claude_cli.py` | The claude-cli backend through the real subprocess path with a fake CLI script: translation, lockdown flags, a keyless caller never reaching the CLI, CLI errors as HTTP statuses, emulated function calling, and no process outliving its slot. |
+| `test_claude_cli.py` | The claude-cli backend through the real subprocess path with a fake CLI script: translation, lockdown flags, the prompt on stdin as one `client_composed` frame, a keyless caller never reaching the CLI, CLI errors as HTTP statuses, emulated function calling, and no process outliving its slot. |
 | `test_version.py` | The build-identity chain: blank args mean `dev`, a CI build reports its tag and sha, `/health` and `llm_proxy_build_info` carry them. |
 | `test_throttle.py` | The once-per-interval gate: open the first time whatever the clock says, per key, and again after the interval. |
 
