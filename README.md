@@ -112,6 +112,33 @@ about a model the caller never asked for) that cannot be diagnosed from the clie
            "type": "invalid_request_error", "param": "model", "code": "model_not_found"}}
 ```
 
+### Where the model name comes from
+
+The proxy reads the model from the `model` key of a JSON body, or, when the
+`Content-Type` is `multipart/form-data`, from the form's `model` field. The second is how
+the OpenAI upload routes arrive (`/v1/audio/transcriptions`, `/v1/audio/translations`),
+and it is decided by the content type, not the path, so any form route in that style is
+covered:
+
+```bash
+curl https://<proxy>/v1/audio/transcriptions -F model=whisper -F file=@sample.wav
+```
+
+A form goes through everything above (resolution, the auth gate, slots and the queue,
+failover) like a JSON request. What differs:
+
+- The body is forwarded byte for byte with its original `Content-Type` and boundary. The
+  one change is the `model` field's value, when the backend's `model_map` gives the
+  model a different native id. `provider_routing`, `strip_fields`, vendor request
+  repairs and the context guardrail are JSON-only and do not apply.
+- A `stream` field set to `true` makes it a streaming request.
+- The form's bytes are never decoded or stored. The In-flight tab and `LOG_INPUT` show a
+  summary: the size, each text field, and each file's name, type and size.
+
+A request with neither (not JSON, or a form without a `model` field) is a
+[passthrough](#request-logging): forwarded untouched to the first HTTP backend the caller
+may use, with no slot and no failover.
+
 ### Slots, priority and queueing
 
 Each backend declares `slots` (the maximum number of in-flight requests, shared across
@@ -613,7 +640,7 @@ The same keys gate `POST /logging` and every `/admin/*` endpoint.
 
 | Path | Method | Description |
 |---|---|---|
-| `/*` | any | The proxy. Routed by the `model` in the request body |
+| `/*` | any | The proxy. Routed by the `model` in the JSON body, or the `model` field of a `multipart/form-data` upload |
 | `/models`, `/v1/models` | `GET` | The model list, in canonical names, honoring the auth gate |
 | `/health` | `GET` | Liveness and build identity: `{"status":"ok","version":"master-52","revision":"<sha>","release":true}`. No auth |
 | `/metrics` | `GET` | Prometheus metrics. No auth |
@@ -876,19 +903,23 @@ ts=2026-06-17T02:48:13-03:00 level=info event=request provider=openRouter model=
 | `cached`, `cache_write`, `reasoning` | When reported: prompt tokens read from the cache (a subset of `in`), prompt tokens written to it, and completion tokens spent thinking (a subset of `out`) |
 | `cost` | USD, as a plain decimal, when the backend reported one or the provider has a [price table](#price-tables). `cost=0` is a free model; no field means nobody said |
 | `cost_src` | `table` when `cost` is the proxy's list-price estimate |
-| `speed_tps` | Output tokens per second. Omitted for embeddings and rerankers |
-| `op`, `in_tps` | On embeddings and rerankers only: `embedding` or `rerank`, and input tokens per second |
+| `speed_tps` | Output tokens per second. Omitted when `op` is set |
+| `op`, `in_tps` | On operations that generate no completion tokens: `embedding`, `rerank`, `transcription`, `translation`, `speech` or `image`, and input tokens per second when the backend reported any |
 | `route` | When smart routing or a `first`/`last` override changed the backend order: `smart`, `pinned` or `smart+pinned` |
 | `trimmed`, `trim_capped` | When the [context guardrail](#context-guardrail) acted: messages dropped and tool results cut to an excerpt |
 | `client_ip`, `client_host` | The caller's address and its reverse-DNS name |
 | `svc`, `ua` | The service guessed from the User-Agent's first token, and the full User-Agent |
 | `err` | A short error category (`invalid_request`, `unauthorized`, `not_found`, `rate_limited`, `upstream_error`); absent on success |
 
-Embedding and rerank requests return no completion tokens, so they are tagged `op=` and
-report `in_tps` in place of `speed_tps`. Detection is by request path and by model id
-(a name containing `embed` or `rerank`).
+Embedding, rerank, audio and image requests return no completion tokens, so they are
+tagged `op=` and report `in_tps` in place of `speed_tps`, or no throughput at all when
+the response carried no usage (a whisper transcription usually does not). Embeddings and
+rerankers are detected by request path and by model id (a name containing `embed` or
+`rerank`); the audio and image operations by path alone (`/audio/transcriptions`,
+`/audio/translations`, `/audio/speech`, `/images/`). They still count in the per-model
+metrics and the ledger, as requests with zero tokens and no price.
 
-A request whose body carries no `model` (a non-chat or multipart passthrough, forwarded
+A request whose body carries no `model` (not JSON, or a form without a `model` field, forwarded
 untouched to the first HTTP backend the caller may use) is logged as
 `event=passthrough`, keyed by `method` and `path`. These stay out of the per-model
 metrics and the ledger.
@@ -908,7 +939,8 @@ own) use `<ts> LEVEL <msg>` with the same timestamp format, also on stdout.
 
 ### Verbose logging
 
-`LOG_INPUT` logs the full proxied request curl-style, with auth masked. `LOG_OUTPUT`
+`LOG_INPUT` logs the full proxied request curl-style, with auth masked; a form upload is
+logged as its summary, never its bytes. `LOG_OUTPUT`
 logs the upstream response pretty-printed; a stream is reassembled into one JSON with
 `_assembled_content` and `_reasoning_content`. Both can be flipped at runtime:
 

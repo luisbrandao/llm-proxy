@@ -53,6 +53,7 @@ CONFIG_PATH=config.yaml uvicorn app.main:app --port 8000
 | `app/rates.py` | Background reads of what the vendors publish: price catalogs hourly, subscription quota and balances every 2 minutes (30 s while a subscription is past 95% used). The request path only reads: `card_for`, `quota_state`, `out_of_funds`, `expected_per_mtok`. `accounts_snapshot()` backs `/admin/accounts`. |
 | `app/providers/` | One module per vendor (`openrouter`, `nanogpt`, `deepseek`), each with the fetchers it has an API for (`fetch_rates`, `fetch_included`, `fetch_quota`, `fetch_balance`), pure `parse_*` functions, and optionally `adapt_request(payload)`. `__init__` holds `RateCard`, `Override`, `Quota`, `Balance`, `get_vendor`. Endpoints and units are in `docs/providers/`. |
 | `app/notify.py` | Warnings to ntfy: balance low or empty, allowance used up, payment refused, topped up. `evaluate()` → `run_once()` → `loop()`. `payment_required()` is the one call from the request path. |
+| `app/multipart.py` | `parse(body, content_type) -> Form \| None`: where each part of a `multipart/form-data` body sits, without copying or decoding it. `Form.value` (a text field), `Form.with_model` (the body with the `model` field rewritten, every other byte the client's), `Form.summary` (what the In-flight row and `LOG_INPUT` get instead of the bytes). Imports nothing from the app. |
 | `app/trim.py` | The context guardrail. `trim_request(payload, body_str, asked, request_id)` returns a `Trimmed` (the shrunk payload plus the numbers) or `None`. `_TokenMeter` counts with a real tokenizer; `_CharMeter` is the fallback. |
 | `app/claude_cli.py` | The `kind: claude-cli` backend: an `httpx.AsyncBaseTransport` that answers `POST …/chat/completions` by running the `claude` binary headless. `translate` (OpenAI request → prompt), `_frame` (the prompt as the one line written to stdin), `_Watch` (catches emulated function calls mid-stream), `_Live` (a `stream: true` run relayed as the CLI writes it) with `_ContentTap` (the answer's text read out of the structured reply's JSON fragments), `_coerce`, `client()`. |
 | `app/usage.py` | `parse(response) -> Usage \| None`: every vendor's spelling of tokens, cache reads and writes, reasoning and cost, folded into one object. `format_cost` for the log. Imports nothing from the app. |
@@ -87,9 +88,10 @@ Outside `app/`:
 Any path that is not a route declared in `main.py` or `admin.py` reaches
 `proxy.proxy_request`.
 
-1. **Parse** the body once and read `model` and `stream`. Open the in-flight entry
-   (`inflight.begin`).
-2. **No model** (the body is not a JSON object, or has no `model`): passthrough. The
+1. **Parse** the body once and read `model` and `stream`: from a JSON object, or, when
+   the Content-Type is `multipart/form-data`, from the form's fields (`multipart.parse`;
+   `payload` is then a `Form`). Open the in-flight entry (`inflight.begin`).
+2. **No model** (the body is not a JSON object or a form, or names no `model`): passthrough. The
    request is forwarded untouched to the first `http` provider the caller is permitted to
    use, with no slot and no failover, and logged as `event=passthrough`. No permitted
    provider → 401.
@@ -103,8 +105,8 @@ Any path that is not a route declared in `main.py` or `admin.py` reaches
    left.
 6. **Order**: `smart.order(candidates, model)` applies the cost ranking when it is
    switched on and the `first` / `last` overrides always. It only permutes the list.
-7. **Trim**: `trim.trim_request`, in a worker thread. It runs once, before any target is
-   chosen, so every failover attempt forwards the same body.
+7. **Trim**: `trim.trim_request`, in a worker thread, for a JSON body only. It runs
+   once, before any target is chosen, so every failover attempt forwards the same body.
 8. **Dispatch** (`_dispatch`), looping over the candidates that remain:
    `slots.acquire` → `_build_body` (native model id, the vendor's `adapt_request`,
    `provider_routing`, `stream_options.include_usage`, `strip_fields`) → handler.
@@ -139,7 +141,7 @@ main                               logging, the lifespan, public routes, the mou
      ├─ smart → ledger, rates      ordering, from the snapshots
      ├─ notify → rates             warnings
      ├─ rates → providers/         vendor account reads
-     └─ slots · inflight · trim · claude_cli · auth · clientinfo · ledger
+     └─ slots · inflight · trim · multipart · claude_cli · auth · clientinfo · ledger
  admin also reads: inflight · ledger · rates · registry · slots · smart
  leaves: config · upstream · usage · metrics · version · throttle
 ```
@@ -302,6 +304,14 @@ never leak.
 - **`_build_body` runs per target and never mutates the shared payload.** A vendor's
   `adapt_request` is copy-on-write, so a failover to another vendor still gets the
   client's own history.
+- **A form upload is forwarded byte for byte.** `_build_body` on a `multipart.Form`
+  changes only the `model` field's value (`Form.with_model`) and returns the client's
+  bytes object itself when the native id is the name sent. The Content-Type, boundary
+  included, is forwarded as it came. None of the JSON edits (`adapt_request`,
+  `provider_routing`, `stream_options`, `strip_fields`) and not the guardrail apply.
+  Its bytes are never decoded: `body_str` for a form is `Form.summary()`, which is what
+  the In-flight body store and `LOG_INPUT` receive. Never hand them the raw body, which
+  is megabytes of audio.
 - **Decompression handles exactly what it advertises.** `_build_headers` caps the
   forwarded `Accept-Encoding` at `gzip, deflate` and `_decompress` implements those two
   from the stdlib. To add an encoding you need all three: the library in
@@ -539,6 +549,7 @@ above are invisible in review. Each file guards a specific set:
 | `test_ledger.py` | The aggregate shape, the day / range / model / provider filters, retention pruning, a file ledger surviving a reopen, a disabled ledger recording nothing, an unwritable ledger warning once and never raising. |
 | `test_usage.py` | The usage parser against real priced samples and every spelling of cache and reasoning counts; no usage block is `None`, `cost: 0` stays a price, malformed fields zero out. |
 | `test_inflight.py` | The feed's derived numbers on `Entry` directly: tokens/s over upstream time, reset by a failover, the `~` estimate kept when a backend never reports usage. |
+| `test_multipart.py` | Form uploads end to end: routed by the `model` field to the backend that serves it, forwarded byte for byte with the Content-Type kept and only `model` rewritten, a form with no model still a passthrough, the gate's 401 and the 404, failover with the same body, a slot held, the guardrail never run, the audio absent from the In-flight store and the log, `op=transcription` with no throughput fields; plus the parser on quoted boundaries, preambles and truncated bodies. |
 | `test_trim.py` | The guardrail: a no-op unless `num_ctx` is present and exceeded, system messages survive, tool calls and results never separated, excerpts before drops, the newest turn always sent; with a hand-built byte-per-token tokenizer, that the count follows what the template prints. |
 | `test_claude_cli.py` | The claude-cli backend through the real subprocess path with a fake CLI script: translation, lockdown flags, the prompt on stdin as one `client_composed` frame, a keyless caller never reaching the CLI, CLI errors as HTTP statuses, emulated function calling, streaming (pieces relayed as they come, the structured reply relayed as its text however its JSON is cut, a failure before the first piece still a status and one after it an `error` event), and no process outliving its slot or its stream. |
 | `test_version.py` | The build-identity chain: blank args mean `dev`, a CI build reports its tag and sha, `/health` and `llm_proxy_build_info` carry them. |

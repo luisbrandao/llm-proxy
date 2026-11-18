@@ -14,7 +14,7 @@ from fastapi.responses import Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from app import config as conf
-from app import auth, claude_cli, clientinfo, inflight, ledger, notify, rates, registry, router, slots, smart, trim, upstream
+from app import auth, claude_cli, clientinfo, inflight, ledger, multipart, notify, rates, registry, router, slots, smart, trim, upstream
 from app.config import Provider
 from app.metrics import (
     COST_TOTAL,
@@ -170,7 +170,20 @@ def _op_kind(path: str, model: str):
     the model id (e.g. a `*-Reranker-*` / `*-Embedding-*` name), so it still works
     when a backend serves these over a nonstandard path. Returns None for ordinary
     generation. Extend the keyword list for other no-output ops (e.g. moderation).
+
+    The audio and image routes are matched on the path alone: a whisper model
+    answers both `transcriptions` and `translations`, and its name says nothing
+    about which one ran. None of them returns completion tokens either.
     """
+    p = path.lower()
+    if "/audio/transcriptions" in p:
+        return "transcription"
+    if "/audio/translations" in p:
+        return "translation"
+    if "/audio/speech" in p:
+        return "speech"
+    if "/images/" in p:
+        return "image"
     hay = f"{path} {model}".lower()
     if "embed" in hay:
         return "embedding"
@@ -220,8 +233,8 @@ async def _emit_request_log(
     version that answered (`claude-opus-5-5`) is recorded. Omitted when the
     backend echoes the id it was sent, so most lines are unchanged.
 
-    A model-less passthrough (`model` is None: a non-chat or multipart body,
-    nothing to resolve) is logged as `event=passthrough` keyed by request path,
+    A model-less passthrough (`model` is None: a non-JSON body, or a form with
+    no `model` field, nothing to resolve) is logged as `event=passthrough` keyed by request path,
     so it never pollutes the per-model view.
 
     What the context guardrail did to this request (app/trim.py) is emitted as
@@ -280,7 +293,9 @@ async def _emit_request_log(
             # reads 0:00:01, never a misleading 0:00:00.
             "dur": str(timedelta(seconds=math.ceil(duration))),
             "speed_tps": None if op else f"{usage.completion / duration if duration > 0 else 0:.2f}",
-            "in_tps": f"{usage.prompt / duration if duration > 0 else 0:.2f}" if op else None,
+            # Only when there are input tokens to divide: a transcription usually
+            # reports no usage at all, and `in_tps=0.00` would read as a slow one.
+            "in_tps": f"{usage.prompt / duration if duration > 0 else 0:.2f}" if op and usage.prompt else None,
             "trimmed": trimmed["dropped"] if trimmed else None,
             "trim_capped": trimmed["capped"] if trimmed else None,
             # Present only when smart routing or a first/last override reordered
@@ -720,12 +735,19 @@ def _routing_for(provider: Provider, model: str):
     return None
 
 
-def _build_body(payload: dict, provider: Provider, model: str):
+def _build_body(payload, provider: Provider, model: str):
     """Rewrite the request body for a chosen target: set the real model id,
     inject upstream routing (OpenRouter `provider`), and ask for usage on streams.
 
     Each defers to the client: an explicit `provider` or `stream_options` wins.
+
+    A form upload (`multipart.Form`) gets only the model id, written into its
+    `model` field; every other byte is the client's. The rest of this function
+    edits JSON fields a form does not have. Its `body_str` is the form's summary,
+    never the bytes: that string reaches the log (LOG_INPUT) and nothing else.
     """
+    if isinstance(payload, multipart.Form):
+        return payload.with_model(model), payload.summary(model)
     p = dict(payload)
     p["model"] = model
     # Repairs this vendor's API needs on a conversation another backend started (see
@@ -799,7 +821,7 @@ def _release_once(target):
 
 
 async def _dispatch(
-    request: Request, path: str, payload: dict, is_stream: bool, targets: list, entry
+    request: Request, path: str, payload, is_stream: bool, targets: list, entry
 ) -> Union[Response, StreamingResponse]:
     """Acquire a slot on the best available target and forward, failing over to
     the next-priority target when a backend errors out (when failover is enabled).
@@ -956,18 +978,28 @@ async def proxy_request(request: Request, path: str) -> Union[Response, Streamin
     same place the slot is released.
     """
     body = await request.body()
-    body_str = body.decode("utf-8", errors="replace")
 
     payload = None
     model = None
     is_stream = False
-    try:
-        payload = json.loads(body_str)
-        model = payload.get("model") or None
-        is_stream = bool(payload.get("stream", False))
-    except (json.JSONDecodeError, AttributeError):
-        # Not a JSON object (or not JSON at all): treated as a passthrough below.
-        payload = None
+    form = multipart.parse(body, request.headers.get("content-type"))
+    if form is not None:
+        # A form upload (an audio transcription, say) is routed by its `model`
+        # field, like a JSON body by its key. Its bytes are never decoded: what
+        # the In-flight row and the log get is the summary, not megabytes of audio.
+        payload = form
+        body_str = form.summary()
+        model = form.value("model") or None
+        is_stream = (form.value("stream") or "").lower() == "true"
+    else:
+        body_str = body.decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(body_str)
+            model = payload.get("model") or None
+            is_stream = bool(payload.get("stream", False))
+        except (json.JSONDecodeError, AttributeError):
+            # Not a JSON object (or not JSON at all): treated as a passthrough below.
+            payload = None
 
     entry = inflight.begin(
         model=model,
@@ -1043,8 +1075,9 @@ async def _route(
     model: Optional[str], is_stream: bool, entry,
 ) -> Union[Response, StreamingResponse]:
     """Resolve the model, apply the auth gate, pick the order and dispatch.
-    `payload` is the already-parsed JSON body (None for a non-JSON passthrough)
-    and `model` the name it asked for (None when it names none)."""
+    `payload` is the already-parsed body: a JSON object, a `multipart.Form`, or
+    None for anything else; `model` the name it asked for (None when it names
+    none, which is a passthrough)."""
     if not conf.PROVIDERS:
         return _error(503, "No providers configured", "no_providers")
     authorized = auth.is_authorized(request)
@@ -1086,9 +1119,11 @@ async def _route(
     # In a thread: tokenizing an agent's whole history takes tens of ms (more on
     # the first, which loads the tokenizer), and the single event loop is
     # relaying every other stream meanwhile. The tokenizer runs without the GIL.
-    trimmed = await asyncio.to_thread(trim.trim_request, payload, body_str, model, entry.id)
-    if trimmed is not None:
-        payload = trimmed.payload
-        entry.mark_trimmed(trimmed.as_dict())
+    # A form upload has no conversation to trim: it is never handed over.
+    if isinstance(payload, dict):
+        trimmed = await asyncio.to_thread(trim.trim_request, payload, body_str, model, entry.id)
+        if trimmed is not None:
+            payload = trimmed.payload
+            entry.mark_trimmed(trimmed.as_dict())
 
     return await _dispatch(request, path, payload, is_stream, candidates, entry)
