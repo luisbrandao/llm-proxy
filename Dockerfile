@@ -18,7 +18,7 @@ RUN apt-get update \
 # changes with the image, never underneath it. Bump to a version listed at
 # https://downloads.claude.ai/claude-code-releases/stable. Above the pip layer
 # so a requirements change doesn't re-download ~240 MB.
-ARG CLAUDE_CODE_VERSION=2.1.322
+ARG CLAUDE_CODE_VERSION=2.1.327
 RUN set -eu; \
     case "$(uname -m)" in \
       x86_64) platform=linux-x64 ;; \
