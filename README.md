@@ -647,7 +647,7 @@ The same keys gate `POST /logging` and every `/admin/*` endpoint.
 | `/logging` | `GET` / `POST` | Read or toggle `log_input` / `log_output` at runtime. `POST` needs a key |
 | `/ui/` | `GET` | The web console |
 | `/admin/logs` | `GET` | Recent log lines from an in-memory ring buffer (`?since=<seq>&level=<min>`) |
-| `/admin/inflight` | `GET` | The request feed: running, queued and recently finished, with per-backend slot occupancy |
+| `/admin/inflight` | `GET` | The request feed: running, queued and recently finished, with per-backend slot occupancy. `?limit=N` returns only the first N rows of `requests` (live ones first, then the newest finished); the `running` / `queued` / `history` counters stay the real totals. A negative or non-integer `limit` is `422` |
 | `/admin/inflight/{id}/cancel` | `POST` | Kill one in-flight request. `404` if it already finished |
 | `/admin/inflight/{id}/body` | `GET` | The prompt and reply captured for one row (see `INFLIGHT_BODIES`) |
 | `/admin/costs` | `GET` | Cost and token totals from the [ledger](#cost-tracking): per day, per model (with each model's split across backends), per backend, and the newest requests. `?days=30`, or `since=YYYY-MM-DD&until=YYYY-MM-DD`; narrowed with `day=`, `model=`, `provider=`; `limit=200` caps the request list |

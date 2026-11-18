@@ -46,7 +46,7 @@ import asyncio
 import time
 from collections import deque
 from datetime import datetime
-from itertools import count
+from itertools import count, islice
 from typing import Optional
 
 from app import clientinfo
@@ -455,8 +455,13 @@ def get(entry_id: int) -> Optional[Entry]:
     return _active.get(entry_id)
 
 
-def snapshot() -> dict:
+def snapshot(limit: Optional[int] = None) -> dict:
     """The feed: live requests newest-first, then the finished history.
+
+    `limit` keeps the first `limit` rows of that list (None keeps all), for a
+    client that shows a handful and polls over a poor link. It cuts the list,
+    not the order, so live rows still come first; the counters always count
+    everything, whatever was cut.
 
     Live rows are pinned above the history so what is happening *now* never
     scrolls away, and within each group the newest is first. Live timings are
@@ -467,10 +472,14 @@ def snapshot() -> dict:
     now = time.monotonic()
     live = [e.as_dict(now) for e in list(_active.values())]
     live.reverse()  # arrival order -> newest first
+    if limit is None:
+        rows = live + list(_recent)
+    else:
+        rows = live[:limit] + list(islice(_recent, max(0, limit - len(live))))
     return {
         "running": sum(1 for r in live if r["state"] == "running"),
         "queued": sum(1 for r in live if r["state"] == "queued"),
         "history": len(_recent),
         "history_limit": _recent.maxlen,
-        "requests": live + list(_recent),
+        "requests": rows,
     }

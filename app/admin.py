@@ -14,6 +14,7 @@ import asyncio
 import logging
 import time
 from datetime import date
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -169,16 +170,23 @@ async def admin_upstream_models(provider: str = ""):
 
 
 @router.get("/inflight")
-async def admin_inflight():
+async def admin_inflight(limit: Optional[int] = None):
     """Everything currently in flight: requests holding a slot and requests
     queued behind one, arrival-ordered, plus each provider's slot occupancy.
+
+    `limit` caps `requests` at its first N rows (live ones first, then the
+    newest finished), for a small client polling over a lossy link: the full
+    history runs to ~160 KB. The counters stay the real totals. Absent, the
+    response is the whole feed, which is what the console reads.
 
     Read-only snapshot of process-local state (see app/inflight.py) — cheap
     enough for the console to poll every second. The provider block is the same
     slot accounting the Routing tab shows, repeated here so the queue and the
     capacity that gates it read side by side.
     """
-    snap = inflight.snapshot()
+    if limit is not None and limit < 0:
+        return _bad("limit must be zero or more")
+    snap = inflight.snapshot(limit)
     snap["providers"] = [_provider_view(p, live=True) for p in conf.PROVIDERS]
     snap["queue_timeout"] = conf.ROUTING.queue_timeout
     snap["queue_affinity"] = conf.ROUTING.queue_affinity
